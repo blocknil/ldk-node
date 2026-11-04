@@ -1536,6 +1536,14 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
+				// Blocknil patch: a just-in-time channel that closed before its payment went through
+				// (the client refused it, say) must not keep the payer's HTLC held until it times out.
+				if let (Some(liquidity_source), Some(counterparty)) =
+					(self.liquidity_source.as_ref(), counterparty_node_id)
+				{
+					liquidity_source.lsps2_channel_closed(&counterparty, user_channel_id).await;
+				}
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),

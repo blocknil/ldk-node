@@ -389,6 +389,34 @@ where
 		}
 	}
 
+	/// Fails back the payments of just-in-time flows stuck waiting on a channel that doesn't exist.
+	/// Blocknil patch; see `LSPS2ServiceHandler::fail_stuck_channel_opens`.
+	pub(crate) async fn fail_stuck_jit_opens(&self) -> usize {
+		match self.liquidity_manager.lsps2_service_handler() {
+			Some(handler) => handler.fail_stuck_channel_opens().await,
+			None => 0,
+		}
+	}
+
+	/// A channel closed: if it was a just-in-time channel whose payment never went through, fail
+	/// that payment back. Any other channel isn't ours to act on, so the answer is ignored.
+	/// Blocknil patch.
+	pub(crate) async fn lsps2_channel_closed(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+		if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+			let _ = handler.channel_open_failed(counterparty_node_id, user_channel_id).await;
+		}
+	}
+
+	/// Fails back the HTLCs held for a just-in-time channel that can't be opened, so the payer
+	/// sees a failure (and may retry) instead of a payment stuck in flight. Blocknil patch.
+	async fn fail_jit_open(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+		if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+			if let Err(e) = handler.channel_open_failed(counterparty_node_id, user_channel_id).await {
+				log_error!(self.logger, "Failed to fail back the held JIT payment: {:?}", e);
+			}
+		}
+	}
+
 	pub(crate) async fn handle_next_event(&self) {
 		match self.liquidity_manager.next_event_async().await {
 			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
@@ -766,9 +794,10 @@ where
 						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 						spendable_amount_sats, required_funds_sats
 					);
-					// TODO: We just silently fail here. Eventually we will need to remember
-					// the pending requests and regularly retry opening the channel until we
-					// succeed.
+					// Blocknil patch: upstream fails silently here, so the payer's HTLC stays held
+					// until its timelock runs out and the payment shows as in flight for an hour.
+					// Fail it back now; the payer can try again.
+					self.fail_jit_open(&their_network_key, user_channel_id).await;
 					return;
 				}
 
@@ -808,6 +837,8 @@ where
 							their_network_key,
 							e
 						);
+						// Blocknil patch: as above, fail the held HTLC back instead of holding it.
+						self.fail_jit_open(&their_network_key, user_channel_id).await;
 						return;
 					},
 				}
