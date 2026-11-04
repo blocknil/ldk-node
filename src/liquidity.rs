@@ -51,7 +51,11 @@ use crate::{total_anchor_channels_reserve_sats, Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 
-const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
+// Blocknil patch: upstream offers last 24 hours. An offer bought for an invoice nobody pays holds
+// one of the client's ten pending LSPS2 slots until it expires, so a customer who asks for ten
+// amounts in a day is locked out of receiving for the rest of it. Our invoices expire in an hour;
+// so do the offers behind them.
+const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
 struct LSPS1Client {
