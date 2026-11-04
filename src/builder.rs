@@ -1834,6 +1834,7 @@ fn build_with_store_internal(
 		node_metrics,
 		om_mailbox,
 		async_payments_role,
+		funding_input_signer: Arc::new(RwLock::new(None)),
 	})
 }
 
