@@ -494,6 +494,8 @@ where
 	static_invoice_store: Option<StaticInvoiceStore>,
 	onion_messenger: Arc<OnionMessenger>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
+	/// Blocknil patch: signs splice inputs from a wallet outside ldk-node.
+	funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -510,6 +512,7 @@ where
 		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
 		config: Arc<Config>,
+		funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
 	) -> Self {
 		Self {
 			event_queue,
@@ -528,6 +531,7 @@ where
 			static_invoice_store,
 			onion_messenger,
 			om_mailbox,
+			funding_input_signer,
 		}
 	}
 
@@ -1702,7 +1706,15 @@ where
 				counterparty_node_id,
 				unsigned_transaction,
 				..
-			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
+			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
+				// Blocknil patch: inputs from a wallet outside ldk-node are signed by the
+				// signer it registered (see `FundingInputSigner`).
+				let signer = self.funding_input_signer.read().unwrap().clone();
+				match signer {
+					Some(signer) => signer.sign_funding_inputs(tx),
+					None => Ok(tx),
+				}
+			}) {
 				Ok(partially_signed_tx) => {
 					match self.channel_manager.funding_transaction_signed(
 						&channel_id,

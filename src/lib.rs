@@ -86,6 +86,7 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+mod funding_signer;
 mod ffi;
 mod gossip;
 pub mod graph;
@@ -124,6 +125,7 @@ use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
+pub use funding_signer::FundingInputSigner;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
@@ -206,6 +208,8 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
+	/// Blocknil patch: see [`FundingInputSigner`].
+	funding_input_signer: funding_signer::FundingInputSignerSlot,
 }
 
 impl Node {
@@ -557,6 +561,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			Arc::clone(&self.funding_input_signer),
 		));
 
 		// Setup background processing
@@ -1359,6 +1364,73 @@ impl Node {
 
 			Err(Error::ChannelSplicingFailed)
 		}
+	}
+
+	/// Registers the signer for inputs that [`Node::splice_in_with_inputs`] contributes from a
+	/// wallet outside ldk-node. Blocknil patch.
+	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
+		*self.funding_input_signer.write().unwrap() = Some(signer);
+	}
+
+	/// The fee rate ldk-node would pay for a channel funding transaction right now. A caller
+	/// choosing coins for [`Node::splice_in_with_inputs`] uses it, so its coins cover what LDK will
+	/// ask for. Blocknil patch.
+	pub fn channel_funding_fee_rate(&self) -> bitcoin::FeeRate {
+		self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
+	}
+
+	/// Adds funds to an existing channel from coins ldk-node's own wallet doesn't hold.
+	///
+	/// `inputs` must cover `splice_amount_sats` plus the fee, at `fee_rate`, for the inputs, the
+	/// change output and the channel's shared input and output; anything over that goes to
+	/// `change_script`. The inputs are signed by the [`FundingInputSigner`] registered with
+	/// [`Node::set_funding_input_signer`], once the transaction has been negotiated.
+	///
+	/// Blocknil patch: upstream's [`Node::splice_in`] only spends ldk-node's own wallet.
+	pub fn splice_in_with_inputs(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		splice_amount_sats: u64, inputs: Vec<lightning::ln::funding::FundingTxInput>,
+		change_script: bitcoin::ScriptBuf, fee_rate: bitcoin::FeeRate,
+	) -> Result<(), Error> {
+		if self.funding_input_signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to splice channel: no funding input signer registered");
+			return Err(Error::ChannelSplicingFailed);
+		}
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Channel not found for user_channel_id {} and counterparty {}",
+					user_channel_id,
+					counterparty_node_id
+				);
+				Error::ChannelSplicingFailed
+			})?;
+
+		let contribution = SpliceContribution::SpliceIn {
+			value: Amount::from_sat(splice_amount_sats),
+			inputs,
+			change_script: Some(change_script),
+		};
+		let funding_feerate_per_kw: u32 =
+			fee_rate.to_sat_per_kwu().try_into().map_err(|_| Error::ChannelSplicingFailed)?;
+
+		self.channel_manager
+			.splice_channel(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				contribution,
+				funding_feerate_per_kw,
+				None,
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel: {:?}", e);
+				Error::ChannelSplicingFailed
+			})
 	}
 
 	/// Remove funds from an existing channel, sending them to an on-chain address.
