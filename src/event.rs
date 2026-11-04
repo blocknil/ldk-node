@@ -1207,6 +1207,28 @@ where
 					}
 				}
 
+				// Blocknil patch: one channel per peer. A second one is refused; the existing
+				// channel grows by splicing instead.
+				if self.config.one_channel_per_peer
+					&& !self.channel_manager.list_channels_with_counterparty(&counterparty_node_id).is_empty()
+				{
+					log_error!(
+						self.logger,
+						"Rejecting a second channel from peer {}: it already has one with us",
+						counterparty_node_id,
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Channel request rejected: one channel per peer".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject channel: {:?}", e);
+						});
+					return Ok(());
+				}
+
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
 				if anchor_channel {
 					if let Some(anchor_channels_config) =

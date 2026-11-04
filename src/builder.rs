@@ -499,6 +499,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Accept at most one channel from each peer. Blocknil patch; see
+	/// [`Config::one_channel_per_peer`].
+	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {
+		self.config.one_channel_per_peer = one;
+		self
+	}
+
 	/// Sets how many confirmations an inbound channel's funding transaction needs before the
 	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
 	pub fn set_inbound_channel_minimum_depth(&mut self, depth: u32) -> &mut Self {

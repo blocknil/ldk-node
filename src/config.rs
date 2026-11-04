@@ -190,6 +190,10 @@ pub struct Config {
 	/// 0.7.1 does not expose. If unset, LDK's default (6) applies. Values below 1 are raised to 1;
 	/// zero-confirmation channels remain governed by [`Config::trusted_peers_0conf`].
 	pub inbound_channel_minimum_depth: Option<u32>,
+	/// Accept at most one channel from each peer: a peer that already has a channel with us
+	/// grows it by splicing instead of opening another. Blocknil patch: our provider gives each
+	/// customer exactly one channel.
+	pub one_channel_per_peer: bool,
 }
 
 impl Default for Config {
@@ -205,6 +209,7 @@ impl Default for Config {
 			route_parameters: None,
 			node_alias: None,
 			inbound_channel_minimum_depth: None,
+			one_channel_per_peer: false,
 		}
 	}
 }
