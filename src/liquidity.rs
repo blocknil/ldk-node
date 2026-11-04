@@ -58,6 +58,9 @@ const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
+/// The smallest just-in-time channel a provider opens, whatever the payment. Blocknil patch.
+const MIN_JIT_CHANNEL_SATS: u64 = 25_000;
+
 struct LSPS1Client {
 	lsp_node_id: PublicKey,
 	lsp_address: SocketAddress,
@@ -774,7 +777,11 @@ where
 				let over_provisioning_msat = (amt_to_forward_msat
 					* service_config.channel_over_provisioning_ppm as u64)
 					/ 1_000_000;
-				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
+				// Blocknil patch: never smaller than MIN_JIT_CHANNEL_SATS. Sized to the payment
+				// alone, a payment of a few hundred sats makes a channel under the 1,000 sat reserve
+				// floor, which the client refuses and force-closes.
+				let channel_amount_sats =
+					((amt_to_forward_msat + over_provisioning_msat) / 1000).max(MIN_JIT_CHANNEL_SATS);
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
