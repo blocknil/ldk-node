@@ -509,6 +509,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets the forwarding fee for channels peers open to us. Blocknil patch; see
+	/// [`Config::forwarding_fees`].
+	pub fn set_forwarding_fees(&mut self, base_msat: u32, proportional_ppm: u32) -> &mut Self {
+		self.config.forwarding_fees = Some((base_msat, proportional_ppm));
+		self
+	}
+
 	/// Accept at most one channel from each peer. Blocknil patch; see
 	/// [`Config::one_channel_per_peer`].
 	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {

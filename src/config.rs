@@ -194,6 +194,10 @@ pub struct Config {
 	/// grows it by splicing instead of opening another. Blocknil patch: our provider gives each
 	/// customer exactly one channel.
 	pub one_channel_per_peer: bool,
+	/// Forwarding fee for channels accepted from peers, as (base msat, proportional ppm); `None`
+	/// keeps LDK's default (1,000 msat + 0). Blocknil patch: our provider forwards between its
+	/// customers for nothing.
+	pub forwarding_fees: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -210,6 +214,7 @@ impl Default for Config {
 			node_alias: None,
 			inbound_channel_minimum_depth: None,
 			one_channel_per_peer: false,
+			forwarding_fees: None,
 		}
 	}
 }
@@ -340,6 +345,10 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.reject_inbound_splices = false;
 	if let Some(depth) = config.inbound_channel_minimum_depth {
 		user_config.channel_handshake_config.minimum_depth = depth.max(1);
+	}
+	if let Some((base_msat, proportional_ppm)) = config.forwarding_fees {
+		user_config.channel_config.forwarding_fee_base_msat = base_msat;
+		user_config.channel_config.forwarding_fee_proportional_millionths = proportional_ppm;
 	}
 
 	if may_announce_channel(config).is_err() {
