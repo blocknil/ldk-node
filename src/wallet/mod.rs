@@ -9,7 +9,9 @@ use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_wallet::descriptor::ExtendedDescriptor;
@@ -26,7 +28,7 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{
-	Address, Amount, FeeRate, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, Weight,
+	Address, Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, Weight,
 	WitnessProgram, WitnessVersion,
 };
 use lightning::chain::chaininterface::BroadcasterInterface;
@@ -72,7 +74,16 @@ pub(crate) struct Wallet {
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
+	// Coins handed to a splice or a channel funding that the wallet may not have seen spent yet:
+	// LDK broadcasts those transactions, not this wallet, so until the next sync the coins still
+	// look unspent.
+	// Without this, a second splice before that sync picks the same coins and is never valid, and
+	// LDK keeps it pending for good, blocking every later splice on that channel.
+	held_for_splices: Mutex<HashMap<OutPoint, Instant>>,
 }
+
+/// How long coins handed to a splice or channel funding stay held when no sync shows them spent.
+const SPLICE_HOLD: Duration = Duration::from_secs(60 * 60);
 
 impl Wallet {
 	pub(crate) fn new(
@@ -83,7 +94,16 @@ impl Wallet {
 	) -> Self {
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
+		Self {
+			inner,
+			persister,
+			broadcaster,
+			fee_estimator,
+			payment_store,
+			config,
+			logger,
+			held_for_splices: Mutex::new(HashMap::new()),
+		}
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -235,7 +255,11 @@ impl Wallet {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
 
 		let mut locked_wallet = self.inner.lock().unwrap();
+		let mut held = self.still_held(&locked_wallet);
 		let mut tx_builder = locked_wallet.build_tx();
+		for coin in held.keys() {
+			tx_builder.add_unspendable(*coin);
+		}
 
 		tx_builder.add_recipient(output_script, amount).fee_rate(fee_rate).nlocktime(locktime);
 
@@ -272,6 +296,12 @@ impl Wallet {
 			log_error!(self.logger, "Failed to extract transaction: {}", e);
 			e
 		})?;
+
+		// LDK broadcasts this, not us: until a sync shows it, its coins would still look free.
+		let until = Instant::now() + SPLICE_HOLD;
+		for txin in &tx.input {
+			held.insert(txin.previous_output, until);
+		}
 
 		Ok(tx)
 	}
@@ -316,7 +346,16 @@ impl Wallet {
 	pub(crate) fn get_balances(
 		&self, total_anchor_channels_reserve_sats: u64,
 	) -> Result<(u64, u64), Error> {
-		let balance = self.inner.lock().unwrap().balance();
+		let (balance, held_sats) = {
+			let locked_wallet = self.inner.lock().unwrap();
+			let held = self.still_held(&locked_wallet);
+			let held_sats: u64 = locked_wallet
+				.list_unspent()
+				.filter(|u| held.contains_key(&u.outpoint))
+				.map(|u| u.txout.value.to_sat())
+				.sum();
+			(locked_wallet.balance(), held_sats)
+		};
 
 		// Make sure `list_confirmed_utxos` returns at least one `Utxo` we could use to spend/bump
 		// Anchors if we have any confirmed amounts.
@@ -328,7 +367,10 @@ impl Wallet {
 			);
 		}
 
+		// Coins already handed to a channel funding or a splice aren't spendable, whatever the
+		// last sync says.
 		self.get_balances_inner(balance, total_anchor_channels_reserve_sats)
+			.map(|(total, spendable)| (total, spendable.saturating_sub(held_sats)))
 	}
 
 	fn get_balances_inner(
@@ -589,8 +631,14 @@ impl Wallet {
 			ExtendedDescriptor::Wpkh(_)
 		));
 
+		let mut held = self.still_held(&locked_wallet);
+		let now = Instant::now();
+
 		let mut tx_builder = locked_wallet.build_tx();
 		tx_builder.only_witness_utxo();
+		for coin in held.keys() {
+			tx_builder.add_unspendable(*coin);
+		}
 
 		for input in &must_spend {
 			let psbt_input = psbt::Input {
@@ -608,7 +656,7 @@ impl Wallet {
 		tx_builder.fee_rate(fee_rate);
 		tx_builder.exclude_unconfirmed();
 
-		tx_builder
+		let chosen: Vec<OutPoint> = tx_builder
 			.finish()
 			.map_err(|e| {
 				log_error!(self.logger, "Failed to select confirmed UTXOs: {}", e);
@@ -616,14 +664,42 @@ impl Wallet {
 			.unsigned_tx
 			.input
 			.iter()
-			.filter(|txin| must_spend.iter().all(|input| input.outpoint != txin.previous_output))
-			.filter_map(|txin| {
+			.map(|txin| txin.previous_output)
+			.filter(|coin| must_spend.iter().all(|input| input.outpoint != *coin))
+			.collect();
+		let inputs = chosen
+			.iter()
+			.filter_map(|coin| {
 				locked_wallet
-					.tx_details(txin.previous_output.txid)
+					.tx_details(coin.txid)
 					.map(|tx_details| tx_details.tx.deref().clone())
-					.map(|prevtx| FundingTxInput::new_p2wpkh(prevtx, txin.previous_output.vout))
+					.map(|prevtx| FundingTxInput::new_p2wpkh(prevtx, coin.vout))
 			})
-			.collect::<Result<Vec<_>, ()>>()
+			.collect::<Result<Vec<_>, ()>>()?;
+		for coin in chosen {
+			held.insert(coin, now + SPLICE_HOLD);
+		}
+		Ok(inputs)
+	}
+
+	/// Drops holds that have run out or whose coin the wallet now sees spent, and returns the
+	/// coins still held. Takes the BDK wallet already locked, as every caller has.
+	fn still_held(
+		&self, wallet: &PersistedWallet<KVStoreWalletPersister>,
+	) -> std::sync::MutexGuard<'_, HashMap<OutPoint, Instant>> {
+		let mut held = self.held_for_splices.lock().unwrap();
+		let unspent: Vec<OutPoint> = wallet.list_unspent().map(|u| u.outpoint).collect();
+		let now = Instant::now();
+		held.retain(|coin, until| *until > now && unspent.contains(coin));
+		held
+	}
+
+	/// Lets coins that went into a splice that didn't happen be chosen again.
+	pub(crate) fn release_splice_coins(&self, coins: &[OutPoint]) {
+		let mut held = self.held_for_splices.lock().unwrap();
+		for coin in coins {
+			held.remove(coin);
+		}
 	}
 
 	fn list_confirmed_utxos_inner(&self) -> Result<Vec<Utxo>, ()> {

@@ -1831,9 +1831,11 @@ where
 				user_channel_id,
 				counterparty_node_id,
 				abandoned_funding_txo,
+				contributed_inputs,
 				contributed_outputs,
 				..
 			} => {
+				self.wallet.release_splice_coins(&contributed_inputs);
 				if let Some(funding_txo) = abandoned_funding_txo {
 					log_info!(
 						self.logger,

@@ -1350,7 +1350,14 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})?;
 
-			let change_address = self.wallet.get_new_internal_address()?;
+			let held: Vec<bitcoin::OutPoint> = inputs.iter().map(|input| input.outpoint()).collect();
+			let change_address = match self.wallet.get_new_internal_address() {
+				Ok(address) => address,
+				Err(e) => {
+					self.wallet.release_splice_coins(&held);
+					return Err(e);
+				},
+			};
 
 			let contribution = SpliceContribution::SpliceIn {
 				value: Amount::from_sat(splice_amount_sats),
@@ -1376,6 +1383,7 @@ impl Node {
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
+					self.wallet.release_splice_coins(&held);
 					let tx = bitcoin::Transaction {
 						version: bitcoin::transaction::Version::TWO,
 						lock_time: bitcoin::absolute::LockTime::ZERO,
