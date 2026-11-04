@@ -1402,6 +1402,20 @@ impl Node {
 		}
 	}
 
+	/// Fails back payments held for just-in-time channels that will never open: the open failed
+	/// before a restart, or the channel closed during setup. A provider calls this once after
+	/// [`Node::start`]; otherwise those payers wait for their HTLCs to time out. Returns how many
+	/// were failed back. Blocknil patch.
+	pub fn fail_stuck_jit_payments(&self) -> usize {
+		match self.liquidity_source.as_ref() {
+			Some(liquidity_source) => {
+				let liquidity_source = Arc::clone(liquidity_source);
+				self.runtime.block_on(async move { liquidity_source.fail_stuck_jit_opens().await })
+			},
+			None => 0,
+		}
+	}
+
 	/// Registers the signer for inputs that [`Node::splice_in_with_inputs`] contributes from a
 	/// wallet outside ldk-node. Blocknil patch.
 	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
