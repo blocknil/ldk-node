@@ -184,6 +184,12 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub route_parameters: Option<RouteParametersConfig>,
+	/// Confirmations an inbound channel's funding transaction needs before the channel is used.
+	///
+	/// Blocknil patch: LDK's `ChannelHandshakeConfig::minimum_depth`, which upstream ldk-node
+	/// 0.7.1 does not expose. If unset, LDK's default (6) applies. Values below 1 are raised to 1;
+	/// zero-confirmation channels remain governed by [`Config::trusted_peers_0conf`].
+	pub inbound_channel_minimum_depth: Option<u32>,
 }
 
 impl Default for Config {
@@ -198,6 +204,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
 			node_alias: None,
+			inbound_channel_minimum_depth: None,
 		}
 	}
 }
@@ -326,6 +333,9 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
 	user_config.reject_inbound_splices = false;
+	if let Some(depth) = config.inbound_channel_minimum_depth {
+		user_config.channel_handshake_config.minimum_depth = depth.max(1);
+	}
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
