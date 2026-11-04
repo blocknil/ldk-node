@@ -1831,6 +1831,12 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	payer_node.start().unwrap();
 
 	let service_addr = service_node.onchain_payment().new_address().unwrap();
+	// Blocknil patch: the service opens three JIT channels and never syncs its wallet in between. A
+	// coin given to a funding stays held until a sync shows it spent (with client_trusts_lsp the
+	// funding isn't even broadcast until the client claims), so each channel needs a coin of its own
+	// instead of spending the previous funding's coin again.
+	let service_addr_2 = service_node.onchain_payment().new_address().unwrap();
+	let service_addr_3 = service_node.onchain_payment().new_address().unwrap();
 	let client_addr = client_node.onchain_payment().new_address().unwrap();
 	let payer_addr = payer_node.onchain_payment().new_address().unwrap();
 
@@ -1839,7 +1845,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	premine_and_distribute_funds(
 		&bitcoind.client,
 		&electrsd.client,
-		vec![service_addr, client_addr, payer_addr],
+		vec![service_addr, service_addr_2, service_addr_3, client_addr, payer_addr],
 		Amount::from_sat(premine_amount_sat),
 	)
 	.await;
