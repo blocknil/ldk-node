@@ -488,6 +488,17 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Trusts `node_id` not to force-close a channel when we couldn't get our side confirmed in
+	/// time, so channels with it keep no on-chain anchor reserve
+	/// ([`AnchorChannelsConfig::trusted_peers_no_reserve`]). Blocknil patch: upstream only sets
+	/// this through a whole [`Config`].
+	pub fn add_trusted_peer_no_reserve(&mut self, node_id: PublicKey) -> &mut Self {
+		if let Some(anchors) = self.config.anchor_channels_config.as_mut() {
+			anchors.trusted_peers_no_reserve.push(node_id);
+		}
+		self
+	}
+
 	/// Sets how many confirmations an inbound channel's funding transaction needs before the
 	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
 	pub fn set_inbound_channel_minimum_depth(&mut self, depth: u32) -> &mut Self {
