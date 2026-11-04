@@ -499,6 +499,16 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets how much ldk-node keeps on-chain per anchor channel to bump its own transactions in a
+	/// force close (upstream: 25,000 sats, settable only through a whole [`Config`]). A provider
+	/// with a channel per customer can't hold 25,000 sats for each. Blocknil patch.
+	pub fn set_anchor_reserve_per_channel_sats(&mut self, sats: u64) -> &mut Self {
+		if let Some(anchors) = self.config.anchor_channels_config.as_mut() {
+			anchors.per_channel_reserve_sats = sats;
+		}
+		self
+	}
+
 	/// Accept at most one channel from each peer. Blocknil patch; see
 	/// [`Config::one_channel_per_peer`].
 	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {
