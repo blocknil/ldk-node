@@ -712,7 +712,17 @@ where
 									lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
 										|max_prop_fee| {
 											// If it's a variable amount payment, compute the actual fee.
-											compute_opening_fee(amount_msat, 0, max_prop_fee)
+											// Blocknil patch: on what the payer sent (what reached us
+											// plus what the provider withheld), as the provider does —
+											// upstream used what reached us, a sat short of the
+											// provider's fee, and refused every such payment. Never
+											// under the provider's 1 sat minimum fee.
+											compute_opening_fee(
+												amount_msat + counterparty_skimmed_fee_msat,
+												0,
+												max_prop_fee,
+											)
+											.map(|fee| fee.max(1_000))
 										},
 									)
 								})
