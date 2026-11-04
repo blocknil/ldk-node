@@ -1072,6 +1072,35 @@ impl Node {
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool,
 	) -> Result<UserChannelId, Error> {
+		self.open_channel_funded(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			announce_for_forwarding,
+			false,
+		)
+	}
+
+	/// Opens a channel whose funding transaction the registered [`FundingInputSigner`] builds
+	/// from a wallet outside ldk-node, instead of ldk-node's own wallet. Private (unannounced),
+	/// nothing pushed to the counterparty. Blocknil patch.
+	pub fn open_channel_with_external_funding(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+	) -> Result<UserChannelId, Error> {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
+			return Err(Error::ChannelCreationFailed);
+		}
+		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true)
+	}
+
+	fn open_channel_funded(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		announce_for_forwarding: bool, external: bool,
+	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
@@ -1088,8 +1117,10 @@ impl Node {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
-		// Check funds availability after connection (includes anchor reserve calculation)
-		self.check_sufficient_onchain_funds(channel_amount_sats, &node_id, true)?;
+		// Check funds availability after connection (includes anchor reserve calculation). Funded
+		// from outside, ldk-node's own wallet only has to hold the anchor reserve, if any.
+		let own_wallet_pays = if external { 0 } else { channel_amount_sats };
+		self.check_sufficient_onchain_funds(own_wallet_pays, &node_id, true)?;
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
@@ -1105,6 +1136,10 @@ impl Node {
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::rng().random();
+		if external {
+			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+			self.funding_input_signer.channels.lock().unwrap().insert(user_channel_id, fee_rate);
+		}
 
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
@@ -1125,6 +1160,7 @@ impl Node {
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
+				self.funding_input_signer.channels.lock().unwrap().remove(&user_channel_id);
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1369,7 +1405,7 @@ impl Node {
 	/// Registers the signer for inputs that [`Node::splice_in_with_inputs`] contributes from a
 	/// wallet outside ldk-node. Blocknil patch.
 	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
-		*self.funding_input_signer.write().unwrap() = Some(signer);
+		*self.funding_input_signer.signer.write().unwrap() = Some(signer);
 	}
 
 	/// The fee rate ldk-node would pay for a channel funding transaction right now. A caller
@@ -1392,7 +1428,7 @@ impl Node {
 		splice_amount_sats: u64, inputs: Vec<lightning::ln::funding::FundingTxInput>,
 		change_script: bitcoin::ScriptBuf, fee_rate: bitcoin::FeeRate,
 	) -> Result<(), Error> {
-		if self.funding_input_signer.read().unwrap().is_none() {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
 			log_error!(self.logger, "Failed to splice channel: no funding input signer registered");
 			return Err(Error::ChannelSplicingFailed);
 		}

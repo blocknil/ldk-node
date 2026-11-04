@@ -554,12 +554,28 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				match self.wallet.create_funding_transaction(
-					output_script,
-					channel_amount,
-					confirmation_target,
-					locktime,
-				) {
+				// Blocknil patch: a channel opened with `open_channel_with_external_funding` is
+				// paid for by the registered signer's wallet, not ours.
+				let external = self.funding_input_signer.channels.lock().unwrap().remove(&user_channel_id);
+				let signer = self.funding_input_signer.signer.read().unwrap().clone();
+				let funding = match (external, signer) {
+					(Some(fee_rate), Some(signer)) => signer
+						.build_funding_transaction(
+							output_script,
+							channel_value_satoshis,
+							fee_rate,
+							locktime,
+						)
+						.map_err(|()| Error::OnchainTxCreationFailed),
+					(Some(_), None) => Err(Error::OnchainTxCreationFailed),
+					(None, _) => self.wallet.create_funding_transaction(
+						output_script,
+						channel_amount,
+						confirmation_target,
+						locktime,
+					),
+				};
+				match funding {
 					Ok(final_tx) => {
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {
@@ -1709,7 +1725,7 @@ where
 			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
 				// Blocknil patch: inputs from a wallet outside ldk-node are signed by the
 				// signer it registered (see `FundingInputSigner`).
-				let signer = self.funding_input_signer.read().unwrap().clone();
+				let signer = self.funding_input_signer.signer.read().unwrap().clone();
 				match signer {
 					Some(signer) => signer.sign_funding_inputs(tx),
 					None => Ok(tx),
