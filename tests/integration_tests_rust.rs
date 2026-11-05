@@ -1792,6 +1792,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp,
+		disable_client_reserve: false,
 	};
 
 	let service_config = random_config(true);
@@ -2178,6 +2179,7 @@ async fn lsps2_client_trusts_lsp() {
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
+		disable_client_reserve: false,
 	};
 
 	let service_config = random_config(true);
@@ -2351,6 +2353,7 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 		min_channel_opening_fee_msat: 0,
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: false,
+		disable_client_reserve: false,
 	};
 
 	let service_config = random_config(true);
