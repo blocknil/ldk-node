@@ -393,6 +393,14 @@ where
 	}
 
 	/// Fails back the payments of just-in-time flows stuck waiting on a channel that doesn't exist.
+	/// Blocknil patch; see `LSPS2ServiceHandler::broadcast_held_funding_transactions`.
+	pub(crate) fn broadcast_held_jit_fundings(&self) -> Vec<bitcoin::Transaction> {
+		match self.liquidity_manager.lsps2_service_handler() {
+			Some(handler) => handler.broadcast_held_funding_transactions(),
+			None => Vec::new(),
+		}
+	}
+
 	/// Blocknil patch; see `LSPS2ServiceHandler::fail_stuck_channel_opens`.
 	pub(crate) async fn fail_stuck_jit_opens(&self) -> usize {
 		match self.liquidity_manager.lsps2_service_handler() {

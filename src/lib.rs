@@ -1424,6 +1424,14 @@ impl Node {
 		}
 	}
 
+	/// Broadcasts the funding transactions still held back for just-in-time channels that are open
+	/// and ready. With `client_trusts_lsp`, a channel whose first payment failed never had its
+	/// funding broadcast, while the client went on using it. A provider calls this once after
+	/// [`Node::start`]. Returns the transactions broadcast. Blocknil patch.
+	pub fn broadcast_held_jit_fundings(&self) -> Vec<bitcoin::Transaction> {
+		self.liquidity_source.as_ref().map(|source| source.broadcast_held_jit_fundings()).unwrap_or_default()
+	}
+
 	/// Registers the signer for inputs that [`Node::splice_in_with_inputs`] contributes from a
 	/// wallet outside ldk-node. Blocknil patch.
 	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
