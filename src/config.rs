@@ -76,7 +76,9 @@ pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
 pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20;
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 10;
+// Blocknil patch: 10s was too short for a provider watching many channels; its Lightning sync
+// timed out on every pass, so it never saw splices or closes confirm.
+pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 120;
 
 // The timeout after which we give up waiting on LDK's event handler to exit on shutdown.
 pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
