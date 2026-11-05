@@ -174,11 +174,61 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	IgnoringMessageHandler,
 >;
 
-pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
+pub(crate) type DefaultMessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
 	Arc<Logger>,
 	Arc<KeysManager>,
 >;
+
+/// LDK's default message router, except on a node everyone reaches directly (an async payments
+/// server, i.e. a provider): there, paths always start at the node itself. LDK would otherwise
+/// start them at one of its peers — with a single peer connected, that peer, typically the very
+/// customer whose app is about to close — or, with several private peers, fail to build any.
+pub(crate) struct MessageRouter {
+	inner: DefaultMessageRouter,
+	direct_paths: bool,
+	entropy_source: Arc<KeysManager>,
+}
+
+impl MessageRouter {
+	pub(crate) fn new(
+		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, direct_paths: bool,
+	) -> Self {
+		let inner = DefaultMessageRouter::new(network_graph, Arc::clone(&entropy_source));
+		Self { inner, direct_paths, entropy_source }
+	}
+}
+
+impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
+	fn find_path(
+		&self, sender: bitcoin::secp256k1::PublicKey, peers: Vec<bitcoin::secp256k1::PublicKey>,
+		destination: lightning::onion_message::messenger::Destination,
+	) -> Result<lightning::onion_message::messenger::OnionMessagePath, ()> {
+		self.inner.find_path(sender, peers, destination)
+	}
+
+	fn create_blinded_paths<
+		T: bitcoin::secp256k1::Signing + bitcoin::secp256k1::Verification,
+	>(
+		&self, recipient: bitcoin::secp256k1::PublicKey,
+		local_node_receive_key: lightning::sign::ReceiveAuthKey,
+		context: lightning::blinded_path::message::MessageContext,
+		peers: Vec<lightning::blinded_path::message::MessageForwardNode>,
+		secp_ctx: &bitcoin::secp256k1::Secp256k1<T>,
+	) -> Result<Vec<lightning::blinded_path::message::BlindedMessagePath>, ()> {
+		if self.direct_paths {
+			return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
+				&[],
+				recipient,
+				local_node_receive_key,
+				context,
+				&*self.entropy_source,
+				secp_ctx,
+			)]);
+		}
+		self.inner.create_blinded_paths(recipient, local_node_receive_key, context, peers, secp_ctx)
+	}
+}
 
 pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
