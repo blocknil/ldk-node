@@ -1317,7 +1317,23 @@ where
 						});
 					}
 				}
-				let res = if allow_0conf {
+				// Blocknil backport: as an LSPS2 service with `disable_client_reserve`, a client
+				// that opens its own (anchor) channel to us keeps no reserve either.
+				let accept_0reserve = anchor_channel
+					&& self
+						.liquidity_source
+						.as_ref()
+						.is_some_and(|ls| ls.as_ref().disables_client_reserve());
+				let res = if accept_0reserve {
+					self.channel_manager.accept_inbound_channel_from_trusted_peer(
+						&temporary_channel_id,
+						&counterparty_node_id,
+						user_channel_id,
+						channel_override_config,
+						allow_0conf,
+						true,
+					)
+				} else if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer_0conf(
 						&temporary_channel_id,
 						&counterparty_node_id,
@@ -1337,8 +1353,9 @@ where
 					Ok(()) => {
 						log_info!(
 							self.logger,
-							"Accepting inbound{}{} channel of {}sats from{} peer {}",
+							"Accepting inbound{}{}{} channel of {}sats from{} peer {}",
 							if allow_0conf { " 0conf" } else { "" },
+							if accept_0reserve { " 0reserve" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
 							funding_satoshis,
 							if allow_0conf { " trusted" } else { "" },

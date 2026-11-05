@@ -150,6 +150,16 @@ pub struct LSPS2ServiceConfig {
 	///
 	/// [`bLIP-52`]: https://github.com/lightning/blips/blob/master/blip-0052.md#trust-models
 	pub client_trusts_lsp: bool,
+	/// Open JIT channels with no reserve on the client's side, so clients can spend their whole
+	/// channel balance.
+	///
+	/// This lets a client broadcast an old channel state with nothing to lose but the on-chain
+	/// fee. It is only safe because the service is always online watching the chain, so it can
+	/// claim the old state's whole balance with a justice transaction. Only anchor channels can
+	/// have a zero reserve.
+	///
+	/// Blocknil backport (ldk-node #853/#873, with rust-lightning #4428).
+	pub disable_client_reserve: bool,
 }
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
@@ -319,6 +329,12 @@ where
 
 	pub(crate) fn get_lsps1_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
 		self.lsps1_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
+	}
+
+	/// Blocknil backport: whether we, as an LSPS2 service, keep no reserve on our clients' side,
+	/// for channels we open to them and channels they open to us.
+	pub(crate) fn disables_client_reserve(&self) -> bool {
+		self.lsps2_service.as_ref().is_some_and(|s| s.service_config.disable_client_reserve)
 	}
 
 	pub(crate) fn get_lsps2_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
@@ -833,14 +849,26 @@ where
 				config.channel_config.forwarding_fee_base_msat = 0;
 				config.channel_config.forwarding_fee_proportional_millionths = 0;
 
-				match self.channel_manager.create_channel(
-					their_network_key,
-					channel_amount_sats,
-					0,
-					user_channel_id,
-					None,
-					Some(config),
-				) {
+				let opened = if service_config.disable_client_reserve {
+					self.channel_manager.create_channel_to_trusted_peer_0reserve(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				} else {
+					self.channel_manager.create_channel(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				};
+				match opened {
 					Ok(_) => {},
 					Err(e) => {
 						// TODO: We just silently fail here. Eventually we will need to remember
