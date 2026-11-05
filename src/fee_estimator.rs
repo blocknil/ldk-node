@@ -169,3 +169,15 @@ pub(crate) fn apply_post_estimation_adjustments(
 		_ => estimated_rate,
 	}
 }
+
+/// Blocknil patch: the targets whose transactions can wait their turn, which take the cheaper of
+/// Core's estimate and the mempool's. Commitment fees (agreed with the peer, which force-closes on
+/// one it finds too low), urgent claims and close negotiation keep Core's.
+pub(crate) fn may_use_mempool_rate(target: ConfirmationTarget) -> bool {
+	matches!(
+		target,
+		ConfirmationTarget::OnchainPayment
+			| ConfirmationTarget::ChannelFunding
+			| ConfirmationTarget::Lightning(LdkConfirmationTarget::OutputSpendingFee)
+	)
+}
