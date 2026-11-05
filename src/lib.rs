@@ -86,6 +86,7 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+mod mempool_fee;
 mod funding_signer;
 mod ffi;
 mod gossip;

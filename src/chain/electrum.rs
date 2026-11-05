@@ -29,8 +29,10 @@ use crate::config::{
 	FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, LDK_WALLET_SYNC_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS,
 };
 use crate::error::Error;
+use crate::mempool_fee::mempool_fee_rate_sat_vb;
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
+	may_use_mempool_rate,
 	ConfirmationTarget, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
@@ -576,6 +578,8 @@ impl ElectrumRuntimeClient {
 			let num_blocks = get_num_block_defaults_for_target(target);
 			batch.estimate_fee(num_blocks);
 		}
+		// Blocknil patch: and the mempool as it is, read last (see `mempool_fee_rate_sat_vb`).
+		batch.raw("mempool.get_fee_histogram".to_string(), vec![]);
 
 		let spawn_fut = self.runtime.spawn_blocking(move || electrum_client.batch_call(&batch));
 
@@ -584,7 +588,7 @@ impl ElectrumRuntimeClient {
 			spawn_fut,
 		);
 
-		let raw_estimates_btc_kvb = timeout_fut
+		let mut raw_estimates_btc_kvb = timeout_fut
 			.await
 			.map_err(|e| {
 				log_error!(self.logger, "Updating fee rate estimates timed out: {}", e);
@@ -598,6 +602,21 @@ impl ElectrumRuntimeClient {
 				log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
 				Error::FeerateEstimationUpdateFailed
 			})?;
+
+		// The histogram is the last answer; a server that doesn't give one leaves Core's estimates.
+		let histogram: Option<Vec<(f64, u64)>> =
+			if raw_estimates_btc_kvb.len() == confirmation_targets.len() + 1 {
+				raw_estimates_btc_kvb.pop().and_then(|v| {
+					v.as_array().map(|pairs| {
+						pairs
+							.iter()
+							.filter_map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_u64()?)))
+							.collect()
+					})
+				})
+			} else {
+				None
+			};
 
 		if raw_estimates_btc_kvb.len() != confirmation_targets.len()
 			&& self.config.network == Network::Bitcoin
@@ -629,6 +648,19 @@ impl ElectrumRuntimeClient {
 			let fee_rate = {
 				let fee_rate_sat_per_kwu = (fee_rate_btc_per_kvb * 25_000_000.0).round() as u64;
 				FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
+			};
+
+			// Blocknil patch: what can wait pays what the mempool asks, if that's less.
+			let fee_rate = match &histogram {
+				Some(histogram) if may_use_mempool_rate(target) => {
+					let num_blocks = get_num_block_defaults_for_target(target);
+					let mempool_sat_kwu =
+						(mempool_fee_rate_sat_vb(histogram, num_blocks) * 250.0).ceil() as u64;
+					FeeRate::from_sat_per_kwu(
+						fee_rate.to_sat_per_kwu().min(mempool_sat_kwu.max(253)),
+					)
+				},
+				_ => fee_rate,
 			};
 
 			// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
