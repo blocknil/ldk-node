@@ -1640,6 +1640,45 @@ impl Node {
 		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
 	}
 
+	/// Closes a channel cooperatively, with our side paid straight to `script` instead of to this
+	/// node's wallet. Blocknil patch.
+	///
+	/// Only works for a channel that didn't commit to a close address when it opened (see
+	/// `commit_upfront_shutdown_pubkey` in `default_user_config`), and `script` must be a SegWit
+	/// or Taproot output. Otherwise this fails and nothing is closed; [`Node::close_channel`]
+	/// still works.
+	pub fn close_channel_to(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		script: bitcoin::ScriptBuf,
+	) -> Result<(), Error> {
+		let shutdown_script =
+			lightning::ln::script::ShutdownScript::try_from(script).map_err(|e| {
+				log_error!(self.logger, "Can't close a channel to {:?}: not a SegWit output", e.script);
+				Error::InvalidAddress
+			})?;
+		let open_channels: Vec<LdkChannelDetails> =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or(Error::ChannelClosingFailed)?;
+		self.channel_manager
+			.close_channel_with_feerate_and_script(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				None,
+				Some(shutdown_script),
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to close channel to an address: {:?}", e);
+				Error::ChannelClosingFailed
+			})?;
+		if open_channels.len() == 1 {
+			self.peer_store.remove_peer(&counterparty_node_id)?;
+		}
+		Ok(())
+	}
+
 	fn close_channel_internal(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
 		force_close_reason: Option<String>,
