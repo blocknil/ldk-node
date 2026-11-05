@@ -1764,10 +1764,30 @@ where
 				..
 			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
 				// Blocknil patch: inputs from a wallet outside ldk-node are signed by the
-				// signer it registered (see `FundingInputSigner`).
+				// signer it registered (see `FundingInputSigner`), told the channel's current
+				// funding output so it needn't look it up.
 				let signer = self.funding_input_signer.signer.read().unwrap().clone();
 				match signer {
-					Some(signer) => signer.sign_funding_inputs(tx),
+					Some(signer) => {
+						let known_prevouts = self
+							.channel_manager
+							.list_channels()
+							.into_iter()
+							.filter(|c| c.channel_id == channel_id)
+							.filter_map(|c| {
+								let txo = c.funding_txo?;
+								let script = c.funding_redeem_script?.to_p2wsh();
+								Some((
+									txo.into_bitcoin_outpoint(),
+									bitcoin::TxOut {
+										value: bitcoin::Amount::from_sat(c.channel_value_satoshis),
+										script_pubkey: script,
+									},
+								))
+							})
+							.collect();
+						signer.sign_funding_inputs(tx, known_prevouts)
+					},
 					None => Ok(tx),
 				}
 			}) {

@@ -29,7 +29,13 @@ pub trait FundingInputSigner: Send + Sync {
 	///
 	/// The transaction must not be changed in any other way; its content was negotiated with the
 	/// channel counterparty.
-	fn sign_funding_inputs(&self, tx: Transaction) -> Result<Transaction, ()>;
+	///
+	/// `known_prevouts` are outputs the node already knows the inputs spend (the channel's current
+	/// funding output, for the shared input). Signing a Taproot input needs every input's previous
+	/// output; these need not be looked up, and can't be when the funding never reached the chain.
+	fn sign_funding_inputs(
+		&self, tx: Transaction, known_prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
+	) -> Result<Transaction, ()>;
 
 	/// Builds and signs a transaction that pays exactly `value_sats` to `output_script` (the new
 	/// channel's funding output) at `fee_rate`, with `locktime`. Anything else it pays goes back to
