@@ -198,6 +198,12 @@ pub struct Config {
 	/// keeps LDK's default (1,000 msat + 0). Blocknil patch: our provider forwards between its
 	/// customers for nothing.
 	pub forwarding_fees: Option<(u32, u32)>,
+	/// Blocks we ask between a forwarded payment's incoming and outgoing expiry; `None` keeps
+	/// LDK's default (72). Blocknil patch: a payer who goes offline once a held (async) payment is
+	/// sent has this long to come back after the receiver collects, before we must claim it from
+	/// their channel on-chain. At most 216: LDK won't build a blinded receive path through a hop
+	/// asking more.
+	pub forwarding_cltv_expiry_delta: Option<u16>,
 }
 
 impl Default for Config {
@@ -215,6 +221,7 @@ impl Default for Config {
 			inbound_channel_minimum_depth: None,
 			one_channel_per_peer: false,
 			forwarding_fees: None,
+			forwarding_cltv_expiry_delta: None,
 		}
 	}
 }
@@ -349,6 +356,9 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	if let Some((base_msat, proportional_ppm)) = config.forwarding_fees {
 		user_config.channel_config.forwarding_fee_base_msat = base_msat;
 		user_config.channel_config.forwarding_fee_proportional_millionths = proportional_ppm;
+	}
+	if let Some(delta) = config.forwarding_cltv_expiry_delta {
+		user_config.channel_config.cltv_expiry_delta = delta;
 	}
 
 	if may_announce_channel(config).is_err() {
