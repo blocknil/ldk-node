@@ -1772,7 +1772,8 @@ impl Node {
 				Ok(monitor) => {
 					let counterparty_node_id = monitor.get_counterparty_node_id();
 					for ldk_balance in monitor.get_claimable_balances() {
-						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
+						total_lightning_balance_sats +=
+							balance::newest_claimable_amount_satoshis(&ldk_balance);
 						lightning_balances.push(LightningBalance::from_ldk_balance(
 							channel_id,
 							counterparty_node_id,
