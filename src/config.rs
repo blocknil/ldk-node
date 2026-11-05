@@ -201,8 +201,8 @@ pub struct Config {
 	/// Blocks we ask between a forwarded payment's incoming and outgoing expiry; `None` keeps
 	/// LDK's default (72). Blocknil patch: a payer who goes offline once a held (async) payment is
 	/// sent has this long to come back after the receiver collects, before we must claim it from
-	/// their channel on-chain. At most 216: LDK won't build a blinded receive path through a hop
-	/// asking more.
+	/// their channel on-chain. At most 1008: past that, our vendored LDK won't build a blinded
+	/// receive path through the hop (upstream LDK stops at 216).
 	pub forwarding_cltv_expiry_delta: Option<u16>,
 }
 
