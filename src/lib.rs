@@ -1825,6 +1825,12 @@ impl Node {
 		self.payment_store.list_filter(f)
 	}
 
+	/// Every transaction the node's own on-chain wallet knows. Blocknil patch: the app's history
+	/// links a channel-wallet transaction to the ones it spends.
+	pub fn wallet_transactions(&self) -> Vec<bitcoin::Transaction> {
+		self.wallet.get_cached_txs().into_iter().map(|tx| (*tx).clone()).collect()
+	}
+
 	/// Retrieves all payments.
 	pub fn list_payments(&self) -> Vec<PaymentDetails> {
 		self.payment_store.list_filter(|_| true)
