@@ -1531,8 +1531,11 @@ fn build_with_store_internal(
 		}
 	}
 
-	let message_router =
-		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
+	let message_router = Arc::new(MessageRouter::new(
+		Arc::clone(&network_graph),
+		Arc::clone(&keys_manager),
+		matches!(async_payments_role, Some(AsyncPaymentsRole::Server)),
+	));
 
 	// Initialize the ChannelManager
 	let channel_manager = {
