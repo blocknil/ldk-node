@@ -350,6 +350,11 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
 	user_config.reject_inbound_splices = false;
+	// Blocknil patch: don't commit, at open, the address a cooperative close pays. Committed, it is
+	// fixed to the node's own wallet, so emptying a wallet to an address takes the close and then
+	// a second transaction forwarding the money. Uncommitted, `Node::close_channel_to` can close
+	// straight to the address.
+	user_config.channel_handshake_config.commit_upfront_shutdown_pubkey = false;
 	if let Some(depth) = config.inbound_channel_minimum_depth {
 		user_config.channel_handshake_config.minimum_depth = depth.max(1);
 	}
