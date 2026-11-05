@@ -516,6 +516,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets the expiry margin we ask on payments we forward. Blocknil patch; see
+	/// [`Config::forwarding_cltv_expiry_delta`].
+	pub fn set_forwarding_cltv_expiry_delta(&mut self, blocks: u16) -> &mut Self {
+		self.config.forwarding_cltv_expiry_delta = Some(blocks);
+		self
+	}
+
 	/// Accept at most one channel from each peer. Blocknil patch; see
 	/// [`Config::one_channel_per_peer`].
 	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {
