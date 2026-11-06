@@ -91,6 +91,8 @@ mod funding_signer;
 mod ffi;
 mod gossip;
 pub mod graph;
+mod held_forwards;
+pub use held_forwards::{HoldRecord, OnHeld};
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -211,6 +213,8 @@ pub struct Node {
 	async_payments_role: Option<AsyncPaymentsRole>,
 	/// Blocknil patch: see [`FundingInputSigner`].
 	funding_input_signer: funding_signer::FundingInputSignerSlot,
+	/// Blocknil patch: payments held for offline customers (see `held_forwards`).
+	held_forwards: Arc<held_forwards::HeldForwards>,
 }
 
 impl Node {
@@ -441,6 +445,21 @@ impl Node {
 			}
 		});
 
+		// Blocknil patch: held payments go through as soon as their customer is back, or are failed
+		// back once they've waited long enough (see `held_forwards`).
+		let held_forwards = Arc::clone(&self.held_forwards);
+		let mut stop_held = self.stop_sender.subscribe();
+		self.runtime.spawn_cancellable_background_task(async move {
+			let mut interval = tokio::time::interval(Duration::from_millis(500));
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tokio::select! {
+					_ = stop_held.changed() => return,
+					_ = interval.tick() => held_forwards.process(),
+				}
+			}
+		});
+
 		// Regularly broadcast node announcements.
 		let bcast_cm = Arc::clone(&self.channel_manager);
 		let bcast_pm = Arc::clone(&self.peer_manager);
@@ -563,6 +582,7 @@ impl Node {
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 			Arc::clone(&self.funding_input_signer),
+			Arc::clone(&self.held_forwards),
 		));
 
 		// Setup background processing
@@ -1437,6 +1457,36 @@ impl Node {
 	/// wallet outside ldk-node. Blocknil patch.
 	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
 		*self.funding_input_signer.signer.write().unwrap() = Some(signer);
+	}
+
+	/// Blocknil patch: the intercept SCID payments to `customer` should be routed through (in
+	/// their invoices' route hints), so a payment that arrives while they're offline is held for
+	/// them instead of failed. Made and saved on first use; stable after that.
+	pub fn hold_scid_for(&self, customer: PublicKey) -> Result<u64, Error> {
+		self.held_forwards.scid_for(customer)
+	}
+
+	/// Blocknil patch: how long a payment for an offline customer is held before it is failed
+	/// back (50 s by default).
+	pub fn set_hold_duration(&self, hold_for: Duration) {
+		self.held_forwards.set_hold_for(hold_for);
+	}
+
+	/// Blocknil patch: called with the customer each time a payment starts being held for them,
+	/// to wake their phone.
+	pub fn set_payment_held_handler(&self, on_held: held_forwards::OnHeld) {
+		self.held_forwards.set_on_held(on_held);
+	}
+
+	/// Blocknil patch: payments held right now, as `(customer, amount_msat, seconds left)`.
+	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
+		self.held_forwards.held()
+	}
+
+	/// Blocknil patch: the last payments that were held and have since ended (forwarded or failed
+	/// back), newest first.
+	pub fn recent_held_payments(&self) -> Vec<held_forwards::HoldRecord> {
+		self.held_forwards.recent()
 	}
 
 	/// The fee rate ldk-node would pay for a channel funding transaction right now. A caller

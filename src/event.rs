@@ -492,10 +492,13 @@ where
 	logger: L,
 	config: Arc<Config>,
 	static_invoice_store: Option<StaticInvoiceStore>,
+	// Blocknil patch: held onion messages now go out through `held_forwards`.
+	#[allow(dead_code)]
 	onion_messenger: Arc<OnionMessenger>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	/// Blocknil patch: signs splice inputs from a wallet outside ldk-node.
 	funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
+	held_forwards: Arc<crate::held_forwards::HeldForwards>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -513,6 +516,7 @@ where
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
 		config: Arc<Config>,
 		funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
+		held_forwards: Arc<crate::held_forwards::HeldForwards>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -532,6 +536,7 @@ where
 			onion_messenger,
 			om_mailbox,
 			funding_input_signer,
+			held_forwards,
 		}
 	}
 
@@ -1616,7 +1621,14 @@ where
 				payment_hash,
 				..
 			} => {
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+				// Blocknil patch: a payment on a customer's hold SCID waits for them if needed.
+				if self.held_forwards.is_hold_scid(requested_next_hop_scid) {
+					self.held_forwards.intercepted(
+						requested_next_hop_scid,
+						intercept_id,
+						expected_outbound_amount_msat,
+					);
+				} else if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source
 						.handle_htlc_intercepted(
 							requested_next_hop_scid,
@@ -1694,19 +1706,8 @@ where
 			LdkEvent::OnionMessagePeerConnected { peer_node_id } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					let messages = om_mailbox.onion_message_peer_connected(peer_node_id);
-
-					for message in messages {
-						if let Err(e) =
-							self.onion_messenger.forward_onion_message(message, &peer_node_id)
-						{
-							log_trace!(
-								self.logger,
-								"Failed to forward onion message to peer {}: {:?}",
-								peer_node_id,
-								e
-							);
-						}
-					}
+					// Blocknil patch: only once the peer's channel is back (`held_forwards`).
+					self.held_forwards.release_onion_messages(peer_node_id, messages);
 				}
 			},
 

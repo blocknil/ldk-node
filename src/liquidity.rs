@@ -1414,6 +1414,53 @@ where
 			})
 	}
 
+	/// Blocknil patch: an invoice whose route hint goes through the provider's hold SCID for us
+	/// (`Node::hold_scid_for` on the provider), so a payment that arrives while we're offline is
+	/// held for us instead of failed. Built and signed like the just-in-time invoices above.
+	pub(crate) fn create_hold_invoice(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		provider: PublicKey, scid: u64, cltv_expiry_delta: u16,
+	) -> Result<Bolt11Invoice, Error> {
+		let (payment_hash, payment_secret) = self
+			.channel_manager
+			.create_inbound_payment(amount_msat, expiry_secs, Some(MIN_FINAL_CLTV_EXPIRY_DELTA))
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+				Error::InvoiceCreationFailed
+			})?;
+		let route_hint = RouteHint(vec![RouteHintHop {
+			src_node_id: provider,
+			short_channel_id: scid,
+			fees: RoutingFees { base_msat: 0, proportional_millionths: 0 },
+			cltv_expiry_delta,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}]);
+		let payment_hash = sha256::Hash::from_slice(&payment_hash.0).map_err(|e| {
+			log_error!(self.logger, "Invalid payment hash: {:?}", e);
+			Error::InvoiceCreationFailed
+		})?;
+		let mut invoice_builder = InvoiceBuilder::new(self.config.network.into())
+			.invoice_description(description.clone())
+			.payment_hash(payment_hash)
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(MIN_FINAL_CLTV_EXPIRY_DELTA.into())
+			.expiry_time(Duration::from_secs(expiry_secs.into()))
+			.private_route(route_hint);
+		if let Some(amount_msat) = amount_msat {
+			invoice_builder = invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
+		}
+		invoice_builder
+			.build_signed(|hash| {
+				Secp256k1::new().sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
+			})
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to build and sign invoice: {}", e);
+				Error::InvoiceCreationFailed
+			})
+	}
+
 	pub(crate) async fn handle_channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) {

@@ -1848,6 +1848,14 @@ fn build_with_store_internal(
 
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
+	// Blocknil patch: payments held for offline customers (see `held_forwards`).
+	let held_forwards = Arc::new(crate::held_forwards::HeldForwards::new(
+		Arc::clone(&kv_store),
+		Arc::clone(&channel_manager),
+		Arc::clone(&onion_messenger),
+		Arc::clone(&logger),
+	));
+
 	Ok(Node {
 		runtime,
 		stop_sender,
@@ -1880,6 +1888,7 @@ fn build_with_store_internal(
 		om_mailbox,
 		async_payments_role,
 		funding_input_signer: Arc::new(Default::default()),
+		held_forwards,
 	})
 }
 
