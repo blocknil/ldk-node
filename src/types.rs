@@ -429,6 +429,13 @@ pub struct ChannelDetails {
 	pub inbound_htlc_maximum_msat: Option<u64>,
 	/// Set of configurable parameters that affect channel operation.
 	pub config: ChannelConfig,
+	/// Inbound HTLCs that are not yet irrevocably resolved on both sides.
+	///
+	/// Blocknil patch: a claimed payment is not finished when LDK marks it `Succeeded` — the
+	/// fulfill still has to reach the counterparty — and an HTLC disappears from this count only
+	/// once the counterparty has answered. The notification extension waits for it to reach zero
+	/// before stopping the node, or the payer is left waiting.
+	pub pending_inbound_htlc_count: u32,
 }
 
 impl From<LdkChannelDetails> for ChannelDetails {
@@ -477,6 +484,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 				.map(|f| f.cltv_expiry_delta),
 			next_outbound_htlc_limit_msat: value.next_outbound_htlc_limit_msat,
 			next_outbound_htlc_minimum_msat: value.next_outbound_htlc_minimum_msat,
+			pending_inbound_htlc_count: value.pending_inbound_htlcs.len() as u32,
 			force_close_spend_delay: value.force_close_spend_delay,
 			// unwrap safety: This field is only `None` for objects serialized prior to LDK 0.0.107
 			inbound_htlc_minimum_msat: value.inbound_htlc_minimum_msat.unwrap_or(0),
