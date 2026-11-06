@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, Bolt11PaymentError, PaymentId, Retry, RetryableSendFailure,
 };
@@ -397,6 +398,45 @@ impl Bolt11Payment {
 
 		self.channel_manager.fail_htlc_backwards(&payment_hash);
 		Ok(())
+	}
+
+	/// Blocknil patch: an invoice routed through the provider's hold SCID for us (`scid`, with the
+	/// provider's `cltv_expiry_delta`), so the provider holds a payment that arrives while we're
+	/// offline instead of failing it. `amount_msat: None` is an any-amount invoice. Claimed on
+	/// arrival like any other.
+	pub fn receive_via_hold_scid(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		provider: PublicKey, scid: u64, cltv_expiry_delta: u16,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+		let invoice = liquidity_source.create_hold_invoice(
+			amount_msat,
+			&description,
+			expiry_secs,
+			provider,
+			scid,
+			cltv_expiry_delta,
+		)?;
+		log_info!(self.logger, "Invoice created through hold SCID {}: {}", scid, invoice);
+
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let payment_secret = invoice.payment_secret();
+		let preimage =
+			self.channel_manager.get_payment_preimage(payment_hash, payment_secret.clone()).ok();
+		let kind =
+			PaymentKind::Bolt11 { hash: payment_hash, preimage, secret: Some(payment_secret.clone()) };
+		let payment = PaymentDetails::new(
+			PaymentId(payment_hash.0),
+			kind,
+			amount_msat,
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		self.payment_store.insert(payment)?;
+		Ok(maybe_wrap(invoice))
 	}
 
 	/// Returns a payable invoice that can be used to request and receive a payment of the amount
