@@ -208,6 +208,28 @@ pub struct WebhookPost {
 /// Delivers a [`WebhookPost`]; see [`crate::Node::set_webhook_sender`]. Blocknil patch (LSPS5).
 pub type OnWebhook = Arc<dyn Fn(WebhookPost) + Send + Sync>;
 
+/// The provider's answer to a webhook registration, as the LSPS5 client reports it.
+///
+/// Blocknil patch (LSPS5): the wallet shows "Notifications: on/off" from this, so the answer has to
+/// be readable rather than only logged. Delivered to the handler set with
+/// [`crate::Node::set_webhook_result_handler`], on the node's event thread: it must not block.
+#[derive(Clone, Debug)]
+pub struct WebhookResult {
+	/// The URL that was registered, as the provider echoes it back.
+	pub url: String,
+	/// The app name it was registered under.
+	pub app_name: String,
+	/// True when the provider accepted it; false when it refused (see `error`).
+	pub accepted: bool,
+	/// True when the provider already had this exact URL and changed nothing.
+	pub no_change: bool,
+	/// Why it was refused, when it was. Empty when accepted.
+	pub error: String,
+}
+
+/// Receives a [`WebhookResult`]; see [`crate::Node::set_webhook_result_handler`]. Blocknil patch.
+pub type OnWebhookResult = Arc<dyn Fn(WebhookResult) + Send + Sync>;
+
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
 where
 	L::Target: LdkLogger,
@@ -368,6 +390,7 @@ where
 			lsps2_client: self.lsps2_client,
 			lsps2_service: self.lsps2_service,
 			webhook_sender: RwLock::new(None),
+			webhook_result_handler: RwLock::new(None),
 			wallet: self.wallet,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
@@ -388,6 +411,9 @@ where
 	lsps2_service: Option<LSPS2Service>,
 	/// Where LSPS5 notifications go; see [`OnWebhook`]. Blocknil patch.
 	webhook_sender: RwLock<Option<OnWebhook>>,
+	/// Where the provider's answers to webhook registrations go; see [`OnWebhookResult`].
+	/// Blocknil patch.
+	webhook_result_handler: RwLock<Option<OnWebhookResult>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
@@ -408,6 +434,20 @@ where
 	/// Blocknil patch: where LSPS5 notifications go (see [`OnWebhook`]).
 	pub(crate) fn set_webhook_sender(&self, sender: OnWebhook) {
 		*self.webhook_sender.write().unwrap() = Some(sender);
+	}
+
+	/// Blocknil patch: where the provider's answers to webhook registrations go (see
+	/// [`OnWebhookResult`]). Called on the node's event thread, so it must not block.
+	pub(crate) fn set_webhook_result_handler(&self, handler: OnWebhookResult) {
+		*self.webhook_result_handler.write().unwrap() = Some(handler);
+	}
+
+	/// Blocknil patch: hands a registration answer to the wallet, if it asked for them.
+	fn report_webhook(&self, result: WebhookResult) {
+		let handler = self.webhook_result_handler.read().unwrap().clone();
+		if let Some(handler) = handler {
+			handler(result);
+		}
 	}
 
 	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them.
@@ -1160,27 +1200,46 @@ where
 					),
 				}
 			},
-			// Blocknil patch: LSPS5 on the client side. The wallet only logs the answer; it
-			// re-registers on the next run, so a refusal costs one push.
+			// Blocknil patch: LSPS5 on the client side. The provider's answer is handed to the
+			// wallet (`set_webhook_result_handler`) so settings can show whether pushing is
+			// actually on, and logged as before.
 			LiquidityEvent::LSPS5Client(event) => match event {
 				LSPS5ClientEvent::WebhookRegistered {
-					counterparty_node_id, app_name, no_change, ..
-				} => log_info!(
-					self.logger,
-					"Webhook {:?} registered with {} (unchanged: {})",
-					app_name,
-					counterparty_node_id,
-					no_change
-				),
+					counterparty_node_id, app_name, no_change, url, ..
+				} => {
+					log_info!(
+						self.logger,
+						"Webhook {:?} registered with {} (unchanged: {})",
+						app_name,
+						counterparty_node_id,
+						no_change
+					);
+					self.report_webhook(WebhookResult {
+						url: url.to_string(),
+						app_name: app_name.to_string(),
+						accepted: true,
+						no_change,
+						error: String::new(),
+					});
+				},
 				LSPS5ClientEvent::WebhookRegistrationFailed {
-					counterparty_node_id, app_name, error, ..
-				} => log_error!(
-					self.logger,
-					"Webhook {:?} refused by {}: {:?}",
-					app_name,
-					counterparty_node_id,
-					error
-				),
+					counterparty_node_id, app_name, error, url, ..
+				} => {
+					log_error!(
+						self.logger,
+						"Webhook {:?} refused by {}: {:?}",
+						app_name,
+						counterparty_node_id,
+						error
+					);
+					self.report_webhook(WebhookResult {
+						url: url.to_string(),
+						app_name: app_name.to_string(),
+						accepted: false,
+						no_change: false,
+						error: format!("{error:?}"),
+					});
+				},
 				other => log_debug!(self.logger, "LSPS5 client event: {:?}", other),
 			},
 			e => {
