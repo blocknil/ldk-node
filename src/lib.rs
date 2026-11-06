@@ -1487,6 +1487,15 @@ impl Node {
 		}
 	}
 
+	/// Blocknil patch: where the LSP's answer to [`Node::set_webhook`] goes (see
+	/// [`liquidity::OnWebhookResult`]), so a wallet can show whether pushing is really on. It is
+	/// called on the node's event thread: don't block in it.
+	pub fn set_webhook_result_handler(&self, handler: liquidity::OnWebhookResult) {
+		if let Some(source) = self.liquidity_source.as_ref() {
+			source.set_webhook_result_handler(handler);
+		}
+	}
+
 	/// Blocknil patch: registers `url` as `app_name`'s webhook with the LSP ([LSPS5]), so the LSP
 	/// can tell the phone that a payment is waiting for it while the app is closed. Needs
 	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP's answer comes
