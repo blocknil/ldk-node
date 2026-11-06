@@ -52,7 +52,10 @@ pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 
 // The timeout after which we abandon retrying failed payments.
-pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+// Blocknil patch: 60 s, from 10. A phone's first message to its provider can take seconds after a
+// reconnect, and on 2026-11-06 one route's `TemporaryChannelFailure` came back after 15 s, past
+// the window, so other routes to the same payee were never tried and the payment failed.
+pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The interval (in block height) after which we retry archiving fully resolved channel monitors.
 pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
