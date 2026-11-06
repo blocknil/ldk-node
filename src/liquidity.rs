@@ -34,6 +34,9 @@ use lightning_liquidity::lsps2::event::{LSPS2ClientEvent, LSPS2ServiceEvent};
 use lightning_liquidity::lsps2::msgs::{LSPS2OpeningFeeParams, LSPS2RawOpeningFeeParams};
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
+use lightning_liquidity::lsps5::client::LSPS5ClientConfig as LdkLSPS5ClientConfig;
+use lightning_liquidity::lsps5::event::{LSPS5ClientEvent, LSPS5ServiceEvent};
+use lightning_liquidity::lsps5::service::LSPS5ServiceConfig as LdkLSPS5ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 use lightning_types::payment::PaymentHash;
 use rand::Rng;
@@ -162,6 +165,49 @@ pub struct LSPS2ServiceConfig {
 	pub disable_client_reserve: bool,
 }
 
+/// Represents the configuration of the LSPS5 (webhook) service.
+///
+/// The service keeps a webhook URL per client and tells it when a payment is waiting, which is how
+/// a phone whose app is closed is woken (`docs/push-wake-plan.md`). Blocknil patch: upstream
+/// ldk-node leaves LSPS5 switched off entirely.
+///
+/// See [bLIP-55 / LSPS5] for more information.
+///
+/// [bLIP-55 / LSPS5]: https://github.com/lightning/blips/pull/55/files
+#[derive(Debug, Clone)]
+pub struct LSPS5ServiceConfig {
+	/// How many webhook URLs one client may register with us.
+	pub max_webhooks_per_client: u32,
+	/// The hosts we will actually POST to; empty allows none, as upstream's "any HTTPS host" is an
+	/// open redirect target for anyone who opens a channel.
+	pub allowed_hosts: Vec<String>,
+}
+
+impl Default for LSPS5ServiceConfig {
+	fn default() -> Self {
+		Self { max_webhooks_per_client: 10, allowed_hosts: Vec::new() }
+	}
+}
+
+/// A webhook notification to deliver: a JSON body this node signed, and where to POST it.
+///
+/// Blocknil patch (LSPS5). Delivered to the sender registered with
+/// [`crate::Node::set_webhook_sender`], which runs on a thread of its own: a sender may block for
+/// as long as its own timeout, and the notification is dropped if it fails (the payment it
+/// announces stops waiting for the phone after the hold, 50 s by default).
+#[derive(Clone, Debug)]
+pub struct WebhookPost {
+	/// The URL the client registered.
+	pub url: String,
+	/// The headers to send with the POST, including the LSPS5 timestamp and signature.
+	pub headers: Vec<(String, String)>,
+	/// The JSON body, exactly as signed: `serde_json::to_string` of the notification.
+	pub body: String,
+}
+
+/// Delivers a [`WebhookPost`]; see [`crate::Node::set_webhook_sender`]. Blocknil patch (LSPS5).
+pub type OnWebhook = Arc<dyn Fn(WebhookPost) + Send + Sync>;
+
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
 where
 	L::Target: LdkLogger,
@@ -169,6 +215,8 @@ where
 	lsps1_client: Option<LSPS1Client>,
 	lsps2_client: Option<LSPS2Client>,
 	lsps2_service: Option<LSPS2Service>,
+	lsps5_service: Option<LSPS5ServiceConfig>,
+	lsps5_client: bool,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
@@ -191,10 +239,14 @@ where
 		let lsps1_client = None;
 		let lsps2_client = None;
 		let lsps2_service = None;
+		let lsps5_service = None;
+		let lsps5_client = false;
 		Self {
 			lsps1_client,
 			lsps2_client,
 			lsps2_service,
+			lsps5_service,
+			lsps5_client,
 			wallet,
 			channel_manager,
 			keys_manager,
@@ -204,6 +256,18 @@ where
 			config,
 			logger,
 		}
+	}
+
+	/// Blocknil patch: LSPS5, the service that tells a client's webhook when a payment is waiting.
+	pub(crate) fn lsps5_service(&mut self, service_config: LSPS5ServiceConfig) -> &mut Self {
+		self.lsps5_service = Some(service_config);
+		self
+	}
+
+	/// Blocknil patch: LSPS5 on the client side, to register a webhook with the LSP.
+	pub(crate) fn lsps5_client(&mut self) -> &mut Self {
+		self.lsps5_client = true;
+		self
 	}
 
 	pub(crate) fn lsps1_client(
@@ -252,16 +316,31 @@ where
 	}
 
 	pub(crate) async fn build(self) -> Result<LiquiditySource<L>, BuildError> {
-		let liquidity_service_config = self.lsps2_service.as_ref().map(|s| {
-			let lsps2_service_config = Some(s.ldk_service_config.clone());
-			let lsps5_service_config = None;
-			let advertise_service = s.service_config.advertise_service;
-			LiquidityServiceConfig { lsps2_service_config, lsps5_service_config, advertise_service }
-		});
+		let liquidity_service_config = if self.lsps2_service.is_some() || self.lsps5_service.is_some() {
+			Some(LiquidityServiceConfig {
+				lsps2_service_config: self
+					.lsps2_service
+					.as_ref()
+					.map(|s| s.ldk_service_config.clone()),
+				// Blocknil patch: LSPS5, off upstream.
+				lsps5_service_config: self.lsps5_service.as_ref().map(|c| LdkLSPS5ServiceConfig {
+					max_webhooks_per_client: c.max_webhooks_per_client,
+					// Always a list: ours accepts only the hosts named, and an empty one none.
+					allowed_hosts: Some(c.allowed_hosts.clone()),
+				}),
+				advertise_service: self
+					.lsps2_service
+					.as_ref()
+					.map_or(false, |s| s.service_config.advertise_service),
+			})
+		} else {
+			None
+		};
 
 		let lsps1_client_config = self.lsps1_client.as_ref().map(|s| s.ldk_client_config.clone());
 		let lsps2_client_config = self.lsps2_client.as_ref().map(|s| s.ldk_client_config.clone());
-		let lsps5_client_config = None;
+		// Blocknil patch: LSPS5 on the client side, off upstream.
+		let lsps5_client_config = self.lsps5_client.then(LdkLSPS5ClientConfig::default);
 		let liquidity_client_config = Some(LiquidityClientConfig {
 			lsps1_client_config,
 			lsps2_client_config,
@@ -288,6 +367,7 @@ where
 			lsps1_client: self.lsps1_client,
 			lsps2_client: self.lsps2_client,
 			lsps2_service: self.lsps2_service,
+			webhook_sender: RwLock::new(None),
 			wallet: self.wallet,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
@@ -306,6 +386,8 @@ where
 	lsps1_client: Option<LSPS1Client>,
 	lsps2_client: Option<LSPS2Client>,
 	lsps2_service: Option<LSPS2Service>,
+	/// Where LSPS5 notifications go; see [`OnWebhook`]. Blocknil patch.
+	webhook_sender: RwLock<Option<OnWebhook>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
@@ -321,6 +403,55 @@ where
 {
 	pub(crate) fn set_peer_manager(&self, peer_manager: Arc<PeerManager>) {
 		*self.peer_manager.write().unwrap() = Some(peer_manager);
+	}
+
+	/// Blocknil patch: where LSPS5 notifications go (see [`OnWebhook`]).
+	pub(crate) fn set_webhook_sender(&self, sender: OnWebhook) {
+		*self.webhook_sender.write().unwrap() = Some(sender);
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them.
+	/// `false` when nothing went out: no LSPS5 service, no webhook registered, or one was sent
+	/// less than the ten-second floor ago.
+	pub(crate) fn notify_payment_incoming(&self, customer: PublicKey) -> bool {
+		match self.liquidity_manager.lsps5_service_handler() {
+			Some(handler) => match handler.notify_payment_incoming(customer) {
+				Ok(()) => true,
+				Err(e) => {
+					log_debug!(self.logger, "Webhook for {} not sent: {:?}", customer, e);
+					false
+				},
+			},
+			None => false,
+		}
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that an onion message (a BOLT12
+	/// invoice request, typically) is waiting for them.
+	pub(crate) fn notify_onion_message_incoming(&self, customer: PublicKey) -> bool {
+		match self.liquidity_manager.lsps5_service_handler() {
+			Some(handler) => match handler.notify_onion_message_incoming(customer) {
+				Ok(()) => true,
+				Err(e) => {
+					log_debug!(self.logger, "Onion message webhook for {} not sent: {:?}", customer, e);
+					false
+				},
+			},
+			None => false,
+		}
+	}
+
+	/// Blocknil patch: registers `url` as `app_name`'s webhook with the LSP (LSPS5). The answer
+	/// comes later, as a [`LSPS5ClientEvent`], which is logged.
+	pub(crate) fn set_webhook(
+		&self, lsp: PublicKey, app_name: String, url: String,
+	) -> Result<(), Error> {
+		let handler =
+			self.liquidity_manager.lsps5_client_handler().ok_or(Error::WebhookRegistrationFailed)?;
+		handler.set_webhook(lsp, app_name, url).map(|_| ()).map_err(|e| {
+			log_error!(self.logger, "Registering the webhook was refused: {:?}", e);
+			Error::WebhookRegistrationFailed
+		})
 	}
 
 	pub(crate) fn liquidity_manager(&self) -> Arc<LiquidityManager> {
@@ -987,6 +1118,70 @@ where
 						"Received unexpected LSPS2Client::InvoiceParametersReady event!"
 					);
 				}
+			},
+			// Blocknil patch: LSPS5. A notification for a customer's registered webhook goes to
+			// the sender the provider registered (`push-relay`'s HTTP POST), on a thread of its
+			// own: a POST that hangs must not hold up the node, and there is no point retrying
+			// past the hold, so a failure drops it.
+			LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
+				counterparty_node_id,
+				url,
+				notification,
+				headers,
+				..
+			}) => {
+				match serde_json::to_string(&notification) {
+					Ok(body) => {
+						let post = WebhookPost { url: url.to_string(), headers, body };
+						match self.webhook_sender.read().unwrap().clone() {
+							Some(sender) => {
+								log_debug!(
+									self.logger,
+									"Sending webhook {:?} to {} for {}",
+									post.url,
+									counterparty_node_id,
+									post.body
+								);
+								let _ = std::thread::Builder::new()
+									.name("lsps5-webhook".to_string())
+									.spawn(move || sender(post));
+							},
+							None => log_error!(
+								self.logger,
+								"No webhook sender registered; dropping the notification for {}",
+								counterparty_node_id
+							),
+						}
+					},
+					Err(e) => log_error!(
+						self.logger,
+						"Webhook notification doesn't serialize: {:?}",
+						e
+					),
+				}
+			},
+			// Blocknil patch: LSPS5 on the client side. The wallet only logs the answer; it
+			// re-registers on the next run, so a refusal costs one push.
+			LiquidityEvent::LSPS5Client(event) => match event {
+				LSPS5ClientEvent::WebhookRegistered {
+					counterparty_node_id, app_name, no_change, ..
+				} => log_info!(
+					self.logger,
+					"Webhook {:?} registered with {} (unchanged: {})",
+					app_name,
+					counterparty_node_id,
+					no_change
+				),
+				LSPS5ClientEvent::WebhookRegistrationFailed {
+					counterparty_node_id, app_name, error, ..
+				} => log_error!(
+					self.logger,
+					"Webhook {:?} refused by {}: {:?}",
+					app_name,
+					counterparty_node_id,
+					error
+				),
+				other => log_debug!(self.logger, "LSPS5 client event: {:?}", other),
 			},
 			e => {
 				log_error!(self.logger, "Received unexpected liquidity event: {:?}", e);
