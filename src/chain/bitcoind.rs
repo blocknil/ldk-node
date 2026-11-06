@@ -34,10 +34,11 @@ use crate::config::{
 };
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
-	ConfirmationTarget, OnchainFeeEstimator,
+	may_use_mempool_rate, ConfirmationTarget, OnchainFeeEstimator,
 };
+use crate::mempool_fee::mempool_fee_rate_sat_vb;
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -494,6 +495,27 @@ impl BitcoindChainSource {
 		}
 		let confirmation_targets = get_all_conf_targets();
 
+		// Blocknil patch: the mempool as it is, from the entries the mempool poll keeps (see
+		// `mempool_fee`). Without a complete picture, Core's estimates stand alone.
+		let histogram = match tokio::time::timeout(
+			Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
+			self.api_client.get_mempool_size(),
+		)
+		.await
+		{
+			Ok(Ok(size)) => self.api_client.mempool_fee_histogram(size),
+			_ => None,
+		};
+		match &histogram {
+			Some(h) => log_debug!(
+				self.logger,
+				"Mempool histogram for fee estimates: {} transactions, {} vB",
+				h.len(),
+				h.iter().map(|(_, vsize)| vsize).sum::<u64>()
+			),
+			None => log_debug!(self.logger, "No complete mempool picture yet: Core's fee estimates only"),
+		}
+
 		let mut new_fee_rate_cache = HashMap::with_capacity(10);
 		let now = Instant::now();
 		for target in confirmation_targets {
@@ -555,6 +577,19 @@ impl BitcoindChainSource {
 					);
 					return Ok(());
 				},
+			};
+
+			// Blocknil patch: what can wait pays what the mempool asks, if that's less.
+			let fee_rate = match &histogram {
+				Some(histogram) if may_use_mempool_rate(target) => {
+					let num_blocks = get_num_block_defaults_for_target(target);
+					let mempool_sat_kwu =
+						(mempool_fee_rate_sat_vb(histogram, num_blocks) * 250.0).ceil() as u64;
+					FeeRate::from_sat_per_kwu(
+						fee_rate.to_sat_per_kwu().min(mempool_sat_kwu.max(253)),
+					)
+				},
+				_ => fee_rate,
 			};
 
 			// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
@@ -774,6 +809,42 @@ impl BitcoindClient {
 	}
 
 	/// Gets the mempool minimum fee rate.
+	/// Blocknil patch: how many transactions the node's mempool holds.
+	pub(crate) async fn get_mempool_size(&self) -> std::io::Result<u64> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => rpc_client
+				.call_method::<MempoolSizeResponse>("getmempoolinfo", &[])
+				.await
+				.map(|r| r.0),
+			BitcoindClient::Rest { rest_client, .. } => rest_client
+				.request_resource::<JsonResponse, MempoolSizeResponse>("mempool/info.json")
+				.await
+				.map(|r| r.0),
+		}
+	}
+
+	/// Blocknil patch: `(fee rate in sat/vB, vsize)` for every transaction the mempool poll has
+	/// cached, highest rate first, for `mempool_fee_rate_sat_vb`. `None` while a poll is filling
+	/// the cache (never waits for it) or when it holds under 95% of the `expected` transactions:
+	/// a partial mempool would make the rate look lower than it is.
+	pub(crate) fn mempool_fee_histogram(&self, expected: u64) -> Option<Vec<(f64, u64)>> {
+		let cache = match self {
+			BitcoindClient::Rpc { mempool_entries_cache, .. }
+			| BitcoindClient::Rest { mempool_entries_cache, .. } => mempool_entries_cache,
+		};
+		let entries = cache.try_lock().ok()?;
+		if (entries.len() as u64) * 100 < expected * 95 {
+			return None;
+		}
+		let mut histogram: Vec<(f64, u64)> = entries
+			.values()
+			.filter(|e| e.vsize > 0)
+			.map(|e| (e.fee_sat as f64 / e.vsize as f64, e.vsize))
+			.collect();
+		histogram.sort_by(|a, b| b.0.total_cmp(&a.0));
+		Some(histogram)
+	}
+
 	pub(crate) async fn get_mempool_minimum_fee_rate(&self) -> std::io::Result<FeeRate> {
 		match self {
 			BitcoindClient::Rpc { rpc_client, .. } => {
@@ -962,7 +1033,13 @@ impl BitcoindClient {
 		let txid_json = serde_json::json!(txid_hex);
 
 		match client.call_method::<GetMempoolEntryResponse>("getmempoolentry", &[txid_json]).await {
-			Ok(resp) => Ok(Some(MempoolEntry { txid, time: resp.time, height: resp.height })),
+			Ok(resp) => Ok(Some(MempoolEntry {
+				txid,
+				time: resp.time,
+				height: resp.height,
+				vsize: resp.vsize,
+				fee_sat: resp.fee_sat,
+			})),
 			Err(e) => match e.into_inner() {
 				Some(inner) => {
 					let rpc_error_res: Result<Box<RpcError>, _> = inner.downcast();
@@ -1272,6 +1349,19 @@ impl TryInto<MempoolMinFeeResponse> for JsonResponse {
 	}
 }
 
+/// Blocknil patch: the number of transactions in the mempool (`getmempoolinfo`'s `size`).
+pub(crate) struct MempoolSizeResponse(pub u64);
+
+impl TryInto<MempoolSizeResponse> for JsonResponse {
+	type Error = std::io::Error;
+	fn try_into(self) -> std::io::Result<MempoolSizeResponse> {
+		self.0["size"].as_u64().map(MempoolSizeResponse).ok_or(std::io::Error::new(
+			std::io::ErrorKind::Other,
+			"Failed to parse mempool size",
+		))
+	}
+}
+
 pub(crate) struct GetRawTransactionResponse(pub Transaction);
 
 impl TryInto<GetRawTransactionResponse> for JsonResponse {
@@ -1340,6 +1430,9 @@ impl TryInto<GetRawMempoolResponse> for JsonResponse {
 pub struct GetMempoolEntryResponse {
 	time: u64,
 	height: u32,
+	/// Blocknil patch: size and fee, for the mempool histogram (0 when missing).
+	vsize: u64,
+	fee_sat: u64,
 }
 
 impl TryInto<GetMempoolEntryResponse> for JsonResponse {
@@ -1370,7 +1463,13 @@ impl TryInto<GetMempoolEntryResponse> for JsonResponse {
 			},
 		};
 
-		Ok(GetMempoolEntryResponse { time, height })
+		let vsize = res.get("vsize").and_then(|v| v.as_u64()).unwrap_or(0);
+		let fee_sat = res
+			.get("fees")
+			.and_then(|f| f.get("base"))
+			.and_then(|b| b.as_f64())
+			.map_or(0, |btc| (btc * 100_000_000.0).round() as u64);
+		Ok(GetMempoolEntryResponse { time, height, vsize, fee_sat })
 	}
 }
 
@@ -1382,6 +1481,9 @@ pub(crate) struct MempoolEntry {
 	time: u64,
 	/// Block height when transaction entered pool
 	height: u32,
+	/// Blocknil patch: virtual size and base fee, for the mempool histogram.
+	vsize: u64,
+	fee_sat: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
