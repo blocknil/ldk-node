@@ -60,7 +60,8 @@ use crate::io::{
 	self, PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::{
-	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
+	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LSPS5ServiceConfig,
+	LiquiditySourceBuilder,
 };
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
@@ -127,6 +128,10 @@ struct LiquiditySourceConfig {
 	lsps2_client: Option<LSPS2ClientConfig>,
 	// Act as an LSPS2 service.
 	lsps2_service: Option<LSPS2ServiceConfig>,
+	// Act as an LSPS5 service, telling clients' webhooks when a payment is waiting.
+	lsps5_service: Option<LSPS5ServiceConfig>,
+	// Act as an LSPS5 client, registering a webhook with the service. Blocknil patch.
+	lsps5_client: bool,
 }
 
 #[derive(Clone)]
@@ -485,6 +490,36 @@ impl NodeBuilder {
 		let liquidity_source_config =
 			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
 		liquidity_source_config.lsps2_service = Some(service_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance to provide an [LSPS5] service: it keeps a webhook URL per
+	/// client and tells it when a payment is waiting for them, which is how a phone whose app is
+	/// closed is woken. The notifications go to the sender registered with
+	/// [`Node::set_webhook_sender`].
+	///
+	/// Blocknil patch: upstream ldk-node leaves LSPS5 off.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_liquidity_provider_lsps5(
+		&mut self, service_config: LSPS5ServiceConfig,
+	) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps5_service = Some(service_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance as an [LSPS5] client, so it can register a webhook with
+	/// its LSP ([`Node::set_webhook`]) and be told when a payment is waiting for it.
+	///
+	/// Blocknil patch: upstream ldk-node leaves LSPS5 off.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_liquidity_client_lsps5(&mut self) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps5_client = true;
 		self
 	}
 
@@ -1724,6 +1759,14 @@ fn build_with_store_internal(
 			lsc.lsps2_service.as_ref().map(|config| {
 				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
 			});
+
+			// Blocknil patch: LSPS5, both sides, off upstream.
+			lsc.lsps5_service.as_ref().map(|config| {
+				liquidity_source_builder.lsps5_service(config.clone())
+			});
+			if lsc.lsps5_client {
+				liquidity_source_builder.lsps5_client();
+			}
 
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;

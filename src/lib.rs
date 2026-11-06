@@ -1478,6 +1478,47 @@ impl Node {
 		self.held_forwards.set_on_held(on_held);
 	}
 
+	/// Blocknil patch: where LSPS5 notifications go (see [`liquidity::OnWebhook`]). It is called
+	/// on a thread of its own, so it may block; a failure drops the notification, because the
+	/// payment it announces waits 50 s at most.
+	pub fn set_webhook_sender(&self, sender: liquidity::OnWebhook) {
+		if let Some(source) = self.liquidity_source.as_ref() {
+			source.set_webhook_sender(sender);
+		}
+	}
+
+	/// Blocknil patch: registers `url` as `app_name`'s webhook with the LSP ([LSPS5]), so the LSP
+	/// can tell the phone that a payment is waiting for it while the app is closed. Needs
+	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP's answer comes
+	/// later, asynchronously, and is only logged: registering again replaces the URL for the same
+	/// `app_name`, so a wallet can simply repeat the call when it starts.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_webhook(&self, lsp: PublicKey, app_name: String, url: String) -> Result<(), Error> {
+		match self.liquidity_source.as_ref() {
+			Some(source) => source.set_webhook(lsp, app_name, url),
+			None => Err(Error::LiquiditySourceUnavailable),
+		}
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them
+	/// ([LSPS5]). `false` when nothing went out: no webhook registered, LSPS5 off, or one was
+	/// sent less than ten seconds ago (the floor that keeps a phone from being flooded).
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn notify_payment_incoming(&self, customer: PublicKey) -> bool {
+		self.liquidity_source.as_ref().map_or(false, |s| s.notify_payment_incoming(customer))
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that an onion message (a BOLT12
+	/// invoice request, typically) is waiting for them. Same rules as
+	/// [`Node::notify_payment_incoming`].
+	pub fn notify_onion_message_incoming(&self, customer: PublicKey) -> bool {
+		self.liquidity_source
+			.as_ref()
+			.map_or(false, |s| s.notify_onion_message_incoming(customer))
+	}
+
 	/// Blocknil patch: payments held right now, as `(customer, amount_msat, seconds left)`.
 	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
 		self.held_forwards.held()
