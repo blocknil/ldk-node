@@ -191,6 +191,12 @@ impl HeldForwards {
 		channels.iter().any(|c| c.is_usable) || !channels.iter().any(|c| c.is_channel_ready)
 	}
 
+	/// Whether a peer whose onion message arrived must be woken: it has a channel with us that
+	/// isn't usable yet, so the message waits for it (`release_onion_messages`). Blocknil patch.
+	pub(crate) fn needs_wake_for_onions(&self, peer: &PublicKey) -> bool {
+		!self.ready_for_onions(peer)
+	}
+
 	fn forward_onions(&self, peer: &PublicKey, messages: Vec<OnionMessage>) {
 		for message in messages {
 			if let Err(e) = self.onion_messenger.forward_onion_message(message, peer) {

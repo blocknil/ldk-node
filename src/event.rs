@@ -1696,6 +1696,20 @@ where
 			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					om_mailbox.onion_message_intercepted(peer_node_id, message);
+					// Blocknil patch: the message waits for a peer whose channel isn't usable,
+					// which is a phone with its app closed. Wake it now (LSPS5), not when the
+					// message is released: by then the invoice request has waited.
+					if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+						if self.held_forwards.needs_wake_for_onions(&peer_node_id) {
+							let woken = liquidity_source.notify_onion_message_incoming(peer_node_id);
+							log_debug!(
+								self.logger,
+								"Onion message held for {}; webhook sent: {}",
+								peer_node_id,
+								woken
+							);
+						}
+					}
 				} else {
 					log_trace!(
 						self.logger,
