@@ -63,7 +63,7 @@ use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LSPS5ServiceConfig,
 	LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_debug, log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
@@ -258,6 +258,7 @@ pub struct NodeBuilder {
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
+	claim_only: bool,
 }
 
 impl NodeBuilder {
@@ -286,6 +287,7 @@ impl NodeBuilder {
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
+			claim_only: false,
 		}
 	}
 
@@ -666,6 +668,27 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Starts the node without a view of the network, for picking up a payment on a channel it
+	/// already has.
+	///
+	/// A claim-only node does not route, so it needs no graph — but the graph is the biggest thing in
+	/// a wallet's store: a few MB on disk on a phone-sized channel set, and roughly **150 MB** once
+	/// deserialized (4,307 nodes and 25,599 channels on a measuring run), against the ~60 MB a
+	/// Notification Service Extension is allowed. So a claim-only start:
+	///
+	/// - does not read the persisted graph, and starts with an empty one;
+	/// - does not read the persisted scorer, which is built on top of that graph;
+	/// - never writes either back (see [`crate::io::claim_only::ClaimOnlyStore`]). Writing an empty
+	///   graph would replace the app's working copy and force a full re-download, and the app is the
+	///   only process that should ever write it.
+	///
+	/// The app's own start is untouched: this is off by default, and nothing else about the builder
+	/// changes.
+	pub fn set_claim_only(&mut self, claim_only: bool) -> &mut Self {
+		self.claim_only = claim_only;
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self) -> Result<Node, BuildError> {
@@ -832,6 +855,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			Arc::new(vss_store),
+			self.claim_only,
 		)
 	}
 
@@ -866,6 +890,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			kv_store,
+			self.claim_only,
 		)
 	}
 }
@@ -1229,9 +1254,17 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
-	logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	logger: Arc<Logger>, kv_store: Arc<DynStore>, claim_only: bool,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
+
+	// A claim-only node leaves the app's network graph and scoring data exactly as it found them
+	// (see `NodeBuilder::set_claim_only`).
+	let kv_store: Arc<DynStore> = if claim_only {
+		Arc::new(crate::io::claim_only::ClaimOnlyStore::new(kv_store))
+	} else {
+		kv_store
+	};
 
 	if let Err(err) = may_announce_channel(&config) {
 		if config.announcement_addresses.is_some() {
@@ -1492,7 +1525,16 @@ fn build_with_store_internal(
 	));
 
 	// Initialize the network graph, scorer, and router
-	let network_graph =
+	let network_graph = if claim_only {
+		// The graph is the biggest thing in the store and grows to ~150 MB in memory once
+		// deserialized on a phone-sized channel set. A claim-only node does not route, so it starts
+		// from an empty one and never persists it.
+		log_debug!(
+			logger,
+			"Claim-only start: not reading the network graph, starting with an empty one."
+		);
+		Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+	} else {
 		match io::utils::read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)) {
 			Ok(graph) => Arc::new(graph),
 			Err(e) => {
@@ -1503,39 +1545,48 @@ fn build_with_store_internal(
 					return Err(BuildError::ReadFailed);
 				}
 			},
-		};
+		}
+	};
 
-	let local_scorer = match io::utils::read_scorer(
-		Arc::clone(&kv_store),
-		Arc::clone(&network_graph),
-		Arc::clone(&logger),
-	) {
-		Ok(scorer) => scorer,
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
-				ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
-			} else {
-				log_error!(logger, "Failed to read scoring data from store: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
+	let local_scorer = if claim_only {
+		// The scorer is built on top of the graph; there is nothing to restore it against here.
+		let params = ProbabilisticScoringDecayParameters::default();
+		ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
+	} else {
+		match io::utils::read_scorer(
+			Arc::clone(&kv_store),
+			Arc::clone(&network_graph),
+			Arc::clone(&logger),
+		) {
+			Ok(scorer) => scorer,
+			Err(e) => {
+				if e.kind() == std::io::ErrorKind::NotFound {
+					let params = ProbabilisticScoringDecayParameters::default();
+					ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
+				} else {
+					log_error!(logger, "Failed to read scoring data from store: {}", e);
+					return Err(BuildError::ReadFailed);
+				}
+			},
+		}
 	};
 
 	let scorer = Arc::new(Mutex::new(CombinedScorer::new(local_scorer)));
 
 	// Restore external pathfinding scores from cache if possible.
-	match read_external_pathfinding_scores_from_cache(Arc::clone(&kv_store), Arc::clone(&logger)) {
-		Ok(external_scores) => {
-			scorer.lock().unwrap().merge(external_scores, cur_time);
-			log_trace!(logger, "External scores from cache merged successfully");
-		},
-		Err(e) => {
-			if e.kind() != std::io::ErrorKind::NotFound {
-				log_error!(logger, "Error while reading external scores from cache: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
+	if !claim_only {
+		match read_external_pathfinding_scores_from_cache(Arc::clone(&kv_store), Arc::clone(&logger)) {
+			Ok(external_scores) => {
+				scorer.lock().unwrap().merge(external_scores, cur_time);
+				log_trace!(logger, "External scores from cache merged successfully");
+			},
+			Err(e) => {
+				if e.kind() != std::io::ErrorKind::NotFound {
+					log_error!(logger, "Error while reading external scores from cache: {}", e);
+					return Err(BuildError::ReadFailed);
+				}
+			},
+		}
 	}
 
 	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
