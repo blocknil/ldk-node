@@ -240,34 +240,44 @@ impl Node {
 			self.config.network
 		);
 
-		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
+		if self.config.claim_only {
+			// A claim needs no chain: no TLS client to the server, no fee estimates to wait for, no
+			// wallet to sync. Each of those is a round trip (and a resident client) between the push
+			// and the payment, and the notification extension has neither the time nor the memory.
+			log_info!(
+				self.logger,
+				"Claim-only start: no chain sync, no fee estimates, no wallet sync."
+			);
+		} else {
+			// Start up any runtime-dependant chain sources (e.g. Electrum)
+			self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
+				log_error!(self.logger, "Failed to start chain syncing: {}", e);
+				e
+			})?;
 
-		// Block to ensure we update our fee rate cache once on startup
-		let chain_source = Arc::clone(&self.chain_source);
-		self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
+			// Block to ensure we update our fee rate cache once on startup
+			let chain_source = Arc::clone(&self.chain_source);
+			self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
 
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let sync_wallet = Arc::clone(&self.wallet);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		self.runtime.spawn_background_task(async move {
-			chain_source
-				.continuously_sync_wallets(
-					stop_sync_receiver,
-					sync_wallet,
-					sync_cman,
-					sync_cmon,
-					sync_sweeper,
-				)
-				.await;
-		});
+			// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
+			let stop_sync_receiver = self.stop_sender.subscribe();
+			let chain_source = Arc::clone(&self.chain_source);
+			let sync_wallet = Arc::clone(&self.wallet);
+			let sync_cman = Arc::clone(&self.channel_manager);
+			let sync_cmon = Arc::clone(&self.chain_monitor);
+			let sync_sweeper = Arc::clone(&self.output_sweeper);
+			self.runtime.spawn_background_task(async move {
+				chain_source
+					.continuously_sync_wallets(
+						stop_sync_receiver,
+						sync_wallet,
+						sync_cman,
+						sync_cmon,
+						sync_sweeper,
+					)
+					.await;
+			});
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);

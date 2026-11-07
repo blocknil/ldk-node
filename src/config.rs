@@ -135,6 +135,14 @@ pub struct Config {
 	pub storage_dir_path: String,
 	/// The used Bitcoin network.
 	pub network: Network,
+	/// Starts the node without chain access or a view of the network, for picking up a payment on a
+	/// channel it already has (the notification extension; see [`crate::NodeBuilder::set_claim_only`]).
+	///
+	/// When set, [`crate::Node::start`] does not start the chain source, does not fetch fee estimates
+	/// and does not sync wallets: a claim needs neither, and each of them is a network round trip (and
+	/// a TLS client) in the way of the payment. Persisted graph and scoring data are neither read nor
+	/// written.
+	pub claim_only: bool,
 	/// The addresses on which the node will listen for incoming connections.
 	///
 	/// **Note**: We will only allow opening and accepting public channels if the `node_alias` and the
@@ -216,6 +224,7 @@ impl Default for Config {
 		Self {
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
+			claim_only: false,
 			listening_addresses: None,
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
