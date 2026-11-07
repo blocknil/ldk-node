@@ -240,6 +240,11 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Worker threads for a claim-only node's runtime: its tasks are an event loop, a held-forward sweep
+/// and a reconnect timer, none of which need one worker per core (each is a thread and its stack
+/// inside a Notification Service Extension).
+const CLAIM_ONLY_WORKER_THREADS: usize = 2;
+
 /// A builder for an [`Node`] instance, allowing to set some configuration and module choices from
 /// the getgo.
 ///
@@ -258,7 +263,6 @@ pub struct NodeBuilder {
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
-	claim_only: bool,
 }
 
 impl NodeBuilder {
@@ -287,7 +291,6 @@ impl NodeBuilder {
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
-			claim_only: false,
 		}
 	}
 
@@ -685,7 +688,7 @@ impl NodeBuilder {
 	/// The app's own start is untouched: this is off by default, and nothing else about the builder
 	/// changes.
 	pub fn set_claim_only(&mut self, claim_only: bool) -> &mut Self {
-		self.claim_only = claim_only;
+		self.config.claim_only = claim_only;
 		self
 	}
 
@@ -811,11 +814,12 @@ impl NodeBuilder {
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let claim_workers = if self.config.claim_only { Some(CLAIM_ONLY_WORKER_THREADS) } else { None };
 
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
-			Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			Arc::new(Runtime::with_worker_threads(Arc::clone(&logger), claim_workers).map_err(|e| {
 				log_error!(logger, "Failed to setup tokio runtime: {}", e);
 				BuildError::RuntimeSetupFailed
 			})?)
@@ -855,18 +859,19 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			Arc::new(vss_store),
-			self.claim_only,
+			self.config.claim_only,
 		)
 	}
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let claim_workers = if self.config.claim_only { Some(CLAIM_ONLY_WORKER_THREADS) } else { None };
 
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
-			Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			Arc::new(Runtime::with_worker_threads(Arc::clone(&logger), claim_workers).map_err(|e| {
 				log_error!(logger, "Failed to setup tokio runtime: {}", e);
 				BuildError::RuntimeSetupFailed
 			})?)
@@ -890,7 +895,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			kv_store,
-			self.claim_only,
+			self.config.claim_only,
 		)
 	}
 }
