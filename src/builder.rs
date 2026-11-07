@@ -1629,10 +1629,22 @@ fn build_with_store_internal(
 		}
 	}
 
+	// A claim-only node has no graph and one peer (the provider): everything it cannot reach goes
+	// through the provider, which is connected to the rest of the network.
+	let claim_route_via = if config.claim_only {
+		config.trusted_peers_0conf.first().copied().or_else(|| {
+			liquidity_source_config
+				.and_then(|lsc| lsc.lsps2_client.as_ref())
+				.map(|client| client.node_id)
+		})
+	} else {
+		None
+	};
 	let message_router = Arc::new(MessageRouter::new(
 		Arc::clone(&network_graph),
 		Arc::clone(&keys_manager),
 		matches!(async_payments_role, Some(AsyncPaymentsRole::Server)),
+		claim_route_via,
 	));
 
 	// Initialize the ChannelManager
