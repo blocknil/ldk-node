@@ -188,14 +188,37 @@ pub(crate) struct MessageRouter {
 	inner: DefaultMessageRouter,
 	direct_paths: bool,
 	entropy_source: Arc<KeysManager>,
+	/// Claim-only: the one node this one is connected to, which does its networking for it. Everything
+	/// a claim-only node cannot reach directly goes through here, and the reply paths it hands out
+	/// start here.
+	via: Option<bitcoin::secp256k1::PublicKey>,
 }
 
 impl MessageRouter {
 	pub(crate) fn new(
 		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, direct_paths: bool,
+		via: Option<bitcoin::secp256k1::PublicKey>,
 	) -> Self {
 		let inner = DefaultMessageRouter::new(network_graph, Arc::clone(&entropy_source));
-		Self { inner, direct_paths, entropy_source }
+		Self { inner, direct_paths, entropy_source, via }
+	}
+
+	/// The node a message would be handed to first, as far as it can be told from the destination
+	/// alone: our node, a peer we are connected to, or somebody we would have to dial.
+	fn first_node(
+		&self, destination: &lightning::onion_message::messenger::Destination,
+	) -> Option<bitcoin::secp256k1::PublicKey> {
+		use lightning::blinded_path::IntroductionNode;
+		use lightning::onion_message::messenger::Destination;
+		match destination {
+			Destination::Node(node_id) => Some(*node_id),
+			Destination::BlindedPath(path) => match path.introduction_node() {
+				IntroductionNode::NodeId(node_id) => Some(*node_id),
+				// A short-channel-id introduction needs the graph to resolve, and a claim-only node
+				// has no graph: nothing can be dialled from here anyway.
+				IntroductionNode::DirectedShortChannelId(..) => None,
+			},
+		}
 	}
 }
 
@@ -204,6 +227,23 @@ impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
 		&self, sender: bitcoin::secp256k1::PublicKey, peers: Vec<bitcoin::secp256k1::PublicKey>,
 		destination: lightning::onion_message::messenger::Destination,
 	) -> Result<lightning::onion_message::messenger::OnionMessagePath, ()> {
+		if let Some(via) = self.via {
+			// A claim-only node has an empty graph, so LDK finds no addresses for anything it is not
+			// already connected to and returns a path with none — which the messenger then queues
+			// behind a connection that never opens. The case that matters: a BOLT12 invoice request
+			// whose reply path starts at the payer's LSP, which is connected to the provider and not
+			// to us. Such a run has exactly one peer, so everything it cannot reach directly is handed
+			// to that peer as the single intermediate node, and the provider forwards it.
+			if crate::claim_only_route_via(via, sender, &peers, self.first_node(&destination))
+				.is_some()
+			{
+				return Ok(lightning::onion_message::messenger::OnionMessagePath {
+					intermediate_nodes: vec![via],
+					destination,
+					first_node_addresses: vec![],
+				});
+			}
+		}
 		self.inner.find_path(sender, peers, destination)
 	}
 
@@ -216,6 +256,21 @@ impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
 		peers: Vec<lightning::blinded_path::message::MessageForwardNode>,
 		secp_ctx: &bitcoin::secp256k1::Secp256k1<T>,
 	) -> Result<Vec<lightning::blinded_path::message::BlindedMessagePath>, ()> {
+		if let Some(via) = self.via {
+			// The reply path we hand out has to start at a node the other side can reach: with no
+			// graph, that is the provider, and the hop after it is us.
+			if let Some(hop) = peers.iter().find(|hop| hop.node_id == via) {
+				return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
+					std::slice::from_ref(hop),
+					recipient,
+					local_node_receive_key,
+					context,
+					&*self.entropy_source,
+					secp_ctx,
+				)]);
+			}
+			return Err(());
+		}
 		if self.direct_paths {
 			return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
 				&[],
