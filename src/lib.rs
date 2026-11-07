@@ -1510,6 +1510,20 @@ impl Node {
 		}
 	}
 
+	/// Blocknil patch: removes `app_name`'s webhook from the LSP ([LSPS5]), so the provider stops
+	/// telling this phone about waiting payments — what turning "receive with the app closed" off
+	/// has to do, or the alerts keep coming for a feature the customer turned off. The LSP's answer
+	/// comes later, asynchronously, and reaches the wallet through
+	/// [`Node::set_webhook_result_handler`] with `removed` set.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn remove_webhook(&self, lsp: PublicKey, app_name: String) -> Result<(), Error> {
+		match self.liquidity_source.as_ref() {
+			Some(source) => source.remove_webhook(lsp, app_name),
+			None => Err(Error::LiquiditySourceUnavailable),
+		}
+	}
+
 	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them
 	/// ([LSPS5]). `false` when nothing went out: no webhook registered, LSPS5 off, or one was
 	/// sent less than ten seconds ago (the floor that keeps a phone from being flooded).
