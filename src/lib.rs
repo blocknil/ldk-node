@@ -101,6 +101,9 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+// Blocknil patch: BIP 353 name resolution through the onion messenger (bLIP-32).
+pub mod name_resolver;
+pub use name_resolver::{NameResolutionError, NameResolver, NAME_RESOLUTION_TIMEOUT_SECS};
 pub mod payment;
 mod peer_store;
 mod runtime;
@@ -116,7 +119,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, FeeRate};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
@@ -218,6 +221,8 @@ pub struct Node {
 	funding_input_signer: funding_signer::FundingInputSignerSlot,
 	/// Blocknil patch: payments held for offline customers (see `held_forwards`).
 	held_forwards: Arc<held_forwards::HeldForwards>,
+	/// Blocknil patch: how BIP 353 names are resolved (see [`NameResolver`]), if configured.
+	name_resolver: Option<Arc<dyn NameResolver + Send + Sync>>,
 }
 
 impl Node {
@@ -1114,6 +1119,7 @@ impl Node {
 			channel_config,
 			announce_for_forwarding,
 			false,
+			None,
 		)
 	}
 
@@ -1127,13 +1133,39 @@ impl Node {
 			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
 			return Err(Error::ChannelCreationFailed);
 		}
-		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true)
+		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true, None)
+	}
+
+	/// The same open, at a fee rate the caller picks for its funding transaction instead of the
+	/// node's own twelve-block estimate. A wallet that opens its first channel by itself can pay
+	/// the rate its cost rules asked for (the app's one-day target, say) rather than the node's
+	/// default. Only the fee rate changes: the transaction is still built and signed by the
+	/// registered [`FundingInputSigner`], and nothing about LDK's signing is involved.
+	/// Blocknil patch.
+	pub fn open_channel_with_external_funding_at_fee_rate(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		fee_rate: FeeRate,
+	) -> Result<UserChannelId, Error> {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
+			return Err(Error::ChannelCreationFailed);
+		}
+		self.open_channel_funded(
+			node_id,
+			address,
+			channel_amount_sats,
+			None,
+			None,
+			false,
+			true,
+			Some(fee_rate),
+		)
 	}
 
 	fn open_channel_funded(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
-		announce_for_forwarding: bool, external: bool,
+		announce_for_forwarding: bool, external: bool, funding_fee_rate: Option<FeeRate>,
 	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
@@ -1171,7 +1203,9 @@ impl Node {
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::rng().random();
 		if external {
-			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+			// Blocknil patch: the caller's rate when it gave one (`open_channel_with_external_funding_at_fee_rate`).
+			let fee_rate = funding_fee_rate
+				.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding));
 			self.funding_input_signer.channels.lock().unwrap().insert(user_channel_id, fee_rate);
 		}
 
@@ -2016,6 +2050,42 @@ impl Node {
 	#[cfg(feature = "uniffi")]
 	pub fn network_graph(&self) -> Arc<NetworkGraph> {
 		Arc::new(NetworkGraph::new(Arc::clone(&self.network_graph)))
+	}
+
+	/// The LSPS2 provider's current opening-fee terms: its minimum fee, proportional fee, the
+	/// smallest and largest first payment it will open a channel for, and when the offer lapses.
+	/// Fetched on the spot, so a screen that shows them never shows stale numbers. Blocknil patch
+	/// (issue #52).
+	pub fn lsps2_opening_fee_params(&self) -> Result<Vec<crate::liquidity::Lsps2FeeTerms>, Error> {
+		let liquidity_source = self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+		self.runtime.block_on(liquidity_source.lsps2_opening_fee_terms())
+	}
+
+	/// Resolves a BIP 353 name (`user@domain`, without the leading `₿`) to the payment
+	/// instructions in its DNSSEC record: normally a `bitcoin:` (BIP 321) URI, which the caller
+	/// then parses like any other payment request.
+	///
+	/// The query goes out as a bLIP-32 onion message through the node's messenger, to the resolver
+	/// the app passed to [`Builder::set_name_resolver`] — our provider, so no third party sees the
+	/// name — and the answer is validated by that resolver, not trusted from the provider. Waits at
+	/// most [`NAME_RESOLUTION_TIMEOUT_SECS`]: an unanswered onion message would otherwise wait
+	/// forever. Blocknil patch.
+	pub fn resolve_name(&self, name: &str) -> Result<String, NameResolutionError> {
+		let resolver = self.name_resolver.as_ref().ok_or(NameResolutionError::NotConfigured)?;
+		let timeout = Duration::from_secs(NAME_RESOLUTION_TIMEOUT_SECS);
+		self.runtime.block_on(async {
+			match tokio::time::timeout(timeout, resolver.resolve_name(name)).await {
+				Ok(Ok(instructions)) => Ok(instructions),
+				Ok(Err(reason)) => {
+					log_error!(self.logger, "Failed to resolve a BIP 353 name: {}", reason);
+					Err(NameResolutionError::Failed(reason))
+				},
+				Err(_) => {
+					log_error!(self.logger, "Resolving a BIP 353 name timed out");
+					Err(NameResolutionError::TimedOut)
+				},
+			}
+		})
 	}
 
 	/// Creates a digital ECDSA signature of a message with the node's secret key.
