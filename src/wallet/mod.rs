@@ -74,6 +74,8 @@ pub(crate) struct Wallet {
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
+	// Blocknil patch: coins held for splices. This field, `SPLICE_HOLD` and every use of either in
+	// this file (with the OutPoint/HashMap/Instant imports they need) are ours.
 	// Coins handed to a splice or a channel funding that the wallet may not have seen spent yet:
 	// LDK broadcasts those transactions, not this wallet, so until the next sync the coins still
 	// look unspent.
