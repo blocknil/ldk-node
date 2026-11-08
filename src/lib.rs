@@ -2023,6 +2023,15 @@ impl Node {
 		Arc::new(NetworkGraph::new(Arc::clone(&self.network_graph)))
 	}
 
+	/// The LSPS2 provider's current opening-fee terms: its minimum fee, proportional fee, the
+	/// smallest and largest first payment it will open a channel for, and when the offer lapses.
+	/// Fetched on the spot, so a screen that shows them never shows stale numbers. Blocknil patch
+	/// (issue #52).
+	pub fn lsps2_opening_fee_params(&self) -> Result<Vec<crate::liquidity::Lsps2FeeTerms>, Error> {
+		let liquidity_source = self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+		self.runtime.block_on(liquidity_source.lsps2_opening_fee_terms())
+	}
+
 	/// Resolves a BIP 353 name (`user@domain`, without the leading `₿`) to the payment
 	/// instructions in its DNSSEC record: normally a `bitcoin:` (BIP 321) URI, which the caller
 	/// then parses like any other payment request.

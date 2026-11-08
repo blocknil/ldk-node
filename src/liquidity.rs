@@ -165,6 +165,22 @@ pub struct LSPS2ServiceConfig {
 	pub disable_client_reserve: bool,
 }
 
+/// The LSPS2 provider's opening-fee terms, as the app's provider screen shows them (Blocknil
+/// patch, issue #52). One entry per offer the provider makes: it may offer several at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lsps2FeeTerms {
+	/// The smallest fee it charges for opening the channel, in msat.
+	pub min_fee_msat: u64,
+	/// The part of the fee proportional to the first payment, in parts per million of it.
+	pub proportional_ppm: u32,
+	/// When the offer stops being valid, in seconds since the Unix epoch.
+	pub valid_until_unix: i64,
+	/// The smallest first payment it will open a channel for, in msat.
+	pub min_payment_size_msat: u64,
+	/// The largest first payment it will open a channel for, in msat.
+	pub max_payment_size_msat: u64,
+}
+
 /// Represents the configuration of the LSPS5 (webhook) service.
 ///
 /// The service keeps a webhook URL per client and tells it when a payment is waiting, which is how
@@ -1604,6 +1620,23 @@ where
 			log_error!(self.logger, "Failed to handle response from liquidity service: {}", e);
 			Error::LiquidityRequestFailed
 		})
+	}
+
+	/// The provider's opening-fee terms, fetched now. Blocknil patch: the app's provider screen
+	/// needs the live numbers, which ldk-node otherwise only reads while creating a JIT invoice.
+	pub(crate) async fn lsps2_opening_fee_terms(&self) -> Result<Vec<Lsps2FeeTerms>, Error> {
+		let fee_response = self.lsps2_request_opening_fee_params().await?;
+		Ok(fee_response
+			.opening_fee_params_menu
+			.into_iter()
+			.map(|params| Lsps2FeeTerms {
+				min_fee_msat: params.min_fee_msat,
+				proportional_ppm: params.proportional,
+				valid_until_unix: params.valid_until.0.timestamp(),
+				min_payment_size_msat: params.min_payment_size_msat,
+				max_payment_size_msat: params.max_payment_size_msat,
+			})
+			.collect())
 	}
 
 	async fn lsps2_send_buy_request(
