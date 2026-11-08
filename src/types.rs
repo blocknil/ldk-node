@@ -15,6 +15,7 @@ use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
 use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
+use lightning::onion_message::dns_resolution::DNSResolverMessageHandler;
 use lightning::ln::types::ChannelId;
 use lightning::routing::gossip;
 use lightning::routing::router::DefaultRouter;
@@ -170,7 +171,9 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	Arc<MessageRouter>,
 	Arc<ChannelManager>,
 	Arc<ChannelManager>,
-	IgnoringMessageHandler,
+	// Blocknil patch: bLIP-32 DNSSEC queries and proofs (BIP 353 names). Whatever the caller
+	// configures, or `IgnoringMessageHandler` when it configures nothing.
+	Arc<dyn DNSResolverMessageHandler + Send + Sync>,
 	IgnoringMessageHandler,
 >;
 
