@@ -86,9 +86,13 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+mod mempool_fee;
+mod funding_signer;
 mod ffi;
 mod gossip;
 pub mod graph;
+mod held_forwards;
+pub use held_forwards::{HoldRecord, OnHeld};
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -124,6 +128,7 @@ use connection::ConnectionManager;
 pub use error::Error as NodeError;
 use error::Error;
 pub use event::Event;
+pub use funding_signer::FundingInputSigner;
 use event::{EventHandler, EventQueue};
 use fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 #[cfg(feature = "uniffi")]
@@ -206,6 +211,10 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
+	/// Blocknil patch: see [`FundingInputSigner`].
+	funding_input_signer: funding_signer::FundingInputSignerSlot,
+	/// Blocknil patch: payments held for offline customers (see `held_forwards`).
+	held_forwards: Arc<held_forwards::HeldForwards>,
 }
 
 impl Node {
@@ -231,34 +240,44 @@ impl Node {
 			self.config.network
 		);
 
-		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
+		if self.config.claim_only {
+			// A claim needs no chain: no TLS client to the server, no fee estimates to wait for, no
+			// wallet to sync. Each of those is a round trip (and a resident client) between the push
+			// and the payment, and the notification extension has neither the time nor the memory.
+			log_info!(
+				self.logger,
+				"Claim-only start: no chain sync, no fee estimates, no wallet sync."
+			);
+		} else {
+			// Start up any runtime-dependant chain sources (e.g. Electrum)
+			self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
+				log_error!(self.logger, "Failed to start chain syncing: {}", e);
+				e
+			})?;
 
-		// Block to ensure we update our fee rate cache once on startup
-		let chain_source = Arc::clone(&self.chain_source);
-		self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
+			// Block to ensure we update our fee rate cache once on startup
+			let chain_source = Arc::clone(&self.chain_source);
+			self.runtime.block_on(async move { chain_source.update_fee_rate_estimates().await })?;
 
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let sync_wallet = Arc::clone(&self.wallet);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		self.runtime.spawn_background_task(async move {
-			chain_source
-				.continuously_sync_wallets(
-					stop_sync_receiver,
-					sync_wallet,
-					sync_cman,
-					sync_cmon,
-					sync_sweeper,
-				)
-				.await;
-		});
+			// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
+			let stop_sync_receiver = self.stop_sender.subscribe();
+			let chain_source = Arc::clone(&self.chain_source);
+			let sync_wallet = Arc::clone(&self.wallet);
+			let sync_cman = Arc::clone(&self.channel_manager);
+			let sync_cmon = Arc::clone(&self.chain_monitor);
+			let sync_sweeper = Arc::clone(&self.output_sweeper);
+			self.runtime.spawn_background_task(async move {
+				chain_source
+					.continuously_sync_wallets(
+						stop_sync_receiver,
+						sync_wallet,
+						sync_cman,
+						sync_cmon,
+						sync_sweeper,
+					)
+					.await;
+			});
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -436,6 +455,21 @@ impl Node {
 			}
 		});
 
+		// Blocknil patch: held payments go through as soon as their customer is back, or are failed
+		// back once they've waited long enough (see `held_forwards`).
+		let held_forwards = Arc::clone(&self.held_forwards);
+		let mut stop_held = self.stop_sender.subscribe();
+		self.runtime.spawn_cancellable_background_task(async move {
+			let mut interval = tokio::time::interval(Duration::from_millis(500));
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			loop {
+				tokio::select! {
+					_ = stop_held.changed() => return,
+					_ = interval.tick() => held_forwards.process(),
+				}
+			}
+		});
+
 		// Regularly broadcast node announcements.
 		let bcast_cm = Arc::clone(&self.channel_manager);
 		let bcast_pm = Arc::clone(&self.peer_manager);
@@ -557,6 +591,8 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			Arc::clone(&self.funding_input_signer),
+			Arc::clone(&self.held_forwards),
 		));
 
 		// Setup background processing
@@ -1067,6 +1103,35 @@ impl Node {
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool,
 	) -> Result<UserChannelId, Error> {
+		self.open_channel_funded(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			announce_for_forwarding,
+			false,
+		)
+	}
+
+	/// Opens a channel whose funding transaction the registered [`FundingInputSigner`] builds
+	/// from a wallet outside ldk-node, instead of ldk-node's own wallet. Private (unannounced),
+	/// nothing pushed to the counterparty. Blocknil patch.
+	pub fn open_channel_with_external_funding(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+	) -> Result<UserChannelId, Error> {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
+			return Err(Error::ChannelCreationFailed);
+		}
+		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true)
+	}
+
+	fn open_channel_funded(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		announce_for_forwarding: bool, external: bool,
+	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
@@ -1083,8 +1148,10 @@ impl Node {
 			con_cm.connect_peer_if_necessary(con_node_id, con_addr).await
 		})?;
 
-		// Check funds availability after connection (includes anchor reserve calculation)
-		self.check_sufficient_onchain_funds(channel_amount_sats, &node_id, true)?;
+		// Check funds availability after connection (includes anchor reserve calculation). Funded
+		// from outside, ldk-node's own wallet only has to hold the anchor reserve, if any.
+		let own_wallet_pays = if external { 0 } else { channel_amount_sats };
+		self.check_sufficient_onchain_funds(own_wallet_pays, &node_id, true)?;
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
@@ -1100,6 +1167,10 @@ impl Node {
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::rng().random();
+		if external {
+			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+			self.funding_input_signer.channels.lock().unwrap().insert(user_channel_id, fee_rate);
+		}
 
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
@@ -1120,6 +1191,7 @@ impl Node {
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
+				self.funding_input_signer.channels.lock().unwrap().remove(&user_channel_id);
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1309,7 +1381,14 @@ impl Node {
 					Error::ChannelSplicingFailed
 				})?;
 
-			let change_address = self.wallet.get_new_internal_address()?;
+			let held: Vec<bitcoin::OutPoint> = inputs.iter().map(|input| input.outpoint()).collect();
+			let change_address = match self.wallet.get_new_internal_address() {
+				Ok(address) => address,
+				Err(e) => {
+					self.wallet.release_splice_coins(&held);
+					return Err(e);
+				},
+			};
 
 			let contribution = SpliceContribution::SpliceIn {
 				value: Amount::from_sat(splice_amount_sats),
@@ -1335,6 +1414,7 @@ impl Node {
 				)
 				.map_err(|e| {
 					log_error!(self.logger, "Failed to splice channel: {:?}", e);
+					self.wallet.release_splice_coins(&held);
 					let tx = bitcoin::Transaction {
 						version: bitcoin::transaction::Version::TWO,
 						lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -1359,6 +1439,189 @@ impl Node {
 
 			Err(Error::ChannelSplicingFailed)
 		}
+	}
+
+	/// Fails back payments held for just-in-time channels that will never open: the open failed
+	/// before a restart, or the channel closed during setup. A provider calls this once after
+	/// [`Node::start`]; otherwise those payers wait for their HTLCs to time out. Returns how many
+	/// were failed back. Blocknil patch.
+	pub fn fail_stuck_jit_payments(&self) -> usize {
+		match self.liquidity_source.as_ref() {
+			Some(liquidity_source) => {
+				let liquidity_source = Arc::clone(liquidity_source);
+				self.runtime.block_on(async move { liquidity_source.fail_stuck_jit_opens().await })
+			},
+			None => 0,
+		}
+	}
+
+	/// Broadcasts the funding transactions still held back for just-in-time channels that are open
+	/// and ready. With `client_trusts_lsp`, a channel whose first payment failed never had its
+	/// funding broadcast, while the client went on using it. A provider calls this once after
+	/// [`Node::start`]. Returns the transactions broadcast. Blocknil patch.
+	pub fn broadcast_held_jit_fundings(&self) -> Vec<bitcoin::Transaction> {
+		self.liquidity_source.as_ref().map(|source| source.broadcast_held_jit_fundings()).unwrap_or_default()
+	}
+
+	/// Registers the signer for inputs that [`Node::splice_in_with_inputs`] contributes from a
+	/// wallet outside ldk-node. Blocknil patch.
+	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
+		*self.funding_input_signer.signer.write().unwrap() = Some(signer);
+	}
+
+	/// Blocknil patch: the intercept SCID payments to `customer` should be routed through (in
+	/// their invoices' route hints), so a payment that arrives while they're offline is held for
+	/// them instead of failed. Made and saved on first use; stable after that.
+	pub fn hold_scid_for(&self, customer: PublicKey) -> Result<u64, Error> {
+		self.held_forwards.scid_for(customer)
+	}
+
+	/// Blocknil patch: how long a payment for an offline customer is held before it is failed
+	/// back (50 s by default).
+	pub fn set_hold_duration(&self, hold_for: Duration) {
+		self.held_forwards.set_hold_for(hold_for);
+	}
+
+	/// Blocknil patch: called with the customer each time a payment starts being held for them,
+	/// to wake their phone.
+	pub fn set_payment_held_handler(&self, on_held: held_forwards::OnHeld) {
+		self.held_forwards.set_on_held(on_held);
+	}
+
+	/// Blocknil patch: where LSPS5 notifications go (see [`liquidity::OnWebhook`]). It is called
+	/// on a thread of its own, so it may block; a failure drops the notification, because the
+	/// payment it announces waits 50 s at most.
+	pub fn set_webhook_sender(&self, sender: liquidity::OnWebhook) {
+		if let Some(source) = self.liquidity_source.as_ref() {
+			source.set_webhook_sender(sender);
+		}
+	}
+
+	/// Blocknil patch: where the LSP's answer to [`Node::set_webhook`] goes (see
+	/// [`liquidity::OnWebhookResult`]), so a wallet can show whether pushing is really on. It is
+	/// called on the node's event thread: don't block in it.
+	pub fn set_webhook_result_handler(&self, handler: liquidity::OnWebhookResult) {
+		if let Some(source) = self.liquidity_source.as_ref() {
+			source.set_webhook_result_handler(handler);
+		}
+	}
+
+	/// Blocknil patch: registers `url` as `app_name`'s webhook with the LSP ([LSPS5]), so the LSP
+	/// can tell the phone that a payment is waiting for it while the app is closed. Needs
+	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP's answer comes
+	/// later, asynchronously, and is only logged: registering again replaces the URL for the same
+	/// `app_name`, so a wallet can simply repeat the call when it starts.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_webhook(&self, lsp: PublicKey, app_name: String, url: String) -> Result<(), Error> {
+		match self.liquidity_source.as_ref() {
+			Some(source) => source.set_webhook(lsp, app_name, url),
+			None => Err(Error::LiquiditySourceUnavailable),
+		}
+	}
+
+	/// Blocknil patch: removes `app_name`'s webhook from the LSP ([LSPS5]), so the provider stops
+	/// telling this phone about waiting payments — what turning "receive with the app closed" off
+	/// has to do, or the alerts keep coming for a feature the customer turned off. The LSP's answer
+	/// comes later, asynchronously, and reaches the wallet through
+	/// [`Node::set_webhook_result_handler`] with `removed` set.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn remove_webhook(&self, lsp: PublicKey, app_name: String) -> Result<(), Error> {
+		match self.liquidity_source.as_ref() {
+			Some(source) => source.remove_webhook(lsp, app_name),
+			None => Err(Error::LiquiditySourceUnavailable),
+		}
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them
+	/// ([LSPS5]). `false` when nothing went out: no webhook registered, LSPS5 off, or one was
+	/// sent less than ten seconds ago (the floor that keeps a phone from being flooded).
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn notify_payment_incoming(&self, customer: PublicKey) -> bool {
+		self.liquidity_source.as_ref().map_or(false, |s| s.notify_payment_incoming(customer))
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that an onion message (a BOLT12
+	/// invoice request, typically) is waiting for them. Same rules as
+	/// [`Node::notify_payment_incoming`].
+	pub fn notify_onion_message_incoming(&self, customer: PublicKey) -> bool {
+		self.liquidity_source
+			.as_ref()
+			.map_or(false, |s| s.notify_onion_message_incoming(customer))
+	}
+
+	/// Blocknil patch: payments held right now, as `(customer, amount_msat, seconds left)`.
+	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
+		self.held_forwards.held()
+	}
+
+	/// Blocknil patch: the last payments that were held and have since ended (forwarded or failed
+	/// back), newest first.
+	pub fn recent_held_payments(&self) -> Vec<held_forwards::HoldRecord> {
+		self.held_forwards.recent()
+	}
+
+	/// The fee rate ldk-node would pay for a channel funding transaction right now. A caller
+	/// choosing coins for [`Node::splice_in_with_inputs`] uses it, so its coins cover what LDK will
+	/// ask for. Blocknil patch.
+	pub fn channel_funding_fee_rate(&self) -> bitcoin::FeeRate {
+		self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
+	}
+
+	/// Adds funds to an existing channel from coins ldk-node's own wallet doesn't hold.
+	///
+	/// `inputs` must cover `splice_amount_sats` plus the fee, at `fee_rate`, for the inputs, the
+	/// change output and the channel's shared input and output; anything over that goes to
+	/// `change_script`. The inputs are signed by the [`FundingInputSigner`] registered with
+	/// [`Node::set_funding_input_signer`], once the transaction has been negotiated.
+	///
+	/// Blocknil patch: upstream's [`Node::splice_in`] only spends ldk-node's own wallet.
+	pub fn splice_in_with_inputs(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		splice_amount_sats: u64, inputs: Vec<lightning::ln::funding::FundingTxInput>,
+		change_script: bitcoin::ScriptBuf, fee_rate: bitcoin::FeeRate,
+	) -> Result<(), Error> {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to splice channel: no funding input signer registered");
+			return Err(Error::ChannelSplicingFailed);
+		}
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Channel not found for user_channel_id {} and counterparty {}",
+					user_channel_id,
+					counterparty_node_id
+				);
+				Error::ChannelSplicingFailed
+			})?;
+
+		let contribution = SpliceContribution::SpliceIn {
+			value: Amount::from_sat(splice_amount_sats),
+			inputs,
+			change_script: Some(change_script),
+		};
+		let funding_feerate_per_kw: u32 =
+			fee_rate.to_sat_per_kwu().try_into().map_err(|_| Error::ChannelSplicingFailed)?;
+
+		self.channel_manager
+			.splice_channel(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				contribution,
+				funding_feerate_per_kw,
+				None,
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel: {:?}", e);
+				Error::ChannelSplicingFailed
+			})
 	}
 
 	/// Remove funds from an existing channel, sending them to an on-chain address.
@@ -1502,6 +1765,45 @@ impl Node {
 		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
 	}
 
+	/// Closes a channel cooperatively, with our side paid straight to `script` instead of to this
+	/// node's wallet. Blocknil patch.
+	///
+	/// Only works for a channel that didn't commit to a close address when it opened (see
+	/// `commit_upfront_shutdown_pubkey` in `default_user_config`), and `script` must be a SegWit
+	/// or Taproot output. Otherwise this fails and nothing is closed; [`Node::close_channel`]
+	/// still works.
+	pub fn close_channel_to(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		script: bitcoin::ScriptBuf,
+	) -> Result<(), Error> {
+		let shutdown_script =
+			lightning::ln::script::ShutdownScript::try_from(script).map_err(|e| {
+				log_error!(self.logger, "Can't close a channel to {:?}: not a SegWit output", e.script);
+				Error::InvalidAddress
+			})?;
+		let open_channels: Vec<LdkChannelDetails> =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or(Error::ChannelClosingFailed)?;
+		self.channel_manager
+			.close_channel_with_feerate_and_script(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				None,
+				Some(shutdown_script),
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to close channel to an address: {:?}", e);
+				Error::ChannelClosingFailed
+			})?;
+		if open_channels.len() == 1 {
+			self.peer_store.remove_peer(&counterparty_node_id)?;
+		}
+		Ok(())
+	}
+
 	fn close_channel_internal(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
 		force_close_reason: Option<String>,
@@ -1595,7 +1897,8 @@ impl Node {
 				Ok(monitor) => {
 					let counterparty_node_id = monitor.get_counterparty_node_id();
 					for ldk_balance in monitor.get_claimable_balances() {
-						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
+						total_lightning_balance_sats +=
+							balance::newest_claimable_amount_satoshis(&ldk_balance);
 						lightning_balances.push(LightningBalance::from_ldk_balance(
 							channel_id,
 							counterparty_node_id,
@@ -1645,6 +1948,12 @@ impl Node {
 		&self, f: F,
 	) -> Vec<PaymentDetails> {
 		self.payment_store.list_filter(f)
+	}
+
+	/// Every transaction the node's own on-chain wallet knows. Blocknil patch: the app's history
+	/// links a channel-wallet transaction to the ones it spends.
+	pub fn wallet_transactions(&self) -> Vec<bitcoin::Transaction> {
+		self.wallet.get_cached_txs().into_iter().map(|tx| (*tx).clone()).collect()
 	}
 
 	/// Retrieves all payments.
@@ -1739,6 +2048,30 @@ impl Node {
 			);
 			Error::PersistenceFailed
 		})
+	}
+}
+
+/// Where a claim-only node hands an onion message it cannot deliver itself: `Some(provider)` means
+/// "give it to the provider as the single intermediate node", `None` means "LDK's own path will do".
+///
+/// A claim-only node has no network graph, so [`lightning::onion_message::messenger::DefaultMessageRouter`]
+/// finds no addresses for anything it is not already connected to and returns a path with none — which
+/// the messenger then queues behind a connection that never opens. The case that matters is a BOLT12
+/// invoice request whose reply path starts at the payer's LSP (Phoenix and ACINQ): the receiver is not
+/// connected to ACINQ, the provider is, and one hop through it is all the reply needs.
+///
+/// `first_node` is the node the destination would be handed to first, as far as it can be told from
+/// the destination alone; `None` when it cannot be resolved (a short-channel-id introduction, which
+/// needs a graph).
+pub fn claim_only_route_via(
+	provider: PublicKey, sender: PublicKey, peers: &[PublicKey],
+	first_node: Option<PublicKey>,
+) -> Option<PublicKey> {
+	match first_node {
+		// Ourselves, a peer we are connected to, or the provider itself: LDK's own path is right.
+		Some(first) if first == sender || first == provider || peers.contains(&first) => None,
+		// Somebody else, or somebody we cannot even resolve: the provider forwards.
+		_ => Some(provider),
 	}
 }
 

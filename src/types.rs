@@ -174,11 +174,116 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	IgnoringMessageHandler,
 >;
 
-pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
+pub(crate) type DefaultMessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
 	Arc<Logger>,
 	Arc<KeysManager>,
 >;
+
+/// LDK's default message router, except on a node everyone reaches directly (an async payments
+/// server, i.e. a provider): there, paths always start at the node itself. LDK would otherwise
+/// start them at one of its peers — with a single peer connected, that peer, typically the very
+/// customer whose app is about to close — or, with several private peers, fail to build any.
+pub(crate) struct MessageRouter {
+	inner: DefaultMessageRouter,
+	direct_paths: bool,
+	entropy_source: Arc<KeysManager>,
+	/// Claim-only: the one node this one is connected to, which does its networking for it. Everything
+	/// a claim-only node cannot reach directly goes through here, and the reply paths it hands out
+	/// start here.
+	via: Option<bitcoin::secp256k1::PublicKey>,
+}
+
+impl MessageRouter {
+	pub(crate) fn new(
+		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, direct_paths: bool,
+		via: Option<bitcoin::secp256k1::PublicKey>,
+	) -> Self {
+		let inner = DefaultMessageRouter::new(network_graph, Arc::clone(&entropy_source));
+		Self { inner, direct_paths, entropy_source, via }
+	}
+
+	/// The node a message would be handed to first, as far as it can be told from the destination
+	/// alone: our node, a peer we are connected to, or somebody we would have to dial.
+	fn first_node(
+		&self, destination: &lightning::onion_message::messenger::Destination,
+	) -> Option<bitcoin::secp256k1::PublicKey> {
+		use lightning::blinded_path::IntroductionNode;
+		use lightning::onion_message::messenger::Destination;
+		match destination {
+			Destination::Node(node_id) => Some(*node_id),
+			Destination::BlindedPath(path) => match path.introduction_node() {
+				IntroductionNode::NodeId(node_id) => Some(*node_id),
+				// A short-channel-id introduction needs the graph to resolve, and a claim-only node
+				// has no graph: nothing can be dialled from here anyway.
+				IntroductionNode::DirectedShortChannelId(..) => None,
+			},
+		}
+	}
+}
+
+impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
+	fn find_path(
+		&self, sender: bitcoin::secp256k1::PublicKey, peers: Vec<bitcoin::secp256k1::PublicKey>,
+		destination: lightning::onion_message::messenger::Destination,
+	) -> Result<lightning::onion_message::messenger::OnionMessagePath, ()> {
+		if let Some(via) = self.via {
+			// A claim-only node has an empty graph, so LDK finds no addresses for anything it is not
+			// already connected to and returns a path with none — which the messenger then queues
+			// behind a connection that never opens. The case that matters: a BOLT12 invoice request
+			// whose reply path starts at the payer's LSP, which is connected to the provider and not
+			// to us. Such a run has exactly one peer, so everything it cannot reach directly is handed
+			// to that peer as the single intermediate node, and the provider forwards it.
+			if crate::claim_only_route_via(via, sender, &peers, self.first_node(&destination))
+				.is_some()
+			{
+				return Ok(lightning::onion_message::messenger::OnionMessagePath {
+					intermediate_nodes: vec![via],
+					destination,
+					first_node_addresses: vec![],
+				});
+			}
+		}
+		self.inner.find_path(sender, peers, destination)
+	}
+
+	fn create_blinded_paths<
+		T: bitcoin::secp256k1::Signing + bitcoin::secp256k1::Verification,
+	>(
+		&self, recipient: bitcoin::secp256k1::PublicKey,
+		local_node_receive_key: lightning::sign::ReceiveAuthKey,
+		context: lightning::blinded_path::message::MessageContext,
+		peers: Vec<lightning::blinded_path::message::MessageForwardNode>,
+		secp_ctx: &bitcoin::secp256k1::Secp256k1<T>,
+	) -> Result<Vec<lightning::blinded_path::message::BlindedMessagePath>, ()> {
+		if let Some(via) = self.via {
+			// The reply path we hand out has to start at a node the other side can reach: with no
+			// graph, that is the provider, and the hop after it is us.
+			if let Some(hop) = peers.iter().find(|hop| hop.node_id == via) {
+				return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
+					std::slice::from_ref(hop),
+					recipient,
+					local_node_receive_key,
+					context,
+					&*self.entropy_source,
+					secp_ctx,
+				)]);
+			}
+			return Err(());
+		}
+		if self.direct_paths {
+			return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
+				&[],
+				recipient,
+				local_node_receive_key,
+				context,
+				&*self.entropy_source,
+				secp_ctx,
+			)]);
+		}
+		self.inner.create_blinded_paths(recipient, local_node_receive_key, context, peers, secp_ctx)
+	}
+}
 
 pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
@@ -379,6 +484,13 @@ pub struct ChannelDetails {
 	pub inbound_htlc_maximum_msat: Option<u64>,
 	/// Set of configurable parameters that affect channel operation.
 	pub config: ChannelConfig,
+	/// Inbound HTLCs that are not yet irrevocably resolved on both sides.
+	///
+	/// Blocknil patch: a claimed payment is not finished when LDK marks it `Succeeded` — the
+	/// fulfill still has to reach the counterparty — and an HTLC disappears from this count only
+	/// once the counterparty has answered. The notification extension waits for it to reach zero
+	/// before stopping the node, or the payer is left waiting.
+	pub pending_inbound_htlc_count: u32,
 }
 
 impl From<LdkChannelDetails> for ChannelDetails {
@@ -427,6 +539,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 				.map(|f| f.cltv_expiry_delta),
 			next_outbound_htlc_limit_msat: value.next_outbound_htlc_limit_msat,
 			next_outbound_htlc_minimum_msat: value.next_outbound_htlc_minimum_msat,
+			pending_inbound_htlc_count: value.pending_inbound_htlcs.len() as u32,
 			force_close_spend_delay: value.force_close_spend_delay,
 			// unwrap safety: This field is only `None` for objects serialized prior to LDK 0.0.107
 			inbound_htlc_minimum_msat: value.inbound_htlc_minimum_msat.unwrap_or(0),

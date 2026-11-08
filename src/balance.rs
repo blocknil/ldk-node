@@ -229,8 +229,13 @@ impl LightningBalance {
 				inbound_claiming_htlc_rounded_msat,
 				inbound_htlc_rounded_msat,
 			} => {
-				// unwrap safety: confirmed_balance_candidate_index is guaranteed to index into balance_candidates
-				let balance = balance_candidates.get(confirmed_balance_candidate_index).unwrap();
+				// Blocknil patch: the newest candidate, not the one for the funding confirmed on-chain
+				// so far. While a splice is pending, that is the balance with it: a splice-in's coins
+				// have already left the on-chain wallet, and counting the old balance made the total
+				// dip by the amount moved until the splice locked.
+				let _ = confirmed_balance_candidate_index;
+				// unwrap safety: there is always at least the current funding's candidate.
+				let balance = balance_candidates.last().unwrap();
 
 				Self::ClaimableOnChannelClose {
 					channel_id,
@@ -393,5 +398,17 @@ fn value_from_descriptor(descriptor: &SpendableOutputDescriptor) -> Amount {
 		SpendableOutputDescriptor::StaticOutput { output, .. } => output.value,
 		SpendableOutputDescriptor::DelayedPaymentOutput(output) => output.output.value,
 		SpendableOutputDescriptor::StaticPaymentOutput(output) => output.output.value,
+	}
+}
+
+/// What `balance` is worth to us, counting a pending splice as done: LDK's
+/// `claimable_amount_satoshis` counts a channel's balance for the funding confirmed so far.
+/// Blocknil patch.
+pub(crate) fn newest_claimable_amount_satoshis(balance: &LdkBalance) -> u64 {
+	match balance {
+		LdkBalance::ClaimableOnChannelClose { balance_candidates, .. } => {
+			balance_candidates.last().map(|b| b.amount_satoshis).unwrap_or(0)
+		},
+		other => other.claimable_amount_satoshis(),
 	}
 }

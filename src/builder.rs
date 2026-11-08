@@ -60,9 +60,10 @@ use crate::io::{
 	self, PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::liquidity::{
-	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
+	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LSPS5ServiceConfig,
+	LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_debug, log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
@@ -127,6 +128,10 @@ struct LiquiditySourceConfig {
 	lsps2_client: Option<LSPS2ClientConfig>,
 	// Act as an LSPS2 service.
 	lsps2_service: Option<LSPS2ServiceConfig>,
+	// Act as an LSPS5 service, telling clients' webhooks when a payment is waiting.
+	lsps5_service: Option<LSPS5ServiceConfig>,
+	// Act as an LSPS5 client, registering a webhook with the service. Blocknil patch.
+	lsps5_client: bool,
 }
 
 #[derive(Clone)]
@@ -234,6 +239,11 @@ impl fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+/// Worker threads for a claim-only node's runtime: its tasks are an event loop, a held-forward sweep
+/// and a reconnect timer, none of which need one worker per core (each is a thread and its stack
+/// inside a Notification Service Extension).
+const CLAIM_ONLY_WORKER_THREADS: usize = 2;
 
 /// A builder for an [`Node`] instance, allowing to set some configuration and module choices from
 /// the getgo.
@@ -488,6 +498,85 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Configures the [`Node`] instance to provide an [LSPS5] service: it keeps a webhook URL per
+	/// client and tells it when a payment is waiting for them, which is how a phone whose app is
+	/// closed is woken. The notifications go to the sender registered with
+	/// [`Node::set_webhook_sender`].
+	///
+	/// Blocknil patch: upstream ldk-node leaves LSPS5 off.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_liquidity_provider_lsps5(
+		&mut self, service_config: LSPS5ServiceConfig,
+	) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps5_service = Some(service_config);
+		self
+	}
+
+	/// Configures the [`Node`] instance as an [LSPS5] client, so it can register a webhook with
+	/// its LSP ([`Node::set_webhook`]) and be told when a payment is waiting for it.
+	///
+	/// Blocknil patch: upstream ldk-node leaves LSPS5 off.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/pull/55/files
+	pub fn set_liquidity_client_lsps5(&mut self) -> &mut Self {
+		let liquidity_source_config =
+			self.liquidity_source_config.get_or_insert(LiquiditySourceConfig::default());
+		liquidity_source_config.lsps5_client = true;
+		self
+	}
+
+	/// Trusts `node_id` not to force-close a channel when we couldn't get our side confirmed in
+	/// time, so channels with it keep no on-chain anchor reserve
+	/// ([`AnchorChannelsConfig::trusted_peers_no_reserve`]). Blocknil patch: upstream only sets
+	/// this through a whole [`Config`].
+	pub fn add_trusted_peer_no_reserve(&mut self, node_id: PublicKey) -> &mut Self {
+		if let Some(anchors) = self.config.anchor_channels_config.as_mut() {
+			anchors.trusted_peers_no_reserve.push(node_id);
+		}
+		self
+	}
+
+	/// Sets how much ldk-node keeps on-chain per anchor channel to bump its own transactions in a
+	/// force close (upstream: 25,000 sats, settable only through a whole [`Config`]). A provider
+	/// with a channel per customer can't hold 25,000 sats for each. Blocknil patch.
+	pub fn set_anchor_reserve_per_channel_sats(&mut self, sats: u64) -> &mut Self {
+		if let Some(anchors) = self.config.anchor_channels_config.as_mut() {
+			anchors.per_channel_reserve_sats = sats;
+		}
+		self
+	}
+
+	/// Sets the forwarding fee for channels peers open to us. Blocknil patch; see
+	/// [`Config::forwarding_fees`].
+	pub fn set_forwarding_fees(&mut self, base_msat: u32, proportional_ppm: u32) -> &mut Self {
+		self.config.forwarding_fees = Some((base_msat, proportional_ppm));
+		self
+	}
+
+	/// Sets the expiry margin we ask on payments we forward. Blocknil patch; see
+	/// [`Config::forwarding_cltv_expiry_delta`].
+	pub fn set_forwarding_cltv_expiry_delta(&mut self, blocks: u16) -> &mut Self {
+		self.config.forwarding_cltv_expiry_delta = Some(blocks);
+		self
+	}
+
+	/// Accept at most one channel from each peer. Blocknil patch; see
+	/// [`Config::one_channel_per_peer`].
+	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {
+		self.config.one_channel_per_peer = one;
+		self
+	}
+
+	/// Sets how many confirmations an inbound channel's funding transaction needs before the
+	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
+	pub fn set_inbound_channel_minimum_depth(&mut self, depth: u32) -> &mut Self {
+		self.config.inbound_channel_minimum_depth = Some(depth);
+		self
+	}
+
 	/// Sets the used storage directory path.
 	pub fn set_storage_dir_path(&mut self, storage_dir_path: String) -> &mut Self {
 		self.config.storage_dir_path = storage_dir_path;
@@ -580,6 +669,27 @@ impl NodeBuilder {
 
 		self.async_payments_role = role;
 		Ok(self)
+	}
+
+	/// Starts the node without a view of the network, for picking up a payment on a channel it
+	/// already has.
+	///
+	/// A claim-only node does not route, so it needs no graph — but the graph is the biggest thing in
+	/// a wallet's store: a few MB on disk on a phone-sized channel set, and roughly **150 MB** once
+	/// deserialized (4,307 nodes and 25,599 channels on a measuring run), against the ~60 MB a
+	/// Notification Service Extension is allowed. So a claim-only start:
+	///
+	/// - does not read the persisted graph, and starts with an empty one;
+	/// - does not read the persisted scorer, which is built on top of that graph;
+	/// - never writes either back (see [`crate::io::claim_only::ClaimOnlyStore`]). Writing an empty
+	///   graph would replace the app's working copy and force a full re-download, and the app is the
+	///   only process that should ever write it.
+	///
+	/// The app's own start is untouched: this is off by default, and nothing else about the builder
+	/// changes.
+	pub fn set_claim_only(&mut self, claim_only: bool) -> &mut Self {
+		self.config.claim_only = claim_only;
+		self
 	}
 
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
@@ -704,11 +814,12 @@ impl NodeBuilder {
 		&self, vss_url: String, store_id: String, header_provider: Arc<dyn VssHeaderProvider>,
 	) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let claim_workers = if self.config.claim_only { Some(CLAIM_ONLY_WORKER_THREADS) } else { None };
 
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
-			Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			Arc::new(Runtime::with_worker_threads(Arc::clone(&logger), claim_workers).map_err(|e| {
 				log_error!(logger, "Failed to setup tokio runtime: {}", e);
 				BuildError::RuntimeSetupFailed
 			})?)
@@ -748,17 +859,19 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			Arc::new(vss_store),
+			self.config.claim_only,
 		)
 	}
 
 	/// Builds a [`Node`] instance according to the options previously configured.
 	pub fn build_with_store(&self, kv_store: Arc<DynStore>) -> Result<Node, BuildError> {
 		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let claim_workers = if self.config.claim_only { Some(CLAIM_ONLY_WORKER_THREADS) } else { None };
 
 		let runtime = if let Some(handle) = self.runtime_handle.as_ref() {
 			Arc::new(Runtime::with_handle(handle.clone(), Arc::clone(&logger)))
 		} else {
-			Arc::new(Runtime::new(Arc::clone(&logger)).map_err(|e| {
+			Arc::new(Runtime::with_worker_threads(Arc::clone(&logger), claim_workers).map_err(|e| {
 				log_error!(logger, "Failed to setup tokio runtime: {}", e);
 				BuildError::RuntimeSetupFailed
 			})?)
@@ -782,6 +895,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			kv_store,
+			self.config.claim_only,
 		)
 	}
 }
@@ -1145,9 +1259,17 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
-	logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	logger: Arc<Logger>, kv_store: Arc<DynStore>, claim_only: bool,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
+
+	// A claim-only node leaves the app's network graph and scoring data exactly as it found them
+	// (see `NodeBuilder::set_claim_only`).
+	let kv_store: Arc<DynStore> = if claim_only {
+		Arc::new(crate::io::claim_only::ClaimOnlyStore::new(kv_store))
+	} else {
+		kv_store
+	};
 
 	if let Err(err) = may_announce_channel(&config) {
 		if config.announcement_addresses.is_some() {
@@ -1408,7 +1530,16 @@ fn build_with_store_internal(
 	));
 
 	// Initialize the network graph, scorer, and router
-	let network_graph =
+	let network_graph = if claim_only {
+		// The graph is the biggest thing in the store and grows to ~150 MB in memory once
+		// deserialized on a phone-sized channel set. A claim-only node does not route, so it starts
+		// from an empty one and never persists it.
+		log_debug!(
+			logger,
+			"Claim-only start: not reading the network graph, starting with an empty one."
+		);
+		Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+	} else {
 		match io::utils::read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)) {
 			Ok(graph) => Arc::new(graph),
 			Err(e) => {
@@ -1419,39 +1550,48 @@ fn build_with_store_internal(
 					return Err(BuildError::ReadFailed);
 				}
 			},
-		};
+		}
+	};
 
-	let local_scorer = match io::utils::read_scorer(
-		Arc::clone(&kv_store),
-		Arc::clone(&network_graph),
-		Arc::clone(&logger),
-	) {
-		Ok(scorer) => scorer,
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
-				ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
-			} else {
-				log_error!(logger, "Failed to read scoring data from store: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
+	let local_scorer = if claim_only {
+		// The scorer is built on top of the graph; there is nothing to restore it against here.
+		let params = ProbabilisticScoringDecayParameters::default();
+		ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
+	} else {
+		match io::utils::read_scorer(
+			Arc::clone(&kv_store),
+			Arc::clone(&network_graph),
+			Arc::clone(&logger),
+		) {
+			Ok(scorer) => scorer,
+			Err(e) => {
+				if e.kind() == std::io::ErrorKind::NotFound {
+					let params = ProbabilisticScoringDecayParameters::default();
+					ProbabilisticScorer::new(params, Arc::clone(&network_graph), Arc::clone(&logger))
+				} else {
+					log_error!(logger, "Failed to read scoring data from store: {}", e);
+					return Err(BuildError::ReadFailed);
+				}
+			},
+		}
 	};
 
 	let scorer = Arc::new(Mutex::new(CombinedScorer::new(local_scorer)));
 
 	// Restore external pathfinding scores from cache if possible.
-	match read_external_pathfinding_scores_from_cache(Arc::clone(&kv_store), Arc::clone(&logger)) {
-		Ok(external_scores) => {
-			scorer.lock().unwrap().merge(external_scores, cur_time);
-			log_trace!(logger, "External scores from cache merged successfully");
-		},
-		Err(e) => {
-			if e.kind() != std::io::ErrorKind::NotFound {
-				log_error!(logger, "Error while reading external scores from cache: {}", e);
-				return Err(BuildError::ReadFailed);
-			}
-		},
+	if !claim_only {
+		match read_external_pathfinding_scores_from_cache(Arc::clone(&kv_store), Arc::clone(&logger)) {
+			Ok(external_scores) => {
+				scorer.lock().unwrap().merge(external_scores, cur_time);
+				log_trace!(logger, "External scores from cache merged successfully");
+			},
+			Err(e) => {
+				if e.kind() != std::io::ErrorKind::NotFound {
+					log_error!(logger, "Error while reading external scores from cache: {}", e);
+					return Err(BuildError::ReadFailed);
+				}
+			},
+		}
 	}
 
 	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
@@ -1489,8 +1629,23 @@ fn build_with_store_internal(
 		}
 	}
 
-	let message_router =
-		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
+	// A claim-only node has no graph and one peer (the provider): everything it cannot reach goes
+	// through the provider, which is connected to the rest of the network.
+	let claim_route_via = if config.claim_only {
+		config.trusted_peers_0conf.first().copied().or_else(|| {
+			liquidity_source_config
+				.and_then(|lsc| lsc.lsps2_client.as_ref())
+				.map(|client| client.node_id)
+		})
+	} else {
+		None
+	};
+	let message_router = Arc::new(MessageRouter::new(
+		Arc::clone(&network_graph),
+		Arc::clone(&keys_manager),
+		matches!(async_payments_role, Some(AsyncPaymentsRole::Server)),
+		claim_route_via,
+	));
 
 	// Initialize the ChannelManager
 	let channel_manager = {
@@ -1673,6 +1828,14 @@ fn build_with_store_internal(
 				liquidity_source_builder.lsps2_service(promise_secret, config.clone())
 			});
 
+			// Blocknil patch: LSPS5, both sides, off upstream.
+			lsc.lsps5_service.as_ref().map(|config| {
+				liquidity_source_builder.lsps5_service(config.clone())
+			});
+			if lsc.lsps5_client {
+				liquidity_source_builder.lsps5_client();
+			}
+
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
 			let custom_message_handler =
@@ -1796,6 +1959,14 @@ fn build_with_store_internal(
 
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
+	// Blocknil patch: payments held for offline customers (see `held_forwards`).
+	let held_forwards = Arc::new(crate::held_forwards::HeldForwards::new(
+		Arc::clone(&kv_store),
+		Arc::clone(&channel_manager),
+		Arc::clone(&onion_messenger),
+		Arc::clone(&logger),
+	));
+
 	Ok(Node {
 		runtime,
 		stop_sender,
@@ -1827,6 +1998,8 @@ fn build_with_store_internal(
 		node_metrics,
 		om_mailbox,
 		async_payments_role,
+		funding_input_signer: Arc::new(Default::default()),
+		held_forwards,
 	})
 }
 

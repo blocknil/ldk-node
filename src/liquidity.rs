@@ -34,6 +34,9 @@ use lightning_liquidity::lsps2::event::{LSPS2ClientEvent, LSPS2ServiceEvent};
 use lightning_liquidity::lsps2::msgs::{LSPS2OpeningFeeParams, LSPS2RawOpeningFeeParams};
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
+use lightning_liquidity::lsps5::client::LSPS5ClientConfig as LdkLSPS5ClientConfig;
+use lightning_liquidity::lsps5::event::{LSPS5ClientEvent, LSPS5ServiceEvent};
+use lightning_liquidity::lsps5::service::LSPS5ServiceConfig as LdkLSPS5ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 use lightning_types::payment::PaymentHash;
 use rand::Rng;
@@ -51,8 +54,15 @@ use crate::{total_anchor_channels_reserve_sats, Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 
-const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
+// Blocknil patch: upstream offers last 24 hours. An offer bought for an invoice nobody pays holds
+// one of the client's ten pending LSPS2 slots until it expires, so a customer who asks for ten
+// amounts in a day is locked out of receiving for the rest of it. Our invoices expire in an hour;
+// so do the offers behind them.
+const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
+
+/// The smallest just-in-time channel a provider opens, whatever the payment. Blocknil patch.
+const MIN_JIT_CHANNEL_SATS: u64 = 25_000;
 
 struct LSPS1Client {
 	lsp_node_id: PublicKey,
@@ -143,7 +153,85 @@ pub struct LSPS2ServiceConfig {
 	///
 	/// [`bLIP-52`]: https://github.com/lightning/blips/blob/master/blip-0052.md#trust-models
 	pub client_trusts_lsp: bool,
+	/// Open JIT channels with no reserve on the client's side, so clients can spend their whole
+	/// channel balance.
+	///
+	/// This lets a client broadcast an old channel state with nothing to lose but the on-chain
+	/// fee. It is only safe because the service is always online watching the chain, so it can
+	/// claim the old state's whole balance with a justice transaction. Only anchor channels can
+	/// have a zero reserve.
+	///
+	/// Blocknil backport (ldk-node #853/#873, with rust-lightning #4428).
+	pub disable_client_reserve: bool,
 }
+
+/// Represents the configuration of the LSPS5 (webhook) service.
+///
+/// The service keeps a webhook URL per client and tells it when a payment is waiting, which is how
+/// a phone whose app is closed is woken (`docs/push-wake-plan.md`). Blocknil patch: upstream
+/// ldk-node leaves LSPS5 switched off entirely.
+///
+/// See [bLIP-55 / LSPS5] for more information.
+///
+/// [bLIP-55 / LSPS5]: https://github.com/lightning/blips/pull/55/files
+#[derive(Debug, Clone)]
+pub struct LSPS5ServiceConfig {
+	/// How many webhook URLs one client may register with us.
+	pub max_webhooks_per_client: u32,
+	/// The hosts we will actually POST to; empty allows none, as upstream's "any HTTPS host" is an
+	/// open redirect target for anyone who opens a channel.
+	pub allowed_hosts: Vec<String>,
+}
+
+impl Default for LSPS5ServiceConfig {
+	fn default() -> Self {
+		Self { max_webhooks_per_client: 10, allowed_hosts: Vec::new() }
+	}
+}
+
+/// A webhook notification to deliver: a JSON body this node signed, and where to POST it.
+///
+/// Blocknil patch (LSPS5). Delivered to the sender registered with
+/// [`crate::Node::set_webhook_sender`], which runs on a thread of its own: a sender may block for
+/// as long as its own timeout, and the notification is dropped if it fails (the payment it
+/// announces stops waiting for the phone after the hold, 50 s by default).
+#[derive(Clone, Debug)]
+pub struct WebhookPost {
+	/// The URL the client registered.
+	pub url: String,
+	/// The headers to send with the POST, including the LSPS5 timestamp and signature.
+	pub headers: Vec<(String, String)>,
+	/// The JSON body, exactly as signed: `serde_json::to_string` of the notification.
+	pub body: String,
+}
+
+/// Delivers a [`WebhookPost`]; see [`crate::Node::set_webhook_sender`]. Blocknil patch (LSPS5).
+pub type OnWebhook = Arc<dyn Fn(WebhookPost) + Send + Sync>;
+
+/// The provider's answer to a webhook registration, as the LSPS5 client reports it.
+///
+/// Blocknil patch (LSPS5): the wallet shows "Notifications: on/off" from this, so the answer has to
+/// be readable rather than only logged. Delivered to the handler set with
+/// [`crate::Node::set_webhook_result_handler`], on the node's event thread: it must not block.
+#[derive(Clone, Debug)]
+pub struct WebhookResult {
+	/// The URL that was registered, as the provider echoes it back.
+	pub url: String,
+	/// The app name it was registered under.
+	pub app_name: String,
+	/// True when the provider accepted it; false when it refused (see `error`).
+	pub accepted: bool,
+	/// True when the provider already had this exact URL and changed nothing.
+	pub no_change: bool,
+	/// True when this answer is about a webhook being removed, not registered: the provider no
+	/// longer has it, so nothing will wake the phone.
+	pub removed: bool,
+	/// Why it was refused, when it was. Empty when accepted.
+	pub error: String,
+}
+
+/// Receives a [`WebhookResult`]; see [`crate::Node::set_webhook_result_handler`]. Blocknil patch.
+pub type OnWebhookResult = Arc<dyn Fn(WebhookResult) + Send + Sync>;
 
 pub(crate) struct LiquiditySourceBuilder<L: Deref>
 where
@@ -152,6 +240,8 @@ where
 	lsps1_client: Option<LSPS1Client>,
 	lsps2_client: Option<LSPS2Client>,
 	lsps2_service: Option<LSPS2Service>,
+	lsps5_service: Option<LSPS5ServiceConfig>,
+	lsps5_client: bool,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
@@ -174,10 +264,14 @@ where
 		let lsps1_client = None;
 		let lsps2_client = None;
 		let lsps2_service = None;
+		let lsps5_service = None;
+		let lsps5_client = false;
 		Self {
 			lsps1_client,
 			lsps2_client,
 			lsps2_service,
+			lsps5_service,
+			lsps5_client,
 			wallet,
 			channel_manager,
 			keys_manager,
@@ -187,6 +281,18 @@ where
 			config,
 			logger,
 		}
+	}
+
+	/// Blocknil patch: LSPS5, the service that tells a client's webhook when a payment is waiting.
+	pub(crate) fn lsps5_service(&mut self, service_config: LSPS5ServiceConfig) -> &mut Self {
+		self.lsps5_service = Some(service_config);
+		self
+	}
+
+	/// Blocknil patch: LSPS5 on the client side, to register a webhook with the LSP.
+	pub(crate) fn lsps5_client(&mut self) -> &mut Self {
+		self.lsps5_client = true;
+		self
 	}
 
 	pub(crate) fn lsps1_client(
@@ -235,16 +341,30 @@ where
 	}
 
 	pub(crate) async fn build(self) -> Result<LiquiditySource<L>, BuildError> {
-		let liquidity_service_config = self.lsps2_service.as_ref().map(|s| {
-			let lsps2_service_config = Some(s.ldk_service_config.clone());
-			let lsps5_service_config = None;
-			let advertise_service = s.service_config.advertise_service;
-			LiquidityServiceConfig { lsps2_service_config, lsps5_service_config, advertise_service }
-		});
+		let liquidity_service_config = if self.lsps2_service.is_some() || self.lsps5_service.is_some() {
+			Some(LiquidityServiceConfig {
+				lsps2_service_config: self
+					.lsps2_service
+					.as_ref()
+					.map(|s| s.ldk_service_config.clone()),
+				// Blocknil patch: LSPS5, off upstream.
+				lsps5_service_config: self.lsps5_service.as_ref().map(|c| LdkLSPS5ServiceConfig {
+					max_webhooks_per_client: c.max_webhooks_per_client,
+					allowed_hosts: c.allowed_hosts.clone(),
+				}),
+				advertise_service: self
+					.lsps2_service
+					.as_ref()
+					.map_or(false, |s| s.service_config.advertise_service),
+			})
+		} else {
+			None
+		};
 
 		let lsps1_client_config = self.lsps1_client.as_ref().map(|s| s.ldk_client_config.clone());
 		let lsps2_client_config = self.lsps2_client.as_ref().map(|s| s.ldk_client_config.clone());
-		let lsps5_client_config = None;
+		// Blocknil patch: LSPS5 on the client side, off upstream.
+		let lsps5_client_config = self.lsps5_client.then(LdkLSPS5ClientConfig::default);
 		let liquidity_client_config = Some(LiquidityClientConfig {
 			lsps1_client_config,
 			lsps2_client_config,
@@ -271,6 +391,8 @@ where
 			lsps1_client: self.lsps1_client,
 			lsps2_client: self.lsps2_client,
 			lsps2_service: self.lsps2_service,
+			webhook_sender: RwLock::new(None),
+			webhook_result_handler: RwLock::new(None),
 			wallet: self.wallet,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
@@ -289,6 +411,11 @@ where
 	lsps1_client: Option<LSPS1Client>,
 	lsps2_client: Option<LSPS2Client>,
 	lsps2_service: Option<LSPS2Service>,
+	/// Where LSPS5 notifications go; see [`OnWebhook`]. Blocknil patch.
+	webhook_sender: RwLock<Option<OnWebhook>>,
+	/// Where the provider's answers to webhook registrations go; see [`OnWebhookResult`].
+	/// Blocknil patch.
+	webhook_result_handler: RwLock<Option<OnWebhookResult>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
@@ -306,12 +433,93 @@ where
 		*self.peer_manager.write().unwrap() = Some(peer_manager);
 	}
 
+	/// Blocknil patch: where LSPS5 notifications go (see [`OnWebhook`]).
+	pub(crate) fn set_webhook_sender(&self, sender: OnWebhook) {
+		*self.webhook_sender.write().unwrap() = Some(sender);
+	}
+
+	/// Blocknil patch: where the provider's answers to webhook registrations go (see
+	/// [`OnWebhookResult`]). Called on the node's event thread, so it must not block.
+	pub(crate) fn set_webhook_result_handler(&self, handler: OnWebhookResult) {
+		*self.webhook_result_handler.write().unwrap() = Some(handler);
+	}
+
+	/// Blocknil patch: hands a registration answer to the wallet, if it asked for them.
+	fn report_webhook(&self, result: WebhookResult) {
+		let handler = self.webhook_result_handler.read().unwrap().clone();
+		if let Some(handler) = handler {
+			handler(result);
+		}
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that a payment is waiting for them.
+	/// `false` when nothing went out: no LSPS5 service, no webhook registered, or one was sent
+	/// less than the ten-second floor ago.
+	pub(crate) fn notify_payment_incoming(&self, customer: PublicKey) -> bool {
+		match self.liquidity_manager.lsps5_service_handler() {
+			Some(handler) => match handler.notify_payment_incoming(customer) {
+				Ok(()) => true,
+				Err(e) => {
+					log_debug!(self.logger, "Webhook for {} not sent: {:?}", customer, e);
+					false
+				},
+			},
+			None => false,
+		}
+	}
+
+	/// Blocknil patch: tells `customer`'s registered webhook that an onion message (a BOLT12
+	/// invoice request, typically) is waiting for them.
+	pub(crate) fn notify_onion_message_incoming(&self, customer: PublicKey) -> bool {
+		match self.liquidity_manager.lsps5_service_handler() {
+			Some(handler) => match handler.notify_onion_message_incoming(customer) {
+				Ok(()) => true,
+				Err(e) => {
+					log_debug!(self.logger, "Onion message webhook for {} not sent: {:?}", customer, e);
+					false
+				},
+			},
+			None => false,
+		}
+	}
+
+	/// Blocknil patch: registers `url` as `app_name`'s webhook with the LSP (LSPS5). The answer
+	/// comes later, as a [`LSPS5ClientEvent`], which is logged.
+	pub(crate) fn set_webhook(
+		&self, lsp: PublicKey, app_name: String, url: String,
+	) -> Result<(), Error> {
+		let handler =
+			self.liquidity_manager.lsps5_client_handler().ok_or(Error::WebhookRegistrationFailed)?;
+		handler.set_webhook(lsp, app_name, url).map(|_| ()).map_err(|e| {
+			log_error!(self.logger, "Registering the webhook was refused: {:?}", e);
+			Error::WebhookRegistrationFailed
+		})
+	}
+
+	/// Blocknil patch: removes `app_name`'s webhook from the LSP (LSPS5), so the provider stops
+	/// telling the phone about waiting payments. The answer comes later, as a `WebhookRemoved` or
+	/// `WebhookRemovalFailed` event.
+	pub(crate) fn remove_webhook(&self, lsp: PublicKey, app_name: String) -> Result<(), Error> {
+		let handler =
+			self.liquidity_manager.lsps5_client_handler().ok_or(Error::WebhookRegistrationFailed)?;
+		handler.remove_webhook(lsp, app_name).map(|_| ()).map_err(|e| {
+			log_error!(self.logger, "Removing the webhook was refused: {:?}", e);
+			Error::WebhookRegistrationFailed
+		})
+	}
+
 	pub(crate) fn liquidity_manager(&self) -> Arc<LiquidityManager> {
 		Arc::clone(&self.liquidity_manager)
 	}
 
 	pub(crate) fn get_lsps1_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
 		self.lsps1_client.as_ref().map(|s| (s.lsp_node_id, s.lsp_address.clone()))
+	}
+
+	/// Blocknil backport: whether we, as an LSPS2 service, keep no reserve on our clients' side,
+	/// for channels we open to them and channels they open to us.
+	pub(crate) fn disables_client_reserve(&self) -> bool {
+		self.lsps2_service.as_ref().is_some_and(|s| s.service_config.disable_client_reserve)
 	}
 
 	pub(crate) fn get_lsps2_lsp_details(&self) -> Option<(PublicKey, SocketAddress)> {
@@ -382,6 +590,42 @@ where
 				});
 		} else {
 			log_error!(self.logger, "LSPS2 service handler is not available.");
+		}
+	}
+
+	/// Fails back the payments of just-in-time flows stuck waiting on a channel that doesn't exist.
+	/// Blocknil patch; see `LSPS2ServiceHandler::broadcast_held_funding_transactions`.
+	pub(crate) fn broadcast_held_jit_fundings(&self) -> Vec<bitcoin::Transaction> {
+		match self.liquidity_manager.lsps2_service_handler() {
+			Some(handler) => handler.broadcast_held_funding_transactions(),
+			None => Vec::new(),
+		}
+	}
+
+	/// Blocknil patch; see `LSPS2ServiceHandler::fail_stuck_channel_opens`.
+	pub(crate) async fn fail_stuck_jit_opens(&self) -> usize {
+		match self.liquidity_manager.lsps2_service_handler() {
+			Some(handler) => handler.fail_stuck_channel_opens().await,
+			None => 0,
+		}
+	}
+
+	/// A channel closed: if it was a just-in-time channel whose payment never went through, fail
+	/// that payment back. Any other channel isn't ours to act on, so the answer is ignored.
+	/// Blocknil patch.
+	pub(crate) async fn lsps2_channel_closed(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+		if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+			let _ = handler.channel_open_failed(counterparty_node_id, user_channel_id).await;
+		}
+	}
+
+	/// Fails back the HTLCs held for a just-in-time channel that can't be opened, so the payer
+	/// sees a failure (and may retry) instead of a payment stuck in flight. Blocknil patch.
+	async fn fail_jit_open(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+		if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+			if let Err(e) = handler.channel_open_failed(counterparty_node_id, user_channel_id).await {
+				log_error!(self.logger, "Failed to fail back the held JIT payment: {:?}", e);
+			}
 		}
 	}
 
@@ -742,7 +986,11 @@ where
 				let over_provisioning_msat = (amt_to_forward_msat
 					* service_config.channel_over_provisioning_ppm as u64)
 					/ 1_000_000;
-				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
+				// Blocknil patch: never smaller than MIN_JIT_CHANNEL_SATS. Sized to the payment
+				// alone, a payment of a few hundred sats makes a channel under the 1,000 sat reserve
+				// floor, which the client refuses and force-closes.
+				let channel_amount_sats =
+					((amt_to_forward_msat + over_provisioning_msat) / 1000).max(MIN_JIT_CHANNEL_SATS);
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
@@ -762,9 +1010,10 @@ where
 						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 						spendable_amount_sats, required_funds_sats
 					);
-					// TODO: We just silently fail here. Eventually we will need to remember
-					// the pending requests and regularly retry opening the channel until we
-					// succeed.
+					// Blocknil patch: upstream fails silently here, so the payer's HTLC stays held
+					// until its timelock runs out and the payment shows as in flight for an hour.
+					// Fail it back now; the payer can try again.
+					self.fail_jit_open(&their_network_key, user_channel_id).await;
 					return;
 				}
 
@@ -785,14 +1034,26 @@ where
 				config.channel_config.forwarding_fee_base_msat = 0;
 				config.channel_config.forwarding_fee_proportional_millionths = 0;
 
-				match self.channel_manager.create_channel(
-					their_network_key,
-					channel_amount_sats,
-					0,
-					user_channel_id,
-					None,
-					Some(config),
-				) {
+				let opened = if service_config.disable_client_reserve {
+					self.channel_manager.create_channel_to_trusted_peer_0reserve(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				} else {
+					self.channel_manager.create_channel(
+						their_network_key,
+						channel_amount_sats,
+						0,
+						user_channel_id,
+						None,
+						Some(config),
+					)
+				};
+				match opened {
 					Ok(_) => {},
 					Err(e) => {
 						// TODO: We just silently fail here. Eventually we will need to remember
@@ -804,6 +1065,8 @@ where
 							their_network_key,
 							e
 						);
+						// Blocknil patch: as above, fail the held HTLC back instead of holding it.
+						self.fail_jit_open(&their_network_key, user_channel_id).await;
 						return;
 					},
 				}
@@ -909,6 +1172,128 @@ where
 						"Received unexpected LSPS2Client::InvoiceParametersReady event!"
 					);
 				}
+			},
+			// Blocknil patch: LSPS5. A notification for a customer's registered webhook goes to
+			// the sender the provider registered (`push-relay`'s HTTP POST), on a thread of its
+			// own: a POST that hangs must not hold up the node, and there is no point retrying
+			// past the hold, so a failure drops it.
+			LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
+				counterparty_node_id,
+				url,
+				notification,
+				headers,
+				..
+			}) => {
+				match serde_json::to_string(&notification) {
+					Ok(body) => {
+						let post = WebhookPost { url: url.to_string(), headers, body };
+						match self.webhook_sender.read().unwrap().clone() {
+							Some(sender) => {
+								log_debug!(
+									self.logger,
+									"Sending webhook {:?} to {} for {}",
+									post.url,
+									counterparty_node_id,
+									post.body
+								);
+								let _ = std::thread::Builder::new()
+									.name("lsps5-webhook".to_string())
+									.spawn(move || sender(post));
+							},
+							None => log_error!(
+								self.logger,
+								"No webhook sender registered; dropping the notification for {}",
+								counterparty_node_id
+							),
+						}
+					},
+					Err(e) => log_error!(
+						self.logger,
+						"Webhook notification doesn't serialize: {:?}",
+						e
+					),
+				}
+			},
+			// Blocknil patch: LSPS5 on the client side. The provider's answer is handed to the
+			// wallet (`set_webhook_result_handler`) so settings can show whether pushing is
+			// actually on, and logged as before.
+			LiquidityEvent::LSPS5Client(event) => match event {
+				LSPS5ClientEvent::WebhookRegistered {
+					counterparty_node_id, app_name, no_change, url, ..
+				} => {
+					log_info!(
+						self.logger,
+						"Webhook {:?} registered with {} (unchanged: {})",
+						app_name,
+						counterparty_node_id,
+						no_change
+					);
+					self.report_webhook(WebhookResult {
+						url: url.to_string(),
+						app_name: app_name.to_string(),
+						accepted: true,
+						no_change,
+						removed: false,
+						error: String::new(),
+					});
+				},
+				LSPS5ClientEvent::WebhookRegistrationFailed {
+					counterparty_node_id, app_name, error, url, ..
+				} => {
+					log_error!(
+						self.logger,
+						"Webhook {:?} refused by {}: {:?}",
+						app_name,
+						counterparty_node_id,
+						error
+					);
+					self.report_webhook(WebhookResult {
+						url: url.to_string(),
+						app_name: app_name.to_string(),
+						accepted: false,
+						no_change: false,
+						removed: false,
+						error: format!("{error:?}"),
+					});
+				},
+				LSPS5ClientEvent::WebhookRemoved {
+					counterparty_node_id, app_name, ..
+				} => {
+					log_info!(
+						self.logger,
+						"Webhook {:?} removed from {}",
+						app_name,
+						counterparty_node_id
+					);
+					self.report_webhook(WebhookResult {
+						url: String::new(),
+						app_name: app_name.to_string(),
+						accepted: false,
+						no_change: false,
+						removed: true,
+						error: String::new(),
+					});
+				},
+				LSPS5ClientEvent::WebhookRemovalFailed {
+					counterparty_node_id, app_name, error, ..
+				} => {
+					log_error!(
+						self.logger,
+						"Webhook {:?} could not be removed from {}: {:?}",
+						app_name,
+						counterparty_node_id,
+						error
+					);
+					self.report_webhook(WebhookResult {
+						url: String::new(),
+						app_name: app_name.to_string(),
+						accepted: false,
+						no_change: false,
+						removed: false,
+						error: format!("{error:?}"),
+					});
+				},
+				other => log_debug!(self.logger, "LSPS5 client event: {:?}", other),
 			},
 			e => {
 				log_error!(self.logger, "Received unexpected liquidity event: {:?}", e);
@@ -1329,6 +1714,53 @@ where
 			.build_signed(|hash| {
 				Secp256k1::new()
 					.sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
+			})
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to build and sign invoice: {}", e);
+				Error::InvoiceCreationFailed
+			})
+	}
+
+	/// Blocknil patch: an invoice whose route hint goes through the provider's hold SCID for us
+	/// (`Node::hold_scid_for` on the provider), so a payment that arrives while we're offline is
+	/// held for us instead of failed. Built and signed like the just-in-time invoices above.
+	pub(crate) fn create_hold_invoice(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		provider: PublicKey, scid: u64, cltv_expiry_delta: u16,
+	) -> Result<Bolt11Invoice, Error> {
+		let (payment_hash, payment_secret) = self
+			.channel_manager
+			.create_inbound_payment(amount_msat, expiry_secs, Some(MIN_FINAL_CLTV_EXPIRY_DELTA))
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to register inbound payment: {:?}", e);
+				Error::InvoiceCreationFailed
+			})?;
+		let route_hint = RouteHint(vec![RouteHintHop {
+			src_node_id: provider,
+			short_channel_id: scid,
+			fees: RoutingFees { base_msat: 0, proportional_millionths: 0 },
+			cltv_expiry_delta,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}]);
+		let payment_hash = sha256::Hash::from_slice(&payment_hash.0).map_err(|e| {
+			log_error!(self.logger, "Invalid payment hash: {:?}", e);
+			Error::InvoiceCreationFailed
+		})?;
+		let mut invoice_builder = InvoiceBuilder::new(self.config.network.into())
+			.invoice_description(description.clone())
+			.payment_hash(payment_hash)
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(MIN_FINAL_CLTV_EXPIRY_DELTA.into())
+			.expiry_time(Duration::from_secs(expiry_secs.into()))
+			.private_route(route_hint);
+		if let Some(amount_msat) = amount_msat {
+			invoice_builder = invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
+		}
+		invoice_builder
+			.build_signed(|hash| {
+				Secp256k1::new().sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
 			})
 			.map_err(|e| {
 				log_error!(self.logger, "Failed to build and sign invoice: {}", e);

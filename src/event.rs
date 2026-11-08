@@ -492,8 +492,13 @@ where
 	logger: L,
 	config: Arc<Config>,
 	static_invoice_store: Option<StaticInvoiceStore>,
+	// Blocknil patch: held onion messages now go out through `held_forwards`.
+	#[allow(dead_code)]
 	onion_messenger: Arc<OnionMessenger>,
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
+	/// Blocknil patch: signs splice inputs from a wallet outside ldk-node.
+	funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
+	held_forwards: Arc<crate::held_forwards::HeldForwards>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -510,6 +515,8 @@ where
 		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<Runtime>, logger: L,
 		config: Arc<Config>,
+		funding_input_signer: crate::funding_signer::FundingInputSignerSlot,
+		held_forwards: Arc<crate::held_forwards::HeldForwards>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -528,6 +535,8 @@ where
 			static_invoice_store,
 			onion_messenger,
 			om_mailbox,
+			funding_input_signer,
+			held_forwards,
 		}
 	}
 
@@ -550,12 +559,28 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				match self.wallet.create_funding_transaction(
-					output_script,
-					channel_amount,
-					confirmation_target,
-					locktime,
-				) {
+				// Blocknil patch: a channel opened with `open_channel_with_external_funding` is
+				// paid for by the registered signer's wallet, not ours.
+				let external = self.funding_input_signer.channels.lock().unwrap().remove(&user_channel_id);
+				let signer = self.funding_input_signer.signer.read().unwrap().clone();
+				let funding = match (external, signer) {
+					(Some(fee_rate), Some(signer)) => signer
+						.build_funding_transaction(
+							output_script,
+							channel_value_satoshis,
+							fee_rate,
+							locktime,
+						)
+						.map_err(|()| Error::OnchainTxCreationFailed),
+					(Some(_), None) => Err(Error::OnchainTxCreationFailed),
+					(None, _) => self.wallet.create_funding_transaction(
+						output_script,
+						channel_amount,
+						confirmation_target,
+						locktime,
+					),
+				};
+				match funding {
 					Ok(final_tx) => {
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {
@@ -692,7 +717,17 @@ where
 									lsp_fee_limits.max_proportional_opening_fee_ppm_msat.and_then(
 										|max_prop_fee| {
 											// If it's a variable amount payment, compute the actual fee.
-											compute_opening_fee(amount_msat, 0, max_prop_fee)
+											// Blocknil patch: on what the payer sent (what reached us
+											// plus what the provider withheld), as the provider does —
+											// upstream used what reached us, a sat short of the
+											// provider's fee, and refused every such payment. Never
+											// under the provider's 1 sat minimum fee.
+											compute_opening_fee(
+												amount_msat + counterparty_skimmed_fee_msat,
+												0,
+												max_prop_fee,
+											)
+											.map(|fee| fee.max(1_000))
 										},
 									)
 								})
@@ -1177,6 +1212,28 @@ where
 					}
 				}
 
+				// Blocknil patch: one channel per peer. A second one is refused; the existing
+				// channel grows by splicing instead.
+				if self.config.one_channel_per_peer
+					&& !self.channel_manager.list_channels_with_counterparty(&counterparty_node_id).is_empty()
+				{
+					log_error!(
+						self.logger,
+						"Rejecting a second channel from peer {}: it already has one with us",
+						counterparty_node_id,
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Channel request rejected: one channel per peer".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject channel: {:?}", e);
+						});
+					return Ok(());
+				}
+
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
 				if anchor_channel {
 					if let Some(anchor_channels_config) =
@@ -1265,7 +1322,23 @@ where
 						});
 					}
 				}
-				let res = if allow_0conf {
+				// Blocknil backport: as an LSPS2 service with `disable_client_reserve`, a client
+				// that opens its own (anchor) channel to us keeps no reserve either.
+				let accept_0reserve = anchor_channel
+					&& self
+						.liquidity_source
+						.as_ref()
+						.is_some_and(|ls| ls.as_ref().disables_client_reserve());
+				let res = if accept_0reserve {
+					self.channel_manager.accept_inbound_channel_from_trusted_peer(
+						&temporary_channel_id,
+						&counterparty_node_id,
+						user_channel_id,
+						channel_override_config,
+						allow_0conf,
+						true,
+					)
+				} else if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer_0conf(
 						&temporary_channel_id,
 						&counterparty_node_id,
@@ -1285,8 +1358,9 @@ where
 					Ok(()) => {
 						log_info!(
 							self.logger,
-							"Accepting inbound{}{} channel of {}sats from{} peer {}",
+							"Accepting inbound{}{}{} channel of {}sats from{} peer {}",
 							if allow_0conf { " 0conf" } else { "" },
+							if accept_0reserve { " 0reserve" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
 							funding_satoshis,
 							if allow_0conf { " trusted" } else { "" },
@@ -1516,6 +1590,14 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
+				// Blocknil patch: a just-in-time channel that closed before its payment went through
+				// (the client refused it, say) must not keep the payer's HTLC held until it times out.
+				if let (Some(liquidity_source), Some(counterparty)) =
+					(self.liquidity_source.as_ref(), counterparty_node_id)
+				{
+					liquidity_source.lsps2_channel_closed(&counterparty, user_channel_id).await;
+				}
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -1539,7 +1621,14 @@ where
 				payment_hash,
 				..
 			} => {
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+				// Blocknil patch: a payment on a customer's hold SCID waits for them if needed.
+				if self.held_forwards.is_hold_scid(requested_next_hop_scid) {
+					self.held_forwards.intercepted(
+						requested_next_hop_scid,
+						intercept_id,
+						expected_outbound_amount_msat,
+					);
+				} else if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source
 						.handle_htlc_intercepted(
 							requested_next_hop_scid,
@@ -1607,6 +1696,20 @@ where
 			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					om_mailbox.onion_message_intercepted(peer_node_id, message);
+					// Blocknil patch: the message waits for a peer whose channel isn't usable,
+					// which is a phone with its app closed. Wake it now (LSPS5), not when the
+					// message is released: by then the invoice request has waited.
+					if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+						if self.held_forwards.needs_wake_for_onions(&peer_node_id) {
+							let woken = liquidity_source.notify_onion_message_incoming(peer_node_id);
+							log_debug!(
+								self.logger,
+								"Onion message held for {}; webhook sent: {}",
+								peer_node_id,
+								woken
+							);
+						}
+					}
 				} else {
 					log_trace!(
 						self.logger,
@@ -1617,19 +1720,8 @@ where
 			LdkEvent::OnionMessagePeerConnected { peer_node_id } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					let messages = om_mailbox.onion_message_peer_connected(peer_node_id);
-
-					for message in messages {
-						if let Err(e) =
-							self.onion_messenger.forward_onion_message(message, &peer_node_id)
-						{
-							log_trace!(
-								self.logger,
-								"Failed to forward onion message to peer {}: {:?}",
-								peer_node_id,
-								e
-							);
-						}
-					}
+					// Blocknil patch: only once the peer's channel is back (`held_forwards`).
+					self.held_forwards.release_onion_messages(peer_node_id, messages);
 				}
 			},
 
@@ -1702,7 +1794,35 @@ where
 				counterparty_node_id,
 				unsigned_transaction,
 				..
-			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
+			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
+				// Blocknil patch: inputs from a wallet outside ldk-node are signed by the
+				// signer it registered (see `FundingInputSigner`), told the channel's current
+				// funding output so it needn't look it up.
+				let signer = self.funding_input_signer.signer.read().unwrap().clone();
+				match signer {
+					Some(signer) => {
+						let known_prevouts = self
+							.channel_manager
+							.list_channels()
+							.into_iter()
+							.filter(|c| c.channel_id == channel_id)
+							.filter_map(|c| {
+								let txo = c.funding_txo?;
+								let script = c.funding_redeem_script?.to_p2wsh();
+								Some((
+									txo.into_bitcoin_outpoint(),
+									bitcoin::TxOut {
+										value: bitcoin::Amount::from_sat(c.channel_value_satoshis),
+										script_pubkey: script,
+									},
+								))
+							})
+							.collect();
+						signer.sign_funding_inputs(tx, known_prevouts)
+					},
+					None => Ok(tx),
+				}
+			}) {
 				Ok(partially_signed_tx) => {
 					match self.channel_manager.funding_transaction_signed(
 						&channel_id,
@@ -1763,9 +1883,11 @@ where
 				user_channel_id,
 				counterparty_node_id,
 				abandoned_funding_txo,
+				contributed_inputs,
 				contributed_outputs,
 				..
 			} => {
+				self.wallet.release_splice_coins(&contributed_inputs);
 				if let Some(funding_txo) = abandoned_funding_txo {
 					log_info!(
 						self.logger,

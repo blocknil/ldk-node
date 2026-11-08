@@ -25,11 +25,25 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-	pub fn new(logger: Arc<Logger>) -> Result<Self, std::io::Error> {
+// Blocknil patch: removed `Runtime::new`, which only forwarded to `with_worker_threads(logger, None)`.
+// Every caller picks its own worker count through `with_worker_threads` — a claim-only node on a
+// phone runs a handful of small tasks and must not get one worker per core.
+	/// A runtime with a fixed number of worker threads. A claim-only node does a handful of small
+	/// tasks (an event loop, a held-forward sweep, a reconnect timer) and gains nothing from one
+	/// worker per core: on a phone that is several stacks and their thread-local state inside a
+	/// Notification Service Extension's ~60 MB.
+	pub fn with_worker_threads(
+		logger: Arc<Logger>, worker_threads: Option<usize>,
+	) -> Result<Self, std::io::Error> {
 		let mode = match tokio::runtime::Handle::try_current() {
 			Ok(handle) => RuntimeMode::Handle(handle),
 			Err(_) => {
-				let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+				let mut builder = tokio::runtime::Builder::new_multi_thread();
+				builder.enable_all();
+				if let Some(workers) = worker_threads {
+					builder.worker_threads(workers);
+				}
+				let rt = builder.build()?;
 				RuntimeMode::Owned(rt)
 			},
 		};
@@ -121,14 +135,17 @@ impl Runtime {
 
 	pub fn abort_cancellable_background_tasks(&self) {
 		let mut tasks = core::mem::take(&mut *self.cancellable_background_tasks.lock().unwrap());
-		debug_assert!(tasks.len() > 0, "Expected some cancellable background_tasks");
+		// A claim-only node starts only some of these (no chain sync), so an empty set is normal.
 		tasks.abort_all();
 		self.block_on(async { while let Some(_) = tasks.join_next().await {} })
 	}
 
 	pub fn wait_on_background_tasks(&self) {
 		let mut tasks = core::mem::take(&mut *self.background_tasks.lock().unwrap());
-		debug_assert!(tasks.len() > 0, "Expected some background_tasks");
+		if tasks.is_empty() {
+			// A claim-only node starts no wallet sync: there is nothing to wait for.
+			return;
+		}
 		self.block_on(async {
 			loop {
 				let timeout_fut = tokio::time::timeout(

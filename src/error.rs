@@ -69,6 +69,8 @@ pub enum Error {
 	GossipUpdateTimeout,
 	/// A liquidity request operation failed.
 	LiquidityRequestFailed,
+	/// Registering a webhook with the LSP failed (LSPS5). Blocknil patch.
+	WebhookRegistrationFailed,
 	/// Parsing a URI parameter has failed.
 	UriParameterParsingFailed,
 	/// The given address is invalid.
@@ -164,6 +166,7 @@ impl fmt::Display for Error {
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
 			Self::GossipUpdateTimeout => write!(f, "Updating gossip data timed out."),
 			Self::LiquidityRequestFailed => write!(f, "Failed to request inbound liquidity."),
+			Self::WebhookRegistrationFailed => write!(f, "Failed to register the webhook."),
 			Self::UriParameterParsingFailed => write!(f, "Failed to parse a URI parameter."),
 			Self::InvalidAddress => write!(f, "The given address is invalid."),
 			Self::InvalidSocketAddress => write!(f, "The given network address is invalid."),

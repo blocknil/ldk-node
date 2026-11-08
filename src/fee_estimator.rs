@@ -141,8 +141,13 @@ pub(crate) fn apply_post_estimation_adjustments(
 	target: ConfirmationTarget, estimated_rate: FeeRate,
 ) -> FeeRate {
 	match target {
+		// Blocknil patch: anchor channels get the same slack. Upstream accepts nothing below its own
+		// estimate from an anchor-channel peer, so two nodes whose estimates differ by one sat/kw
+		// force-close (seen on Mutinynet: "peer provided a feerate (258 sat/kw) which was below our
+		// lower bound (259 sat/kw)"). The relay floor still applies.
 		ConfirmationTarget::Lightning(
-			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee
+			| LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
 		) => {
 			let slightly_less_than_background = estimated_rate
 				.to_sat_per_kwu()
@@ -163,4 +168,16 @@ pub(crate) fn apply_post_estimation_adjustments(
 		},
 		_ => estimated_rate,
 	}
+}
+
+/// Blocknil patch: the targets whose transactions can wait their turn, which take the cheaper of
+/// Core's estimate and the mempool's. Commitment fees (agreed with the peer, which force-closes on
+/// one it finds too low), urgent claims and close negotiation keep Core's.
+pub(crate) fn may_use_mempool_rate(target: ConfirmationTarget) -> bool {
+	matches!(
+		target,
+		ConfirmationTarget::OnchainPayment
+			| ConfirmationTarget::ChannelFunding
+			| ConfirmationTarget::Lightning(LdkConfirmationTarget::OutputSpendingFee)
+	)
 }

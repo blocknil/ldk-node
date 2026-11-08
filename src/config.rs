@@ -52,7 +52,10 @@ pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 
 // The timeout after which we abandon retrying failed payments.
-pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+// Blocknil patch: 60 s, from 10. A phone's first message to its provider can take seconds after a
+// reconnect, and on 2026-11-06 one route's `TemporaryChannelFailure` came back after 15 s, past
+// the window, so other routes to the same payee were never tried and the payment failed.
+pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The interval (in block height) after which we retry archiving fully resolved channel monitors.
 pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
@@ -76,7 +79,9 @@ pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
 pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 20;
 
 // The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 10;
+// Blocknil patch: 10s was too short for a provider watching many channels; its Lightning sync
+// timed out on every pass, so it never saw splices or closes confirm.
+pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 120;
 
 // The timeout after which we give up waiting on LDK's event handler to exit on shutdown.
 pub(crate) const LDK_EVENT_HANDLER_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
@@ -130,6 +135,14 @@ pub struct Config {
 	pub storage_dir_path: String,
 	/// The used Bitcoin network.
 	pub network: Network,
+	/// Starts the node without chain access or a view of the network, for picking up a payment on a
+	/// channel it already has (the notification extension; see [`crate::NodeBuilder::set_claim_only`]).
+	///
+	/// When set, [`crate::Node::start`] does not start the chain source, does not fetch fee estimates
+	/// and does not sync wallets: a claim needs neither, and each of them is a network round trip (and
+	/// a TLS client) in the way of the payment. Persisted graph and scoring data are neither read nor
+	/// written.
+	pub claim_only: bool,
 	/// The addresses on which the node will listen for incoming connections.
 	///
 	/// **Note**: We will only allow opening and accepting public channels if the `node_alias` and the
@@ -184,6 +197,26 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub route_parameters: Option<RouteParametersConfig>,
+	/// Confirmations an inbound channel's funding transaction needs before the channel is used.
+	///
+	/// Blocknil patch: LDK's `ChannelHandshakeConfig::minimum_depth`, which upstream ldk-node
+	/// 0.7.1 does not expose. If unset, LDK's default (6) applies. Values below 1 are raised to 1;
+	/// zero-confirmation channels remain governed by [`Config::trusted_peers_0conf`].
+	pub inbound_channel_minimum_depth: Option<u32>,
+	/// Accept at most one channel from each peer: a peer that already has a channel with us
+	/// grows it by splicing instead of opening another. Blocknil patch: our provider gives each
+	/// customer exactly one channel.
+	pub one_channel_per_peer: bool,
+	/// Forwarding fee for channels accepted from peers, as (base msat, proportional ppm); `None`
+	/// keeps LDK's default (1,000 msat + 0). Blocknil patch: our provider forwards between its
+	/// customers for nothing.
+	pub forwarding_fees: Option<(u32, u32)>,
+	/// Blocks we ask between a forwarded payment's incoming and outgoing expiry; `None` keeps
+	/// LDK's default (72). Blocknil patch: a payer who goes offline once a held (async) payment is
+	/// sent has this long to come back after the receiver collects, before we must claim it from
+	/// their channel on-chain. At most 1008: past that, our vendored LDK won't build a blinded
+	/// receive path through the hop (upstream LDK stops at 216).
+	pub forwarding_cltv_expiry_delta: Option<u16>,
 }
 
 impl Default for Config {
@@ -191,6 +224,7 @@ impl Default for Config {
 		Self {
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
+			claim_only: false,
 			listening_addresses: None,
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
@@ -198,6 +232,10 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
 			node_alias: None,
+			inbound_channel_minimum_depth: None,
+			one_channel_per_peer: false,
+			forwarding_fees: None,
+			forwarding_cltv_expiry_delta: None,
 		}
 	}
 }
@@ -326,6 +364,21 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
 	user_config.reject_inbound_splices = false;
+	// Blocknil patch: don't commit, at open, the address a cooperative close pays. Committed, it is
+	// fixed to the node's own wallet, so emptying a wallet to an address takes the close and then
+	// a second transaction forwarding the money. Uncommitted, `Node::close_channel_to` can close
+	// straight to the address.
+	user_config.channel_handshake_config.commit_upfront_shutdown_pubkey = false;
+	if let Some(depth) = config.inbound_channel_minimum_depth {
+		user_config.channel_handshake_config.minimum_depth = depth.max(1);
+	}
+	if let Some((base_msat, proportional_ppm)) = config.forwarding_fees {
+		user_config.channel_config.forwarding_fee_base_msat = base_msat;
+		user_config.channel_config.forwarding_fee_proportional_millionths = proportional_ppm;
+	}
+	if let Some(delta) = config.forwarding_cltv_expiry_delta {
+		user_config.channel_config.cltv_expiry_delta = delta;
+	}
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
