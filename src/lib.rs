@@ -86,7 +86,10 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
-mod mempool_fee;
+// Blocknil patch: public so the wallet core uses this one copy of the mempool-histogram fee math
+// (it used to include the file by path from its vendor/ folder). Not part of ldk-node's API.
+#[doc(hidden)]
+pub mod mempool_fee;
 mod funding_signer;
 mod ffi;
 mod gossip;
