@@ -25,10 +25,9 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-	pub fn new(logger: Arc<Logger>) -> Result<Self, std::io::Error> {
-		Self::with_worker_threads(logger, None)
-	}
-
+// Blocknil patch: removed `Runtime::new`, which only forwarded to `with_worker_threads(logger, None)`.
+// Every caller picks its own worker count through `with_worker_threads` — a claim-only node on a
+// phone runs a handful of small tasks and must not get one worker per core.
 	/// A runtime with a fixed number of worker threads. A claim-only node does a handful of small
 	/// tasks (an event loop, a held-forward sweep, a reconnect timer) and gains nothing from one
 	/// worker per core: on a phone that is several stacks and their thread-local state inside a
