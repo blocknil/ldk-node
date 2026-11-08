@@ -157,3 +157,18 @@ harness = false
 
 #vss-client-ng = { path = "../vss-client" }
 #vss-client-ng = { git = "https://github.com/lightningdevkit/vss-client", branch = "main" }
+
+# Blocknil patch: build this fork against our rust-lightning fork (branch blocknil-0.2.8-r5), which
+# carries the LDK patches this code calls. Only applies when building ldk-node by itself; the
+# wallet core sets the same patches in its own Cargo.toml.
+[patch.crates-io]
+lightning = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-types = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-invoice = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-net-tokio = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-persister = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-background-processor = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-rapid-gossip-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-block-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-liquidity = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
+lightning-macros = { git = "https://github.com/blocknil/rust-lightning", rev = "1ebc3dab022f2ed9be55b37b57bf6d1db8e9de20" }
