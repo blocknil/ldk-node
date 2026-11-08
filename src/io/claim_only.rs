@@ -5,6 +5,8 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+// Blocknil patch: this whole file is ours; upstream ldk-node has no claim-only store.
+
 //! A store for a claim-only node: everything passes through except the network graph and the
 //! scoring data, which are never written.
 

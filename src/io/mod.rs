@@ -7,6 +7,7 @@
 
 //! Objects and traits for data persistence.
 
+// Blocknil patch: the claim-only node's store (see claim_only.rs).
 pub mod claim_only;
 pub mod sqlite_store;
 #[cfg(test)]
