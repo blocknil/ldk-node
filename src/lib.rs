@@ -101,6 +101,9 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+// Blocknil patch: BIP 353 name resolution through the onion messenger (bLIP-32).
+pub mod name_resolver;
+pub use name_resolver::{NameResolutionError, NameResolver, NAME_RESOLUTION_TIMEOUT_SECS};
 pub mod payment;
 mod peer_store;
 mod runtime;
@@ -218,6 +221,8 @@ pub struct Node {
 	funding_input_signer: funding_signer::FundingInputSignerSlot,
 	/// Blocknil patch: payments held for offline customers (see `held_forwards`).
 	held_forwards: Arc<held_forwards::HeldForwards>,
+	/// Blocknil patch: how BIP 353 names are resolved (see [`NameResolver`]), if configured.
+	name_resolver: Option<Arc<dyn NameResolver + Send + Sync>>,
 }
 
 impl Node {
@@ -2016,6 +2021,33 @@ impl Node {
 	#[cfg(feature = "uniffi")]
 	pub fn network_graph(&self) -> Arc<NetworkGraph> {
 		Arc::new(NetworkGraph::new(Arc::clone(&self.network_graph)))
+	}
+
+	/// Resolves a BIP 353 name (`user@domain`, without the leading `₿`) to the payment
+	/// instructions in its DNSSEC record: normally a `bitcoin:` (BIP 321) URI, which the caller
+	/// then parses like any other payment request.
+	///
+	/// The query goes out as a bLIP-32 onion message through the node's messenger, to the resolver
+	/// the app passed to [`Builder::set_name_resolver`] — our provider, so no third party sees the
+	/// name — and the answer is validated by that resolver, not trusted from the provider. Waits at
+	/// most [`NAME_RESOLUTION_TIMEOUT_SECS`]: an unanswered onion message would otherwise wait
+	/// forever. Blocknil patch.
+	pub fn resolve_name(&self, name: &str) -> Result<String, NameResolutionError> {
+		let resolver = self.name_resolver.as_ref().ok_or(NameResolutionError::NotConfigured)?;
+		let timeout = Duration::from_secs(NAME_RESOLUTION_TIMEOUT_SECS);
+		self.runtime.block_on(async {
+			match tokio::time::timeout(timeout, resolver.resolve_name(name)).await {
+				Ok(Ok(instructions)) => Ok(instructions),
+				Ok(Err(reason)) => {
+					log_error!(self.logger, "Failed to resolve a BIP 353 name: {}", reason);
+					Err(NameResolutionError::Failed(reason))
+				},
+				Err(_) => {
+					log_error!(self.logger, "Resolving a BIP 353 name timed out");
+					Err(NameResolutionError::TimedOut)
+				},
+			}
+		})
 	}
 
 	/// Creates a digital ECDSA signature of a message with the node's secret key.

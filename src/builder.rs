@@ -24,6 +24,7 @@ use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
 use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler};
+use lightning::onion_message::dns_resolution::DNSResolverMessageHandler;
 use lightning::log_trace;
 use lightning::routing::gossip::NodeAlias;
 use lightning::routing::router::DefaultRouter;
@@ -65,6 +66,7 @@ use crate::liquidity::{
 };
 use crate::logger::{log_debug, log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
+use crate::name_resolver::{DnsResolverSlot, NameResolver, NameResolverSlot};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::peer_store::PeerStore;
 use crate::runtime::Runtime;
@@ -263,6 +265,10 @@ pub struct NodeBuilder {
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
+	/// Blocknil patch: the bLIP-32 DNSSEC handler (BIP 353 names), if the caller set one.
+	dns_resolver_handler: Option<DnsResolverSlot>,
+	/// Blocknil patch: how BIP 353 names are resolved, if the caller set a resolver.
+	name_resolver: Option<NameResolverSlot>,
 }
 
 impl NodeBuilder {
@@ -291,6 +297,8 @@ impl NodeBuilder {
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
+			dns_resolver_handler: None,
+			name_resolver: None,
 		}
 	}
 
@@ -671,6 +679,28 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Blocknil patch: gives the node a bLIP-32 DNSSEC handler, so it can answer
+	/// [`DNSResolverMessageHandler::handle_dnssec_query`] and receive `DNSSECProof`s. The provider
+	/// sets its own (our `lightning-dns-resolver` in front of a DNS server); an app that resolves
+	/// BIP 353 names sets the resolver it also passes to
+	/// [`Self::set_name_resolver`]. Unset, the node ignores both kinds of message.
+	pub fn set_dns_resolver_handler(
+		&mut self, handler: Arc<dyn DNSResolverMessageHandler + Send + Sync>,
+	) -> &mut Self {
+		self.dns_resolver_handler = Some(DnsResolverSlot::new(handler));
+		self
+	}
+
+	/// Blocknil patch: sets how [`crate::Node::resolve_name`] resolves a BIP 353 name
+	/// (`user@domain`). Usually the same object as the handler above: it sends the query and
+	/// validates the proof that comes back.
+	pub fn set_name_resolver(
+		&mut self, resolver: Arc<dyn NameResolver + Send + Sync>,
+	) -> &mut Self {
+		self.name_resolver = Some(NameResolverSlot::new(resolver));
+		self
+	}
+
 	/// Starts the node without a view of the network, for picking up a payment on a channel it
 	/// already has.
 	///
@@ -860,6 +890,8 @@ impl NodeBuilder {
 			logger,
 			Arc::new(vss_store),
 			self.config.claim_only,
+			self.dns_resolver_handler.as_ref(),
+			self.name_resolver.as_ref(),
 		)
 	}
 
@@ -896,6 +928,8 @@ impl NodeBuilder {
 			logger,
 			kv_store,
 			self.config.claim_only,
+			self.dns_resolver_handler.as_ref(),
+			self.name_resolver.as_ref(),
 		)
 	}
 }
@@ -1260,6 +1294,7 @@ fn build_with_store_internal(
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>, claim_only: bool,
+	dns_resolver_handler: Option<&DnsResolverSlot>, name_resolver: Option<&NameResolverSlot>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -1720,6 +1755,15 @@ fn build_with_store_internal(
 		})?;
 	}
 
+	// Blocknil patch: bLIP-32 queries and proofs go to the handler the caller configured — the
+	// provider's DNS resolver, or the app's BIP 353 resolver — and nowhere when it configured none.
+	let dns_resolver_handler: Arc<dyn DNSResolverMessageHandler + Send + Sync> = match
+		dns_resolver_handler
+	{
+		Some(slot) => slot.handler(),
+		None => Arc::new(IgnoringMessageHandler {}),
+	};
+
 	// Initialize the PeerManager
 	let onion_messenger: Arc<OnionMessenger> =
 		if let Some(AsyncPaymentsRole::Server) = async_payments_role {
@@ -1731,7 +1775,7 @@ fn build_with_store_internal(
 				message_router,
 				Arc::clone(&channel_manager),
 				Arc::clone(&channel_manager),
-				IgnoringMessageHandler {},
+				Arc::clone(&dns_resolver_handler),
 				IgnoringMessageHandler {},
 			))
 		} else {
@@ -1743,7 +1787,7 @@ fn build_with_store_internal(
 				message_router,
 				Arc::clone(&channel_manager),
 				Arc::clone(&channel_manager),
-				IgnoringMessageHandler {},
+				Arc::clone(&dns_resolver_handler),
 				IgnoringMessageHandler {},
 			))
 		};
@@ -2000,6 +2044,8 @@ fn build_with_store_internal(
 		async_payments_role,
 		funding_input_signer: Arc::new(Default::default()),
 		held_forwards,
+		// Blocknil patch: the wallet's own BIP 353 resolver, for `Node::resolve_name`.
+		name_resolver: name_resolver.map(|slot| slot.resolver()),
 	})
 }
 
