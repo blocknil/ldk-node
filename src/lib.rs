@@ -119,7 +119,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, FeeRate};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
@@ -1119,6 +1119,7 @@ impl Node {
 			channel_config,
 			announce_for_forwarding,
 			false,
+			None,
 		)
 	}
 
@@ -1132,13 +1133,39 @@ impl Node {
 			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
 			return Err(Error::ChannelCreationFailed);
 		}
-		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true)
+		self.open_channel_funded(node_id, address, channel_amount_sats, None, None, false, true, None)
+	}
+
+	/// The same open, at a fee rate the caller picks for its funding transaction instead of the
+	/// node's own twelve-block estimate. A wallet that opens its first channel by itself can pay
+	/// the rate its cost rules asked for (the app's one-day target, say) rather than the node's
+	/// default. Only the fee rate changes: the transaction is still built and signed by the
+	/// registered [`FundingInputSigner`], and nothing about LDK's signing is involved.
+	/// Blocknil patch.
+	pub fn open_channel_with_external_funding_at_fee_rate(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		fee_rate: FeeRate,
+	) -> Result<UserChannelId, Error> {
+		if self.funding_input_signer.signer.read().unwrap().is_none() {
+			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
+			return Err(Error::ChannelCreationFailed);
+		}
+		self.open_channel_funded(
+			node_id,
+			address,
+			channel_amount_sats,
+			None,
+			None,
+			false,
+			true,
+			Some(fee_rate),
+		)
 	}
 
 	fn open_channel_funded(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
-		announce_for_forwarding: bool, external: bool,
+		announce_for_forwarding: bool, external: bool, funding_fee_rate: Option<FeeRate>,
 	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
@@ -1176,7 +1203,9 @@ impl Node {
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::rng().random();
 		if external {
-			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+			// Blocknil patch: the caller's rate when it gave one (`open_channel_with_external_funding_at_fee_rate`).
+			let fee_rate = funding_fee_rate
+				.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding));
 			self.funding_input_signer.channels.lock().unwrap().insert(user_channel_id, fee_rate);
 		}
 
