@@ -195,15 +195,17 @@ pub(crate) struct MessageRouter {
 	/// a claim-only node cannot reach directly goes through here, and the reply paths it hands out
 	/// start here.
 	via: Option<bitcoin::secp256k1::PublicKey>,
+	/// Blocknil patch: true for a claim-only node, whose reply paths can only start at `via`.
+	via_only: bool,
 }
 
 impl MessageRouter {
 	pub(crate) fn new(
 		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, direct_paths: bool,
-		via: Option<bitcoin::secp256k1::PublicKey>,
+		via: Option<bitcoin::secp256k1::PublicKey>, via_only: bool,
 	) -> Self {
 		let inner = DefaultMessageRouter::new(network_graph, Arc::clone(&entropy_source));
-		Self { inner, direct_paths, entropy_source, via }
+		Self { inner, direct_paths, entropy_source, via, via_only }
 	}
 
 	/// The node a message would be handed to first, as far as it can be told from the destination
@@ -272,7 +274,12 @@ impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
 					secp_ctx,
 				)]);
 			}
-			return Err(());
+			// Blocknil patch: a claim-only node has nothing else to offer. A full wallet routing via
+			// its LSP (`route_messages_via_lsp`) falls back to LDK's paths while the LSP isn't
+			// connected, as it did before the option existed.
+			if self.via_only {
+				return Err(());
+			}
 		}
 		if self.direct_paths {
 			return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::new(
