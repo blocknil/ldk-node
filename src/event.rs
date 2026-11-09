@@ -48,6 +48,12 @@ use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
 use crate::runtime::Runtime;
+
+/// Blocknil patch: how often, and for how long, a reconnect retries a held payment for the peer that
+/// just came back (see the `OnionMessagePeerConnected` arm). Two seconds is longer than any
+/// reestablish we have seen and short enough to leave the 5 s timer as the real fallback.
+const HOLD_RELEASE_EVERY_MS: u64 = 100;
+const HOLD_RELEASE_TRIES: u32 = 20;
 use crate::types::{CustomTlvRecord, DynStore, OnionMessenger, PaymentStore, Sweeper, Wallet};
 use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
@@ -1591,6 +1597,10 @@ where
 						.await;
 				}
 
+				// Blocknil patch: a payment held for this customer goes out now that their channel
+				// can take it, instead of waiting for the next sweep (#5).
+				self.held_forwards.release_for(counterparty_node_id);
+
 				let event = Event::ChannelReady {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -1781,6 +1791,30 @@ where
 				}
 			},
 			LdkEvent::OnionMessagePeerConnected { peer_node_id } => {
+				// Blocknil patch: the customer just (re)connected. Anything held for them that can
+				// go now, goes now. The connect arrives before their channel is usable, and LDK
+				// fires no event when a *reestablished* channel becomes usable again, so keep trying
+				// for this peer alone for a couple of seconds (#5). The timer is the fallback.
+				self.held_forwards.release_for(peer_node_id);
+				if self.held_forwards.has_held(&peer_node_id) {
+					let held = Arc::clone(&self.held_forwards);
+					let retry_logger = self.logger.clone();
+					self.runtime.spawn_cancellable_background_task(async move {
+						for _ in 0..HOLD_RELEASE_TRIES {
+							tokio::time::sleep(std::time::Duration::from_millis(HOLD_RELEASE_EVERY_MS))
+								.await;
+							held.release_for(peer_node_id);
+							if !held.has_held(&peer_node_id) {
+								return;
+							}
+						}
+						log_debug!(
+							retry_logger,
+							"Still holding a payment for {} after retrying for this connection",
+							peer_node_id
+						);
+					});
+				}
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					let messages = om_mailbox.onion_message_peer_connected(peer_node_id);
 					// Blocknil patch: only once the peer's channel is back (`held_forwards`).
