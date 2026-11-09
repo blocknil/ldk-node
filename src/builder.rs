@@ -758,6 +758,85 @@ impl NodeBuilder {
 		self.build_with_store(kv_store)
 	}
 
+	/// Blocknil patch: copies this node's SQLite store into VSS, so a node that has run on local
+	/// storage can move to VSS with its channels (#61). Run it with the node stopped, then build
+	/// with [`Self::build_with_vss_store_and_fixed_headers`] using the same `store_id`.
+	///
+	/// The data is encrypted with the same key `build_with_vss_store*` derives from the seed. Refused
+	/// when the VSS store already holds a channel manager: copying over a live store could replace
+	/// newer channel state with older. Every entry is read back and compared before returning the
+	/// number copied. The SQLite file is left untouched; never start the node from it again.
+	pub fn migrate_sqlite_store_to_vss(
+		&self, vss_url: String, store_id: String, fixed_headers: HashMap<String, String>,
+	) -> Result<usize, BuildError> {
+		let logger = setup_logger(&self.log_writer_config, &self.config)?;
+		let fail = |what: &str, e: &dyn std::fmt::Display| {
+			log_error!(logger, "Moving the store to VSS: {}: {}", what, e);
+			BuildError::KVStoreSetupFailed
+		};
+
+		let db_path = PathBuf::from(&self.config.storage_dir_path)
+			.join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+		if !db_path.exists() {
+			return Err(fail("no SQLite store", &db_path.display()));
+		}
+		let sqlite = SqliteStore::new(
+			self.config.storage_dir_path.clone().into(),
+			Some(io::sqlite_store::SQLITE_DB_FILE_NAME.to_string()),
+			Some(io::sqlite_store::KV_TABLE_NAME.to_string()),
+		)
+		.map_err(|e| fail("open SQLite", &e))?;
+
+		let seed_bytes = seed_bytes_from_config(
+			&self.config,
+			self.entropy_source_config.as_ref(),
+			Arc::clone(&logger),
+		)?;
+		let vss_xprv = derive_xprv(
+			Arc::new(self.config.clone()),
+			&seed_bytes,
+			VSS_HARDENED_CHILD_INDEX,
+			Arc::clone(&logger),
+		)?;
+		let vss = VssStore::new(
+			vss_url,
+			store_id,
+			vss_xprv.private_key.secret_bytes(),
+			Arc::new(FixedHeaders::new(fixed_headers)),
+		)
+		.map_err(|e| fail("open VSS", &e))?;
+
+		match KVStoreSync::read(
+			&vss,
+			CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+			CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+			CHANNEL_MANAGER_PERSISTENCE_KEY,
+		) {
+			Ok(_) => return Err(fail("refused", &"the VSS store already holds a node")),
+			Err(e) if e.kind() == bitcoin::io::ErrorKind::NotFound => {},
+			Err(e) => return Err(fail("check VSS is empty", &e)),
+		}
+
+		let keys = sqlite.list_all_keys().map_err(|e| fail("list SQLite", &e))?;
+		for (primary, secondary, key) in &keys {
+			let data = KVStoreSync::read(&sqlite, primary, secondary, key)
+				.map_err(|e| fail(&format!("read {primary}/{secondary}/{key}"), &e))?;
+			KVStoreSync::write(&vss, primary, secondary, key, data)
+				.map_err(|e| fail(&format!("write {primary}/{secondary}/{key}"), &e))?;
+		}
+		for (primary, secondary, key) in &keys {
+			let local = KVStoreSync::read(&sqlite, primary, secondary, key)
+				.map_err(|e| fail("re-read SQLite", &e))?;
+			let remote = KVStoreSync::read(&vss, primary, secondary, key)
+				.map_err(|e| fail(&format!("read back {primary}/{secondary}/{key}"), &e))?;
+			if local != remote {
+				return Err(fail("verify", &format!("{primary}/{secondary}/{key} differs")));
+			}
+		}
+		crate::log_info!(logger, "Moved {} entries from SQLite into VSS", keys.len());
+		Ok(keys.len())
+	}
+
 	/// Builds a [`Node`] instance with a [VSS] backend and according to the options
 	/// previously configured.
 	///
