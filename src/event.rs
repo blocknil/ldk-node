@@ -1235,6 +1235,34 @@ where
 				}
 
 				let anchor_channel = channel_type.requires_anchors_zero_fee_htlc_tx();
+				// Blocknil patch: as an LSPS2 service that keeps no reserve on its clients' side,
+				// refuse channels without anchors. Zero reserve is only granted to anchor channels,
+				// so a legacy channel would leave the client holding 1% of its money for the
+				// channel's whole life. It mostly comes from LDK's own retry: when we turn down an
+				// anchor open below (no on-chain reserve to bump it with), the opener's node drops
+				// anchors and asks again. Refusing that too makes the open fail plainly, and the
+				// client tries again later.
+				let disables_client_reserve = self
+					.liquidity_source
+					.as_ref()
+					.is_some_and(|ls| ls.as_ref().disables_client_reserve());
+				if !anchor_channel && disables_client_reserve {
+					log_error!(
+						self.logger,
+						"Rejecting inbound channel without anchors from peer {}: it couldn't be given zero reserve",
+						counterparty_node_id,
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Channel request rejected: anchor channels only".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject channel: {:?}", e);
+						});
+					return Ok(());
+				}
 				if anchor_channel {
 					if let Some(anchor_channels_config) =
 						self.config.anchor_channels_config.as_ref()
@@ -1324,11 +1352,7 @@ where
 				}
 				// Blocknil backport: as an LSPS2 service with `disable_client_reserve`, a client
 				// that opens its own (anchor) channel to us keeps no reserve either.
-				let accept_0reserve = anchor_channel
-					&& self
-						.liquidity_source
-						.as_ref()
-						.is_some_and(|ls| ls.as_ref().disables_client_reserve());
+				let accept_0reserve = anchor_channel && disables_client_reserve;
 				let res = if accept_0reserve {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer(
 						&temporary_channel_id,
