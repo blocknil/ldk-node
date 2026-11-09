@@ -256,8 +256,24 @@ impl HeldForwards {
 	}
 
 	/// Forwards what can go now, fails back what has waited too long, and announces newly held
-	/// payments. Runs on every interception and on a short timer.
+	/// payments. Runs on every interception and, as a fallback, on a timer.
 	pub(crate) fn process(&self) {
+		self.process_for(None);
+	}
+
+	/// Whether anything is still held for this customer.
+	pub(crate) fn has_held(&self, peer: &PublicKey) -> bool {
+		self.held.lock().unwrap().iter().any(|h| &h.customer == peer)
+	}
+
+	/// The same for one customer: called the moment their channel reads usable or they reconnect, so
+	/// a held payment goes out then rather than up to a sweep later (Blocknil patch, #5). Anything
+	/// that still can't go stays held, and the timer picks it up.
+	pub(crate) fn release_for(&self, peer: PublicKey) {
+		self.process_for(Some(peer));
+	}
+
+	fn process_for(&self, only: Option<PublicKey>) {
 		self.process_onions();
 		let now = Instant::now();
 		let mut announce = Vec::new();
@@ -265,6 +281,11 @@ impl HeldForwards {
 			let mut held = self.held.lock().unwrap();
 			let mut keep = Vec::with_capacity(held.len());
 			for mut h in held.drain(..) {
+				// Only this customer's payments, when one was named.
+				if only.is_some_and(|peer| h.customer != peer) {
+					keep.push(h);
+					continue;
+				}
 				let channel = self
 					.channel_manager
 					.list_channels_with_counterparty(&h.customer)

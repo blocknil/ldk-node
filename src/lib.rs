@@ -463,12 +463,15 @@ impl Node {
 			}
 		});
 
-		// Blocknil patch: held payments go through as soon as their customer is back, or are failed
-		// back once they've waited long enough (see `held_forwards`).
+		// Blocknil patch: held payments go through as soon as their customer is back (the
+		// `ChannelReady` and reconnect events call `held_forwards.release_for`), or are failed back
+		// once they've waited long enough. This timer is only the fallback — the deadline, and a
+		// channel that became usable without an event — so it is slow on purpose: it used to be
+		// 500 ms to catch a reconnect, which the events now catch at once (#5).
 		let held_forwards = Arc::clone(&self.held_forwards);
 		let mut stop_held = self.stop_sender.subscribe();
 		self.runtime.spawn_cancellable_background_task(async move {
-			let mut interval = tokio::time::interval(Duration::from_millis(500));
+			let mut interval = tokio::time::interval(Duration::from_secs(5));
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 			loop {
 				tokio::select! {
