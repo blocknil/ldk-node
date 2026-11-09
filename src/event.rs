@@ -1696,6 +1696,45 @@ where
 			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					om_mailbox.onion_message_intercepted(peer_node_id, message);
+					// Blocknil patch: a message for a node we share no channel with is a customer's
+					// message on its way out (a BOLT12 invoice request to Phoenix's LSP, say), not
+					// one waiting for a customer's phone. Nothing would ever connect us to that
+					// node, so connect now from the addresses in our graph; once connected, the
+					// mailbox releases the message (`OnionMessagePeerConnected`) and it is
+					// forwarded at once, since there is no channel to wait for.
+					if self.channel_manager.list_channels_with_counterparty(&peer_node_id).is_empty() {
+						let addresses: Vec<_> = self
+							.network_graph
+							.read_only()
+							.node(&NodeId::from_pubkey(&peer_node_id))
+							.and_then(|node| node.announcement_info.as_ref())
+							.map(|info| info.addresses().to_vec())
+							.unwrap_or_default();
+						if addresses.is_empty() {
+							log_debug!(
+								self.logger,
+								"Onion message for {} held, and no address for it in the graph",
+								peer_node_id
+							);
+						} else {
+							let spawn_logger = self.logger.clone();
+							let spawn_cm = Arc::clone(&self.connection_manager);
+							self.runtime.spawn_cancellable_background_task(async move {
+								for addr in &addresses {
+									match spawn_cm.connect_peer_if_necessary(peer_node_id, addr.clone()).await {
+										Ok(()) => return,
+										Err(e) => log_debug!(
+											spawn_logger,
+											"Couldn't connect to {}@{} to forward an onion message: {}",
+											peer_node_id,
+											addr,
+											e
+										),
+									}
+								}
+							});
+						}
+					}
 					// Blocknil patch: the message waits for a peer whose channel isn't usable,
 					// which is a phone with its app closed. Wake it now (LSPS5), not when the
 					// message is released: by then the invoice request has waited.
