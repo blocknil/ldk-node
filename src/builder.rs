@@ -722,6 +722,13 @@ impl NodeBuilder {
 		self
 	}
 
+	// Blocknil patch: see `Config::route_messages_via_lsp`.
+	/// Sends onion messages this node cannot hand to a connected peer through its LSP.
+	pub fn set_route_messages_via_lsp(&mut self, on: bool) -> &mut Self {
+		self.config.route_messages_via_lsp = on;
+		self
+	}
+
 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
 	/// previously configured.
 	pub fn build(&self) -> Result<Node, BuildError> {
@@ -1666,7 +1673,8 @@ fn build_with_store_internal(
 
 	// A claim-only node has no graph and one peer (the provider): everything it cannot reach goes
 	// through the provider, which is connected to the rest of the network.
-	let claim_route_via = if config.claim_only {
+	// Blocknil patch: a wallet that asks for it (`route_messages_via_lsp`) routes the same way.
+	let claim_route_via = if config.claim_only || config.route_messages_via_lsp {
 		config.trusted_peers_0conf.first().copied().or_else(|| {
 			liquidity_source_config
 				.and_then(|lsc| lsc.lsps2_client.as_ref())
@@ -1680,6 +1688,7 @@ fn build_with_store_internal(
 		Arc::clone(&keys_manager),
 		matches!(async_payments_role, Some(AsyncPaymentsRole::Server)),
 		claim_route_via,
+		config.claim_only,
 	));
 
 	// Initialize the ChannelManager
