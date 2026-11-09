@@ -50,6 +50,27 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+	/// Blocknil patch: every `(primary_namespace, secondary_namespace, key)` in the store, so the
+	/// whole store can be copied into VSS (`Builder::migrate_sqlite_store_to_vss`).
+	pub(crate) fn list_all_keys(&self) -> io::Result<Vec<(String, String, String)>> {
+		let locked_conn = self.inner.connection.lock().unwrap();
+		let sql = format!(
+			"SELECT primary_namespace, secondary_namespace, key FROM {}",
+			self.inner.kv_table_name
+		);
+		let mut stmt = locked_conn.prepare(&sql).map_err(|e| {
+			io::Error::new(io::ErrorKind::Other, format!("Failed to prepare statement: {}", e))
+		})?;
+		let rows = stmt
+			.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+			.map_err(|e| {
+				io::Error::new(io::ErrorKind::Other, format!("Failed to list keys: {}", e))
+			})?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+			io::Error::new(io::ErrorKind::Other, format!("Failed to read a key: {}", e))
+		})
+	}
+
 	/// Constructs a new [`SqliteStore`].
 	///
 	/// If not already existing, a new SQLite database will be created in the given `data_dir` under the
