@@ -143,6 +143,12 @@ pub struct Config {
 	/// a TLS client) in the way of the payment. Persisted graph and scoring data are neither read nor
 	/// written.
 	pub claim_only: bool,
+	/// Blocknil patch: send every onion message this node cannot hand to a connected peer through its
+	/// LSP, as a claim-only node does. A wallet that talks only to its provider and has a rapid-gossip
+	/// graph (no node addresses) otherwise queues a BOLT12 invoice request behind a connection to the
+	/// offer's introduction node that never opens, and the payment fails with `InvoiceRequestExpired`.
+	/// It also keeps the phone from dialling third parties. Off by default.
+	pub route_messages_via_lsp: bool,
 	/// The addresses on which the node will listen for incoming connections.
 	///
 	/// **Note**: We will only allow opening and accepting public channels if the `node_alias` and the
@@ -225,6 +231,7 @@ impl Default for Config {
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
 			claim_only: false,
+			route_messages_via_lsp: false,
 			listening_addresses: None,
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
