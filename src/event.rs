@@ -1629,7 +1629,11 @@ where
 				if let (Some(liquidity_source), Some(counterparty)) =
 					(self.liquidity_source.as_ref(), counterparty_node_id)
 				{
-					liquidity_source.lsps2_channel_closed(&counterparty, user_channel_id).await;
+					let disconnected =
+						matches!(reason, lightning::events::ClosureReason::DisconnectedPeer);
+					liquidity_source
+						.lsps2_channel_closed(&counterparty, user_channel_id, disconnected)
+						.await;
 				}
 
 				let event = Event::ChannelClosed {
@@ -1796,6 +1800,10 @@ where
 				// fires no event when a *reestablished* channel becomes usable again, so keep trying
 				// for this peer alone for a couple of seconds. The timer is the fallback.
 				self.held_forwards.release_for(peer_node_id);
+				// Blocknil patch: a first payment waiting for this customer opens their channel now.
+				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					liquidity_source.retry_jit_opens_for(peer_node_id).await;
+				}
 				if self.held_forwards.has_held(&peer_node_id) {
 					let held = Arc::clone(&self.held_forwards);
 					let retry_logger = self.logger.clone();
