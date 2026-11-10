@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
@@ -409,6 +409,10 @@ where
 			lsps2_service: self.lsps2_service,
 			webhook_sender: RwLock::new(None),
 			webhook_result_handler: RwLock::new(None),
+			waiting_opens: Mutex::new(Vec::new()),
+			opening: Mutex::new(Vec::new()),
+			jit_wait: RwLock::new(crate::held_forwards::DEFAULT_HOLD),
+			on_jit_waiting: RwLock::new(None),
 			wallet: self.wallet,
 			channel_manager: self.channel_manager,
 			peer_manager: RwLock::new(None),
@@ -418,6 +422,25 @@ where
 			logger: self.logger,
 		})
 	}
+}
+
+/// Blocknil patch: what an attempt to open a just-in-time channel came to.
+#[derive(Debug, PartialEq, Eq)]
+enum JitOpen {
+	/// The open started: the channel is being negotiated with the customer.
+	Opening,
+	/// Failed (and the payment failed back where that is done).
+	Done,
+	/// The customer isn't connected; nothing was done.
+	PeerOffline,
+}
+
+/// Blocknil patch: a first payment waiting for its offline customer.
+struct WaitingOpen {
+	customer: PublicKey,
+	amt_to_forward_msat: u64,
+	user_channel_id: u128,
+	deadline: Instant,
 }
 
 pub(crate) struct LiquiditySource<L: Deref>
@@ -432,6 +455,14 @@ where
 	/// Where the provider's answers to webhook registrations go; see [`OnWebhookResult`].
 	/// Blocknil patch.
 	webhook_result_handler: RwLock<Option<OnWebhookResult>>,
+	/// First payments waiting for their offline customer to connect. Blocknil patch.
+	waiting_opens: Mutex<Vec<WaitingOpen>>,
+	/// First-payment channels being opened, until ready. Blocknil patch.
+	opening: Mutex<Vec<WaitingOpen>>,
+	/// How long a first payment waits for its customer. Blocknil patch.
+	jit_wait: RwLock<Duration>,
+	/// Wakes the customer a first payment waits for. Blocknil patch.
+	on_jit_waiting: RwLock<Option<crate::held_forwards::OnHeld>>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	peer_manager: RwLock<Option<Arc<PeerManager>>>,
@@ -629,10 +660,261 @@ where
 	/// A channel closed: if it was a just-in-time channel whose payment never went through, fail
 	/// that payment back. Any other channel isn't ours to act on, so the answer is ignored.
 	/// Blocknil patch.
-	pub(crate) async fn lsps2_channel_closed(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+	pub(crate) async fn lsps2_channel_closed(
+		&self, counterparty_node_id: &PublicKey, user_channel_id: u128, disconnected: bool,
+	) {
+		if self.rewait_if_dropped_mid_open(counterparty_node_id, user_channel_id, disconnected) {
+			// The customer may already be back (the app reconnecting as the extension's run let
+			// go): then open at once rather than wait for a connect that already happened.
+			let connected = self
+				.peer_manager
+				.read()
+				.unwrap()
+				.as_ref()
+				.is_some_and(|pm| pm.peer_by_node_id(counterparty_node_id).is_some());
+			if connected {
+				self.retry_jit_opens_for(*counterparty_node_id).await;
+			}
+			return;
+		}
 		if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
 			let _ = handler.channel_open_failed(counterparty_node_id, user_channel_id).await;
 		}
+	}
+
+	/// Opens the just-in-time channel LSPS2 asked for. Blocknil patch: split out of the
+	/// `OpenChannel` event so a customer who wasn't connected can be retried when they are.
+	async fn open_jit_channel(
+		&self, their_network_key: PublicKey, amt_to_forward_msat: u64, user_channel_id: u128,
+		service_config: &LSPS2ServiceConfig,
+	) -> JitOpen {
+		let init_features = if let Some(peer_manager) =
+			self.peer_manager.read().unwrap().as_ref()
+		{
+			// Fail if we're not connected to the prospective channel partner.
+			if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
+				peer.init_features
+			} else {
+				// Blocknil patch: not a failure. The caller wakes the customer and opens
+				// once they connect (`wait_for_jit_peer`).
+				log_info!(
+					self.logger,
+					"LSPS2 channel to {} waits: the peer is not connected.",
+					their_network_key,
+				);
+				return JitOpen::PeerOffline;
+			}
+		} else {
+			debug_assert!(false, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
+			log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
+			return JitOpen::Done;
+		};
+
+		// Fail if we have insufficient onchain funds available.
+		let over_provisioning_msat = (amt_to_forward_msat
+			* service_config.channel_over_provisioning_ppm as u64)
+			/ 1_000_000;
+		// Blocknil patch: never smaller than MIN_JIT_CHANNEL_SATS. Sized to the payment
+		// alone, a payment of a few hundred sats makes a channel under the 1,000 sat reserve
+		// floor, which the client refuses and force-closes.
+		let channel_amount_sats =
+			((amt_to_forward_msat + over_provisioning_msat) / 1000).max(MIN_JIT_CHANNEL_SATS);
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+		let required_funds_sats = channel_amount_sats
+			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
+				if init_features.supports_anchors_zero_fee_htlc_tx()
+					&& !c.trusted_peers_no_reserve.contains(&their_network_key)
+				{
+					c.per_channel_reserve_sats
+				} else {
+					0
+				}
+			});
+		if spendable_amount_sats < required_funds_sats {
+			log_error!(self.logger,
+				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, required_funds_sats
+			);
+			// Blocknil patch: upstream fails silently here, so the payer's HTLC stays held
+			// until its timelock runs out and the payment shows as in flight for an hour.
+			// Fail it back now; the payer can try again.
+			self.fail_jit_open(&their_network_key, user_channel_id).await;
+			return JitOpen::Done;
+		}
+
+		let mut config = self.channel_manager.get_current_config().clone();
+
+		// We set these LSP-specific values during Node building, here we're making sure it's actually set.
+		debug_assert_eq!(
+			config
+				.channel_handshake_config
+				.max_inbound_htlc_value_in_flight_percent_of_channel,
+			100
+		);
+		debug_assert!(config.accept_forwards_to_priv_channels);
+
+		// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
+		//
+		// TODO: revisit this decision eventually.
+		config.channel_config.forwarding_fee_base_msat = 0;
+		config.channel_config.forwarding_fee_proportional_millionths = 0;
+
+		let opened = if service_config.disable_client_reserve {
+			self.channel_manager.create_channel_to_trusted_peer_0reserve(
+				their_network_key,
+				channel_amount_sats,
+				0,
+				user_channel_id,
+				None,
+				Some(config),
+			)
+		} else {
+			self.channel_manager.create_channel(
+				their_network_key,
+				channel_amount_sats,
+				0,
+				user_channel_id,
+				None,
+				Some(config),
+			)
+		};
+		match opened {
+			Ok(_) => return JitOpen::Opening,
+			Err(e) => {
+				// TODO: We just silently fail here. Eventually we will need to remember
+				// the pending requests and regularly retry opening the channel until we
+				// succeed.
+				log_error!(
+					self.logger,
+					"Failed to open LSPS2 channel to {}: {:?}",
+					their_network_key,
+					e
+				);
+				// Blocknil patch: as above, fail the held HTLC back instead of holding it.
+				self.fail_jit_open(&their_network_key, user_channel_id).await;
+				JitOpen::Done
+			},
+		}
+	}
+
+	/// Blocknil patch: the customer's first payment arrived while they were offline. Hold it (LDK
+	/// keeps the intercepted HTLC), wake them through the same handler as a held payment, and open
+	/// once they connect (`retry_jit_opens_for`), or fail it back after the hold time.
+	fn wait_for_jit_peer(&self, customer: PublicKey, amt_to_forward_msat: u64, user_channel_id: u128) {
+		let deadline = Instant::now() + *self.jit_wait.read().unwrap();
+		self.waiting_opens.lock().unwrap().push(WaitingOpen {
+			customer,
+			amt_to_forward_msat,
+			user_channel_id,
+			deadline,
+		});
+		log_info!(
+			self.logger,
+			"Holding a first payment of {} msat for customer {} until they connect",
+			amt_to_forward_msat,
+			customer
+		);
+		if let Some(on_waiting) = self.on_jit_waiting.read().unwrap().clone() {
+			on_waiting(customer);
+		}
+	}
+
+	/// Blocknil patch: `customer` connected; open any channel their first payment is waiting for.
+	pub(crate) async fn retry_jit_opens_for(&self, customer: PublicKey) {
+		let due: Vec<WaitingOpen> = {
+			let mut waiting = self.waiting_opens.lock().unwrap();
+			let (due, keep): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|w| w.customer == customer);
+			*waiting = keep;
+			due
+		};
+		if due.is_empty() {
+			return;
+		}
+		let Some(service_config) = self.lsps2_service.as_ref().map(|s| s.service_config.clone())
+		else {
+			return;
+		};
+		for w in due {
+			log_info!(self.logger, "Customer {} is back: opening their first payment's channel", customer);
+			let opened = self
+				.open_jit_channel(w.customer, w.amt_to_forward_msat, w.user_channel_id, &service_config)
+				.await;
+			match opened {
+				// Gone again between the connect and the open: keep waiting, same deadline.
+				JitOpen::PeerOffline => self.waiting_opens.lock().unwrap().push(w),
+				JitOpen::Opening => self.track_jit_opening(w),
+				JitOpen::Done => {},
+			}
+		}
+	}
+
+	/// Blocknil patch: an open in progress, until its channel is ready. A phone can drop the
+	/// connection mid-open (the extension's run is cancelled because the app opened, or iOS takes
+	/// the extension back); LDK then discards the unfunded channel, and the payment would be failed
+	/// back. Remembering the open lets it wait for the customer again instead.
+	fn track_jit_opening(&self, open: WaitingOpen) {
+		self.opening.lock().unwrap().push(open);
+	}
+
+	/// Blocknil patch: a just-in-time channel closed. If it closed before it was ready because the
+	/// customer disconnected, and there is time left, the first payment waits for them again (they
+	/// reconnect, `retry_jit_opens_for` opens anew). Any other close (a refusal) fails it back as
+	/// before. Returns whether it waits.
+	fn rewait_if_dropped_mid_open(
+		&self, counterparty_node_id: &PublicKey, user_channel_id: u128, disconnected: bool,
+	) -> bool {
+		let Some(open) = ({
+			let mut opening = self.opening.lock().unwrap();
+			opening.iter().position(|o| o.user_channel_id == user_channel_id).map(|i| opening.remove(i))
+		}) else {
+			return false;
+		};
+		if !disconnected || Instant::now() >= open.deadline {
+			return false;
+		}
+		log_info!(
+			self.logger,
+			"First payment channel to {} dropped mid-open (customer disconnected): waiting for them again",
+			counterparty_node_id
+		);
+		self.waiting_opens.lock().unwrap().push(open);
+		true
+	}
+
+	/// Blocknil patch: fails back first payments whose customer didn't connect in time.
+	pub(crate) async fn expire_jit_opens(&self) {
+		let now = Instant::now();
+		let expired: Vec<WaitingOpen> = {
+			let mut waiting = self.waiting_opens.lock().unwrap();
+			let (expired, keep): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|w| now >= w.deadline);
+			*waiting = keep;
+			expired
+		};
+		for w in expired {
+			log_info!(
+				self.logger,
+				"Gave up on a first payment of {} msat for customer {}: not back in time",
+				w.amt_to_forward_msat,
+				w.customer
+			);
+			self.fail_jit_open(&w.customer, w.user_channel_id).await;
+		}
+	}
+
+	/// Blocknil patch: first payments waiting for their customer, `(customer, amount_msat)`.
+	pub(crate) fn waiting_jit_opens(&self) -> Vec<(PublicKey, u64)> {
+		self.waiting_opens.lock().unwrap().iter().map(|w| (w.customer, w.amt_to_forward_msat)).collect()
+	}
+
+	pub(crate) fn set_jit_wait(&self, wait: Duration) {
+		*self.jit_wait.write().unwrap() = wait;
+	}
+
+	pub(crate) fn set_on_jit_waiting(&self, on_waiting: crate::held_forwards::OnHeld) {
+		*self.on_jit_waiting.write().unwrap() = Some(on_waiting);
 	}
 
 	/// Fails back the HTLCs held for a just-in-time channel that can't be opened, so the payer
@@ -975,116 +1257,23 @@ where
 					return;
 				};
 
-				let init_features = if let Some(peer_manager) =
-					self.peer_manager.read().unwrap().as_ref()
-				{
-					// Fail if we're not connected to the prospective channel partner.
-					if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
-						peer.init_features
-					} else {
-						// TODO: We just silently fail here. Eventually we will need to remember
-						// the pending requests and regularly retry opening the channel until we
-						// succeed.
-						log_error!(
-							self.logger,
-							"Failed to open LSPS2 channel to {} due to peer not being not connected.",
-							their_network_key,
-						);
-						return;
-					}
-				} else {
-					debug_assert!(false, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					return;
-				};
-
-				// Fail if we have insufficient onchain funds available.
-				let over_provisioning_msat = (amt_to_forward_msat
-					* service_config.channel_over_provisioning_ppm as u64)
-					/ 1_000_000;
-				// Blocknil patch: never smaller than MIN_JIT_CHANNEL_SATS. Sized to the payment
-				// alone, a payment of a few hundred sats makes a channel under the 1,000 sat reserve
-				// floor, which the client refuses and force-closes.
-				let channel_amount_sats =
-					((amt_to_forward_msat + over_provisioning_msat) / 1000).max(MIN_JIT_CHANNEL_SATS);
-				let cur_anchor_reserve_sats =
-					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-				let spendable_amount_sats =
-					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
-				let required_funds_sats = channel_amount_sats
-					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
-						if init_features.supports_anchors_zero_fee_htlc_tx()
-							&& !c.trusted_peers_no_reserve.contains(&their_network_key)
-						{
-							c.per_channel_reserve_sats
-						} else {
-							0
-						}
-					});
-				if spendable_amount_sats < required_funds_sats {
-					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-						spendable_amount_sats, required_funds_sats
-					);
-					// Blocknil patch: upstream fails silently here, so the payer's HTLC stays held
-					// until its timelock runs out and the payment shows as in flight for an hour.
-					// Fail it back now; the payer can try again.
-					self.fail_jit_open(&their_network_key, user_channel_id).await;
-					return;
-				}
-
-				let mut config = self.channel_manager.get_current_config().clone();
-
-				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
-				debug_assert_eq!(
-					config
-						.channel_handshake_config
-						.max_inbound_htlc_value_in_flight_percent_of_channel,
-					100
-				);
-				debug_assert!(config.accept_forwards_to_priv_channels);
-
-				// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
-				//
-				// TODO: revisit this decision eventually.
-				config.channel_config.forwarding_fee_base_msat = 0;
-				config.channel_config.forwarding_fee_proportional_millionths = 0;
-
-				let opened = if service_config.disable_client_reserve {
-					self.channel_manager.create_channel_to_trusted_peer_0reserve(
-						their_network_key,
-						channel_amount_sats,
-						0,
-						user_channel_id,
-						None,
-						Some(config),
-					)
-				} else {
-					self.channel_manager.create_channel(
-						their_network_key,
-						channel_amount_sats,
-						0,
-						user_channel_id,
-						None,
-						Some(config),
-					)
-				};
+				// Blocknil patch: a customer who is offline when their first payment arrives (the
+				// app closed after showing the invoice) is woken and waited for, instead of the open
+				// failing silently and the payment hanging until its timelock (upstream's TODO).
+				let opened = self
+					.open_jit_channel(their_network_key, amt_to_forward_msat, user_channel_id, &service_config)
+					.await;
 				match opened {
-					Ok(_) => {},
-					Err(e) => {
-						// TODO: We just silently fail here. Eventually we will need to remember
-						// the pending requests and regularly retry opening the channel until we
-						// succeed.
-						log_error!(
-							self.logger,
-							"Failed to open LSPS2 channel to {}: {:?}",
-							their_network_key,
-							e
-						);
-						// Blocknil patch: as above, fail the held HTLC back instead of holding it.
-						self.fail_jit_open(&their_network_key, user_channel_id).await;
-						return;
+					JitOpen::PeerOffline => {
+						self.wait_for_jit_peer(their_network_key, amt_to_forward_msat, user_channel_id)
 					},
+					JitOpen::Opening => self.track_jit_opening(WaitingOpen {
+						customer: their_network_key,
+						amt_to_forward_msat,
+						user_channel_id,
+						deadline: Instant::now() + *self.jit_wait.read().unwrap(),
+					}),
+					JitOpen::Done => {},
 				}
 			},
 			LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
@@ -1804,6 +1993,8 @@ where
 	pub(crate) async fn handle_channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) {
+		// Blocknil patch: the open finished; a later close is an ordinary close.
+		self.opening.lock().unwrap().retain(|o| o.user_channel_id != user_channel_id);
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			if let Err(e) = lsps2_service_handler
 				.channel_ready(user_channel_id, channel_id, counterparty_node_id)

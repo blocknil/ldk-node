@@ -248,6 +248,36 @@ impl Node {
 			self.config.network
 		);
 
+		// Blocknil patch: LDK does not persist a channel's `accept_underpaying_htlcs` (its
+		// `LegacyChannelConfig` serialization leaves it out), so after a restart a just-in-time
+		// channel from our LSPS2 LSP refuses the payment it was opened for: the LSP skims its
+		// opening fee, and the HTLC fails with "Upstream node sent less than we were supposed to
+		// receive". It happens whenever the node stops between accepting the channel and receiving
+		// the payment, e.g. the notification extension handing the wallet to the app mid-open.
+		// Set it again for every channel with the LSP, as it was when the channel was accepted
+		// (`Event::OpenChannelRequest`); the skimmed fee is still checked before claiming.
+		if let Some((lsp_node_id, _)) =
+			self.liquidity_source.as_ref().and_then(|ls| ls.get_lsps2_lsp_details())
+		{
+			let channel_ids: Vec<lightning::ln::types::ChannelId> = self
+				.channel_manager
+				.list_channels_with_counterparty(&lsp_node_id)
+				.into_iter()
+				.filter(|c| !c.config.is_some_and(|config| config.accept_underpaying_htlcs))
+				.map(|c| c.channel_id)
+				.collect();
+			if !channel_ids.is_empty() {
+				let update = lightning::util::config::ChannelConfigUpdate {
+					accept_underpaying_htlcs: Some(true),
+					..Default::default()
+				};
+				if let Err(e) =
+					self.channel_manager.update_partial_channel_config(&lsp_node_id, &channel_ids, &update)
+				{
+					log_error!(self.logger, "Failed to restore accepting the LSP's fee: {:?}", e);
+				}
+			}
+		}
 		if self.config.claim_only {
 			// A claim needs no chain: no TLS client to the server, no fee estimates to wait for, no
 			// wallet to sync. Each of those is a round trip (and a resident client) between the push
@@ -469,6 +499,7 @@ impl Node {
 		// channel that became usable without an event — so it is slow on purpose: it used to be
 		// 500 ms to catch a reconnect, which the events now catch at once (#5).
 		let held_forwards = Arc::clone(&self.held_forwards);
+		let held_jit = self.liquidity_source.clone();
 		let mut stop_held = self.stop_sender.subscribe();
 		self.runtime.spawn_cancellable_background_task(async move {
 			let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -476,7 +507,13 @@ impl Node {
 			loop {
 				tokio::select! {
 					_ = stop_held.changed() => return,
-					_ = interval.tick() => held_forwards.process(),
+					_ = interval.tick() => {
+						held_forwards.process();
+						// First payments waiting for an offline customer: the same deadline rule.
+						if let Some(ls) = held_jit.as_ref() {
+							ls.expire_jit_opens().await;
+						}
+					},
 				}
 			}
 		});
@@ -1520,11 +1557,20 @@ impl Node {
 	/// back (50 s by default).
 	pub fn set_hold_duration(&self, hold_for: Duration) {
 		self.held_forwards.set_hold_for(hold_for);
+		// The same wait for a first payment whose channel can't open until the customer connects.
+		if let Some(ls) = self.liquidity_source.as_ref() {
+			ls.set_jit_wait(hold_for);
+		}
 	}
 
 	/// Blocknil patch: called with the customer each time a payment starts being held for them,
 	/// to wake their phone.
 	pub fn set_payment_held_handler(&self, on_held: held_forwards::OnHeld) {
+		// Also called for a first payment waiting for its customer to connect, so the channel
+		// can be opened to them (Blocknil patch).
+		if let Some(ls) = self.liquidity_source.as_ref() {
+			ls.set_on_jit_waiting(Arc::clone(&on_held));
+		}
 		self.held_forwards.set_on_held(on_held);
 	}
 
@@ -1595,6 +1641,12 @@ impl Node {
 	/// Blocknil patch: payments held right now, as `(customer, amount_msat, seconds left)`.
 	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
 		self.held_forwards.held()
+	}
+
+	/// Blocknil patch: first payments waiting for their offline customer to connect so their
+	/// channel can be opened: `(customer, amount_msat)`.
+	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
+		self.liquidity_source.as_ref().map(|ls| ls.waiting_jit_opens()).unwrap_or_default()
 	}
 
 	/// Blocknil patch: the last payments that were held and have since ended (forwarded or failed
