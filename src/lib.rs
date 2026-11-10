@@ -469,6 +469,7 @@ impl Node {
 		// channel that became usable without an event — so it is slow on purpose: it used to be
 		// 500 ms to catch a reconnect, which the events now catch at once.
 		let held_forwards = Arc::clone(&self.held_forwards);
+		let held_jit = self.liquidity_source.clone();
 		let mut stop_held = self.stop_sender.subscribe();
 		self.runtime.spawn_cancellable_background_task(async move {
 			let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -476,7 +477,13 @@ impl Node {
 			loop {
 				tokio::select! {
 					_ = stop_held.changed() => return,
-					_ = interval.tick() => held_forwards.process(),
+					_ = interval.tick() => {
+						held_forwards.process();
+						// First payments waiting for an offline customer: the same deadline rule.
+						if let Some(ls) = held_jit.as_ref() {
+							ls.expire_jit_opens().await;
+						}
+					},
 				}
 			}
 		});
@@ -1520,11 +1527,20 @@ impl Node {
 	/// back (50 s by default).
 	pub fn set_hold_duration(&self, hold_for: Duration) {
 		self.held_forwards.set_hold_for(hold_for);
+		// The same wait for a first payment whose channel can't open until the customer connects.
+		if let Some(ls) = self.liquidity_source.as_ref() {
+			ls.set_jit_wait(hold_for);
+		}
 	}
 
 	/// Blocknil patch: called with the customer each time a payment starts being held for them,
 	/// to wake their phone.
 	pub fn set_payment_held_handler(&self, on_held: held_forwards::OnHeld) {
+		// Also called for a first payment waiting for its customer to connect, so the channel
+		// can be opened to them (Blocknil patch).
+		if let Some(ls) = self.liquidity_source.as_ref() {
+			ls.set_on_jit_waiting(Arc::clone(&on_held));
+		}
 		self.held_forwards.set_on_held(on_held);
 	}
 
@@ -1595,6 +1611,12 @@ impl Node {
 	/// Blocknil patch: payments held right now, as `(customer, amount_msat, seconds left)`.
 	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
 		self.held_forwards.held()
+	}
+
+	/// Blocknil patch: first payments waiting for their offline customer to connect so their
+	/// channel can be opened: `(customer, amount_msat)`.
+	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
+		self.liquidity_source.as_ref().map(|ls| ls.waiting_jit_opens()).unwrap_or_default()
 	}
 
 	/// Blocknil patch: the last payments that were held and have since ended (forwarded or failed
