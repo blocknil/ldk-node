@@ -22,7 +22,12 @@ use core::pin::Pin;
 use lightning::onion_message::dns_resolution::DNSResolverMessageHandler;
 
 /// How long [`crate::Node::resolve_name`] waits for an answer before it gives up.
-pub const NAME_RESOLUTION_TIMEOUT_SECS: u64 = 10;
+///
+/// Five seconds: a provider that has a record answers in well under one, and one that has none
+/// says nothing at all (`lightning-dns-resolver` sends no reply when `dnssec-prover` cannot build
+/// a proof, and it cannot for a name with no record), so the customer waits this long for every
+/// address that only has LNURL.
+pub const NAME_RESOLUTION_TIMEOUT_SECS: u64 = 5;
 
 /// A resolver for BIP 353 names, as the wallet implements it.
 ///
