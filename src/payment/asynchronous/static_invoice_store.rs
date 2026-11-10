@@ -41,6 +41,11 @@ pub(crate) struct StaticInvoiceStore {
 
 impl StaticInvoiceStore {
 	const RATE_LIMITER_BUCKET_CAPACITY: u32 = 5;
+	/// Blocknil patch: a wallet uploads its whole set of static invoices at once (ten slots, plus
+	/// their replacements), and a bucket of five refused the rest: on our mainnet provider 53 uploads
+	/// were refused in a day, and an offer whose invoice never landed fails silently for the payer.
+	/// The refill rate (ten a second) still bounds a wallet that keeps uploading.
+	const PERSIST_BUCKET_CAPACITY: u32 = 20;
 	const RATE_LIMITER_REFILL_INTERVAL: Duration = Duration::from_millis(100);
 	const RATE_LIMITER_MAX_IDLE: Duration = Duration::from_secs(600);
 
@@ -53,7 +58,7 @@ impl StaticInvoiceStore {
 				Self::RATE_LIMITER_MAX_IDLE,
 			)),
 			persist_rate_limiter: Mutex::new(RateLimiter::new(
-				Self::RATE_LIMITER_BUCKET_CAPACITY,
+				Self::PERSIST_BUCKET_CAPACITY,
 				Self::RATE_LIMITER_REFILL_INTERVAL,
 				Self::RATE_LIMITER_MAX_IDLE,
 			)),
@@ -197,6 +202,29 @@ mod tests {
 			.await
 			.unwrap()
 			.is_none());
+	}
+
+	/// Blocknil patch: a wallet uploads all ten of its slots in one burst, and every one must land;
+	/// a refused upload is an offer that fails silently for the payer.
+	#[tokio::test]
+	async fn a_wallets_whole_set_of_static_invoices_is_stored_in_one_burst() {
+		let store: Arc<DynStore> = Arc::new(InMemoryStore::new());
+		let static_invoice_store = StaticInvoiceStore::new(Arc::clone(&store));
+		let recipient_id = vec![1, 1, 1];
+		for slot in 0..10u16 {
+			let stored = static_invoice_store
+				.handle_persist_static_invoice(invoice(), blinded_path(), slot, recipient_id.clone())
+				.await;
+			assert!(stored.is_ok(), "slot {slot} refused: {stored:?}");
+		}
+		// Payers' requests keep their own, smaller bucket (one wallet is rarely asked ten times at
+		// once), so the lookups here are spaced at the refill rate.
+		for slot in 0..10u16 {
+			tokio::time::sleep(Duration::from_millis(110)).await;
+			let found =
+				static_invoice_store.handle_static_invoice_requested(&recipient_id, slot).await;
+			assert!(found.unwrap().is_some(), "slot {slot} missing");
+		}
 	}
 
 	fn invoice() -> StaticInvoice {

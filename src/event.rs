@@ -1896,7 +1896,9 @@ where
 							}
 						},
 						Ok(None) => {
-							log_trace!(
+							// Blocknil patch: the payer gets no answer at all and times out, so this
+							// is the one line that explains a failed payment to an offline wallet.
+							log_info!(
 								self.logger,
 								"No static invoice found for recipient {} and slot {}",
 								hex_utils::to_string(&recipient_id),
