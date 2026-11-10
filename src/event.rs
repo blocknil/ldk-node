@@ -569,6 +569,8 @@ where
 				// paid for by the registered signer's wallet, not ours.
 				let external = self.funding_input_signer.channels.lock().unwrap().remove(&user_channel_id);
 				let signer = self.funding_input_signer.signer.read().unwrap().clone();
+				// Blocknil patch: whether the funding comes from our own wallet (see below).
+				let own_funding = external.is_none();
 				let funding = match (external, signer) {
 					(Some(fee_rate), Some(signer)) => signer
 						.build_funding_transaction(
@@ -588,6 +590,8 @@ where
 				};
 				match funding {
 					Ok(final_tx) => {
+						// Blocknil patch: kept to give the coins back if LDK never takes the tx.
+						let unused_tx = final_tx.clone();
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {
 								ls.as_ref().lsps2_channel_needs_manual_broadcast(
@@ -633,6 +637,19 @@ where
 									"Failed to process funding transaction as channel went away before we could fund it: {}",
 									err
 								);
+								// Blocknil patch: the transaction was built, and its coins are held (our
+								// coin hold, `held_for_splices`), but LDK never took it, so it is never
+								// broadcast. Without releasing them those coins stay unavailable to every
+								// later open until the hold runs out: a customer whose phone dropped
+								// mid-open could not be given a channel when it came back.
+								if own_funding {
+									let coins: Vec<_> =
+										unused_tx.input.iter().map(|i| i.previous_output).collect();
+									self.wallet.release_splice_coins(&coins);
+									if let Err(e) = self.wallet.cancel_tx(&unused_tx) {
+										log_error!(self.logger, "Failed to release unused funding: {:?}", e);
+									}
+								}
 							},
 							Err(err) => {
 								log_error!(
