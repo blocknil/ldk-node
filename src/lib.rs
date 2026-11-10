@@ -248,6 +248,36 @@ impl Node {
 			self.config.network
 		);
 
+		// Blocknil patch: LDK does not persist a channel's `accept_underpaying_htlcs` (its
+		// `LegacyChannelConfig` serialization leaves it out), so after a restart a just-in-time
+		// channel from our LSPS2 LSP refuses the payment it was opened for: the LSP skims its
+		// opening fee, and the HTLC fails with "Upstream node sent less than we were supposed to
+		// receive". It happens whenever the node stops between accepting the channel and receiving
+		// the payment, e.g. the notification extension handing the wallet to the app mid-open.
+		// Set it again for every channel with the LSP, as it was when the channel was accepted
+		// (`Event::OpenChannelRequest`); the skimmed fee is still checked before claiming.
+		if let Some((lsp_node_id, _)) =
+			self.liquidity_source.as_ref().and_then(|ls| ls.get_lsps2_lsp_details())
+		{
+			let channel_ids: Vec<lightning::ln::types::ChannelId> = self
+				.channel_manager
+				.list_channels_with_counterparty(&lsp_node_id)
+				.into_iter()
+				.filter(|c| !c.config.is_some_and(|config| config.accept_underpaying_htlcs))
+				.map(|c| c.channel_id)
+				.collect();
+			if !channel_ids.is_empty() {
+				let update = lightning::util::config::ChannelConfigUpdate {
+					accept_underpaying_htlcs: Some(true),
+					..Default::default()
+				};
+				if let Err(e) =
+					self.channel_manager.update_partial_channel_config(&lsp_node_id, &channel_ids, &update)
+				{
+					log_error!(self.logger, "Failed to restore accepting the LSP's fee: {:?}", e);
+				}
+			}
+		}
 		if self.config.claim_only {
 			// A claim needs no chain: no TLS client to the server, no fee estimates to wait for, no
 			// wallet to sync. Each of those is a round trip (and a resident client) between the push
