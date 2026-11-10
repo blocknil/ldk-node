@@ -109,7 +109,7 @@ use crate::probing::{
 	RandomWalkStrategy,
 };
 use crate::provider_fee::ProviderFees;
-use crate::runtime::{Runtime, RuntimeSpawner};
+use crate::runtime::{MonitorPersistenceSpawner, Runtime};
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	AsyncPersister, ChainMonitor, ChannelManager, ChannelTxFactsStore, DynStore, DynStoreRef,
@@ -2191,7 +2191,7 @@ fn build_with_store_internal(
 	let peer_storage_key = keys_manager.get_peer_storage_key();
 	let monitor_reader = Arc::new(AsyncPersister::new(
 		DynStoreRef(Arc::clone(&kv_store)),
-		RuntimeSpawner::new(Arc::clone(&runtime)),
+		MonitorPersistenceSpawner::new(&runtime),
 		Arc::clone(&logger),
 		PERSISTER_MAX_PENDING_UPDATES,
 		Arc::clone(&keys_manager),
