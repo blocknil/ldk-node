@@ -215,9 +215,29 @@ pub(crate) fn random_storage_path() -> PathBuf {
 	temp_path
 }
 
+/// Blocknil patch (test-only): a port no other node in this test process was given, and that is
+/// free right now. Upstream draws each port at random from 5000..32768, and with ~70 nodes of two
+/// ports each running in parallel, two draws collide often enough that a node's `start` fails
+/// with `InvalidSocketAddress` ("is something else already listening?") in a random test. Ports
+/// now come from one counter per process, starting at an offset from the process id, and a port
+/// something else holds is skipped.
 pub(crate) fn random_port() -> u16 {
-	let mut rng = rng();
-	rng.random_range(5000..32768)
+	use std::sync::atomic::{AtomicU32, Ordering};
+	const LOW: u32 = 5000;
+	const SPAN: u32 = 32768 - LOW;
+	static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+	let _ = NEXT.compare_exchange(
+		u32::MAX,
+		std::process::id().wrapping_mul(97) % SPAN,
+		Ordering::SeqCst,
+		Ordering::SeqCst,
+	);
+	loop {
+		let port = (LOW + NEXT.fetch_add(1, Ordering::SeqCst) % SPAN) as u16;
+		if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+			return port;
+		}
+	}
 }
 
 pub(crate) fn random_listening_addresses() -> Vec<SocketAddress> {
