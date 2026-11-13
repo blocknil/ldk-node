@@ -18,12 +18,51 @@ use crate::logger::{log_error, log_info, LdkLogger};
 use crate::types::PeerManager;
 use crate::Error;
 
+type PendingConnections =
+	Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>;
+
+// Blocknil patch: backport of upstream d2f3a00 ("Clean up cancelled connection attempts", not in a
+// release yet). The connection manager outlives `stop`/`start`, and `stop` aborts the background
+// reconnect task mid-connect. The aborted attempt never reached `propagate_result_to_subscribers`,
+// so its `pending_connections` entry stayed, and every later `connect` to that peer subscribed to
+// it and waited forever (upstream's own `electrum_registrations_survive_chain_source_restart` hung
+// in `Node::connect`). This guard clears the entry and fails the subscribers when the leading
+// attempt is dropped before it finishes.
+struct PendingConnectionGuard<'a> {
+	pending_connections: &'a PendingConnections,
+	node_id: PublicKey,
+	active: bool,
+}
+
+impl<'a> PendingConnectionGuard<'a> {
+	fn new(pending_connections: &'a PendingConnections, node_id: PublicKey) -> Self {
+		Self { pending_connections, node_id, active: true }
+	}
+
+	fn disarm(&mut self) {
+		self.active = false;
+	}
+}
+
+impl Drop for PendingConnectionGuard<'_> {
+	fn drop(&mut self) {
+		if !self.active {
+			return;
+		}
+		let mut pending_connections = self.pending_connections.lock().unwrap();
+		if let Some(subscribers) = pending_connections.remove(&self.node_id) {
+			for subscriber in subscribers {
+				let _ = subscriber.send(Err(Error::ConnectionFailed));
+			}
+		}
+	}
+}
+
 pub(crate) struct ConnectionManager<L: Deref + Clone + Sync + Send>
 where
 	L::Target: LdkLogger,
 {
-	pending_connections:
-		Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>,
+	pending_connections: PendingConnections,
 	peer_manager: Arc<PeerManager>,
 	logger: L,
 }
@@ -61,6 +100,10 @@ where
 				Error::ConnectionFailed
 			})?;
 		}
+
+		// Blocknil patch (upstream d2f3a00): from here this task leads the attempt; if it is dropped
+		// before it finishes, the guard clears the pending entry and fails the subscribers.
+		let mut pending_connection = PendingConnectionGuard::new(&self.pending_connections, node_id);
 
 		log_info!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
 
@@ -109,6 +152,7 @@ where
 		};
 
 		self.propagate_result_to_subscribers(&node_id, res);
+		pending_connection.disarm();
 
 		res
 	}
@@ -120,6 +164,8 @@ where
 		match pending_connections_lock.entry(*node_id) {
 			hash_map::Entry::Occupied(mut entry) => {
 				let (tx, rx) = tokio::sync::oneshot::channel();
+				// Blocknil patch (upstream d2f3a00): drop subscribers that gave up waiting.
+				entry.get_mut().retain(|subscriber| !subscriber.is_closed());
 				entry.get_mut().push(tx);
 				Some(rx)
 			},
@@ -136,11 +182,6 @@ where
 		if let Some(connection_ready_senders) = pending_connections_lock.remove(node_id) {
 			for sender in connection_ready_senders {
 				let _ = sender.send(res).map_err(|e| {
-					debug_assert!(
-						false,
-						"Failed to send connection result to subscribers: {:?}",
-						e
-					);
 					log_error!(
 						self.logger,
 						"Failed to send connection result to subscribers: {:?}",
@@ -149,5 +190,29 @@ where
 				});
 			}
 		}
+	}
+}
+
+// Blocknil patch (upstream d2f3a00): the guard's own test.
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn pending_connection_guard_notifies_subscribers_when_abandoned() {
+		let node_id: PublicKey =
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		let pending_connections = Mutex::new(HashMap::new());
+		let (sender, mut receiver) = tokio::sync::oneshot::channel();
+		pending_connections.lock().unwrap().insert(node_id, vec![sender]);
+
+		let connection_guard = PendingConnectionGuard::new(&pending_connections, node_id);
+		drop(connection_guard);
+
+		assert!(
+			pending_connections.lock().unwrap().is_empty(),
+			"abandoned connection attempt should remove pending state"
+		);
+		assert_eq!(receiver.try_recv(), Ok(Err(Error::ConnectionFailed)));
 	}
 }
