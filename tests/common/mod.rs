@@ -724,8 +724,21 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		Amount::from_sat(premine_amount_sat),
 	)
 	.await;
-	node_a.sync_wallets().unwrap();
-	node_b.sync_wallets().unwrap();
+	// Blocknil patch (test-only): one `sync_wallets` can join a background sync that started
+	// before the funds were mined ("Sync in progress, skipping") and return without them, so a
+	// single sync then an exact balance failed with 0 now and then. Sync until the balance is
+	// there (30 s at most); the balance asserted is unchanged.
+	for node in [&node_a, &node_b] {
+		let deadline = std::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			node.sync_wallets().unwrap();
+			let spendable = node.list_balances().spendable_onchain_balance_sats;
+			if spendable == premine_amount_sat || std::time::Instant::now() > deadline {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(500)).await;
+		}
+	}
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
