@@ -82,6 +82,14 @@ pub(crate) struct Wallet {
 	// Without this, a second splice before that sync picks the same coins and is never valid, and
 	// LDK keeps it pending for good, blocking every later splice on that channel.
 	held_for_splices: Mutex<HashMap<OutPoint, Instant>>,
+	// Blocknil patch: channel-open funding transactions this wallet built, by txid, until LDK either
+	// broadcasts them (their coins then show spent) or discards them. A discarded one gives its
+	// coins back at once (`release_unused_funding`); without it they stay held for `SPLICE_HOLD`,
+	// and an open retried in that hour (a customer's phone that dropped mid-open and came back)
+	// finds no coins to fund it.
+	// Each entry keeps the hold deadline its coins were given, so only holds that are still this
+	// transaction's are lifted (a coin whose hold ran out may since be held for a later one).
+	own_fundings: Mutex<HashMap<Txid, (Transaction, Instant)>>,
 }
 
 /// How long coins handed to a splice or channel funding stay held when no sync shows them spent.
@@ -105,6 +113,7 @@ impl Wallet {
 			config,
 			logger,
 			held_for_splices: Mutex::new(HashMap::new()),
+			own_fundings: Mutex::new(HashMap::new()),
 		}
 	}
 
@@ -299,11 +308,17 @@ impl Wallet {
 			e
 		})?;
 
+		// Remembered until broadcast or discarded. Pruned first, before this transaction's holds go
+		// in: an entry none of whose coins still carries its own hold (spent, or the hold ran out)
+		// has nothing left to give back, even if this transaction now holds one of those coins.
+		let mut own = self.own_fundings.lock().unwrap();
+		own.retain(|_, (t, at)| !coins_held_by(&held, t, *at).is_empty());
 		// LDK broadcasts this, not us: until a sync shows it, its coins would still look free.
 		let until = Instant::now() + SPLICE_HOLD;
 		for txin in &tx.input {
 			held.insert(txin.previous_output, until);
 		}
+		own.insert(tx.compute_txid(), (tx.clone(), until));
 
 		Ok(tx)
 	}
@@ -694,6 +709,30 @@ impl Wallet {
 		let now = Instant::now();
 		held.retain(|coin, until| *until > now && unspent.contains(coin));
 		held
+	}
+
+	/// Blocknil patch: gives back the coins of a channel-open funding transaction this wallet built
+	/// and LDK will never broadcast (it was refused, or the channel closed before funding was
+	/// signed). Only transactions `create_funding_transaction` built are touched, so a discarded
+	/// splice candidate, whose inputs the splice that did lock may share, is never released here.
+	/// Returns whether `txid` was one of ours.
+	pub(crate) fn release_unused_funding(&self, txid: &Txid) -> bool {
+		let (tx, until) = match self.own_fundings.lock().unwrap().remove(txid) {
+			Some(entry) => entry,
+			None => return false,
+		};
+		{
+			// Only the holds this transaction placed: a coin whose hold ran out and that a later
+			// funding or splice now holds keeps that later hold.
+			let mut held = self.held_for_splices.lock().unwrap();
+			for coin in coins_held_by(&held, &tx, until) {
+				held.remove(&coin);
+			}
+		}
+		if let Err(e) = self.cancel_tx(&tx) {
+			log_error!(self.logger, "Failed to release unused funding {}: {:?}", txid, e);
+		}
+		true
 	}
 
 	/// Lets coins that went into a splice that didn't happen be chosen again.
@@ -1111,5 +1150,63 @@ impl ChangeDestinationSource for WalletKeysManager {
 				.map(|addr| addr.script_pubkey())
 				.map_err(|_| ())
 		})
+	}
+}
+
+/// Blocknil patch: the inputs of `tx` whose hold is still the one `tx` placed (deadline `until`).
+fn coins_held_by(
+	held: &HashMap<OutPoint, Instant>, tx: &Transaction, until: Instant,
+) -> Vec<OutPoint> {
+	tx.input
+		.iter()
+		.map(|i| i.previous_output)
+		.filter(|coin| held.get(coin) == Some(&until))
+		.collect()
+}
+
+#[cfg(test)]
+mod own_funding_tests {
+	use super::*;
+	use bitcoin::transaction::Version;
+	use bitcoin::{Sequence, TxIn, Witness};
+
+	fn tx_spending(coins: &[OutPoint]) -> Transaction {
+		Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: coins
+				.iter()
+				.map(|c| TxIn {
+					previous_output: *c,
+					script_sig: ScriptBuf::new(),
+					sequence: Sequence::MAX,
+					witness: Witness::new(),
+				})
+				.collect(),
+			output: vec![],
+		}
+	}
+
+	fn coin(n: u8) -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([n; 32]), vout: 0 }
+	}
+
+	#[test]
+	fn a_funding_releases_only_the_holds_it_placed() {
+		let start = Instant::now();
+		let a_until = start + Duration::from_secs(1);
+		let b_until = start + Duration::from_secs(2);
+		// Funding A held coins 1 and 2; A's hold on coin 2 ran out and funding B now holds it.
+		let a = tx_spending(&[coin(1), coin(2)]);
+		let mut held = HashMap::new();
+		held.insert(coin(1), a_until);
+		held.insert(coin(2), b_until);
+		assert_eq!(coins_held_by(&held, &a, a_until), vec![coin(1)]);
+		// B's coin is B's to release.
+		let b = tx_spending(&[coin(2)]);
+		assert_eq!(coins_held_by(&held, &b, b_until), vec![coin(2)]);
+		// A coin no longer held at all is nobody's.
+		held.remove(&coin(1));
+		assert!(coins_held_by(&held, &a, a_until).is_empty());
 	}
 }
