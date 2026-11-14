@@ -5,7 +5,7 @@
 // arrives on an intercept SCID, so each customer gets one (`scid_for`, kept in the store so
 // invoices stay valid across restarts) and puts it in its invoices' route hints. A payment on it
 // is forwarded at once when the customer's channel is usable; otherwise it is held, the
-// `on_held` callback is told (to wake the phone, docs/push-wake-plan.md), and it goes through as
+// `on_held` callback is told (to wake the customer's device), and it goes through as
 // soon as the customer is back, or is failed back after `hold_for`.
 //
 // Onion messages held for an offline customer (a BOLT12 invoice request) get the same care: LDK

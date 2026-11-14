@@ -184,7 +184,7 @@ pub struct Lsps2FeeTerms {
 /// Represents the configuration of the LSPS5 (webhook) service.
 ///
 /// The service keeps a webhook URL per client and tells it when a payment is waiting, which is how
-/// a phone whose app is closed is woken (`docs/push-wake-plan.md`). Blocknil patch: upstream
+/// a phone whose app is closed is woken. Blocknil patch: upstream
 /// ldk-node leaves LSPS5 switched off entirely.
 ///
 /// See [bLIP-55 / LSPS5] for more information.
