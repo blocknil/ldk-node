@@ -16,7 +16,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint};
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{
-	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
+	ClosureReason, Event as LdkEvent, FundingInfo, PaymentFailureReason, PaymentPurpose,
+	ReplayEvent,
 };
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::{FailureCode, PaymentId};
@@ -643,12 +644,7 @@ where
 								// later open until the hold runs out: a customer whose phone dropped
 								// mid-open could not be given a channel when it came back.
 								if own_funding {
-									let coins: Vec<_> =
-										unused_tx.input.iter().map(|i| i.previous_output).collect();
-									self.wallet.release_splice_coins(&coins);
-									if let Err(e) = self.wallet.cancel_tx(&unused_tx) {
-										log_error!(self.logger, "Failed to release unused funding: {:?}", e);
-									}
+									self.wallet.release_unused_funding(&unused_tx.compute_txid());
 								}
 							},
 							Err(err) => {
@@ -1637,9 +1633,30 @@ where
 				reason,
 				user_channel_id,
 				counterparty_node_id,
+				channel_funding_txo,
 				..
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
+
+				// Blocknil patch: the peer went away before funding completed (LDK forgets such a
+				// channel; it never broadcast the funding, and neither did we: no funding is broadcast
+				// before `funding_signed`, which this channel never got). If our wallet built
+				// that funding, its coins are free again now, before the code below lets a returning
+				// customer retry the open: `DiscardFunding`, which says the same, is handled after
+				// this event, and a phone that reconnects within milliseconds would otherwise find
+				// the coins still held and its first payment failed back.
+				if matches!(reason, lightning::events::ClosureReason::DisconnectedPeer) {
+					if let Some(txo) = channel_funding_txo {
+						if self.wallet.release_unused_funding(&txo.txid) {
+							log_info!(
+								self.logger,
+								"Released the coins of unused funding transaction {} (channel {})",
+								txo.txid,
+								channel_id
+							);
+						}
+					}
+				}
 
 				// Blocknil patch: a just-in-time channel that closed before its payment went through
 				// (the client refused it, say) must not keep the payer's HTLC held until it times out.
@@ -1668,7 +1685,26 @@ where
 					},
 				};
 			},
-			LdkEvent::DiscardFunding { .. } => {},
+			// Blocknil patch: a channel that closed before its funding was broadcast (the peer
+			// went away between `accept_channel` and `funding_signed`, e.g. a customer's phone
+			// whose background run was stopped) leaves the funding transaction unused. If our
+			// wallet built it, its coins are given back now instead of after the hold, so the
+			// open can be retried at once. A transaction LDK left for us to broadcast
+			// (`FundingInfo::OutPoint`, the LSPS2 manual-broadcast case) may already be out, so
+			// its coins stay held until a sync shows them unspent or the hold runs out.
+			LdkEvent::DiscardFunding { channel_id, funding_info } => {
+				if let FundingInfo::Tx { transaction } = funding_info {
+					let txid = transaction.compute_txid();
+					if self.wallet.release_unused_funding(&txid) {
+						log_info!(
+							self.logger,
+							"Released the coins of unused funding transaction {} (channel {})",
+							txid,
+							channel_id
+						);
+					}
+				}
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,
