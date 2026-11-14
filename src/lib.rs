@@ -87,7 +87,7 @@ mod error;
 mod event;
 mod fee_estimator;
 // Blocknil patch: public so the wallet core uses this one copy of the mempool-histogram fee math
-// (it used to include the file by path from its vendor/ folder). Not part of ldk-node's API.
+// (it used to keep its own copy of the file). Not part of ldk-node's API.
 #[doc(hidden)]
 pub mod mempool_fee;
 mod funding_signer;
@@ -2184,8 +2184,8 @@ impl Node {
 /// A claim-only node has no network graph, so [`lightning::onion_message::messenger::DefaultMessageRouter`]
 /// finds no addresses for anything it is not already connected to and returns a path with none — which
 /// the messenger then queues behind a connection that never opens. The case that matters is a BOLT12
-/// invoice request whose reply path starts at the payer's LSP (Phoenix and ACINQ): the receiver is not
-/// connected to ACINQ, the provider is, and one hop through it is all the reply needs.
+/// invoice request whose reply path starts at the payer's LSP: the receiver is not connected to that
+/// LSP, the provider is, and one hop through it is all the reply needs.
 ///
 /// `first_node` is the node the destination would be handed to first, as far as it can be told from
 /// the destination alone; `None` when it cannot be resolved (a short-channel-id introduction, which

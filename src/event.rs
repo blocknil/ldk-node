@@ -1752,7 +1752,7 @@ where
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 					om_mailbox.onion_message_intercepted(peer_node_id, message);
 					// Blocknil patch: a message for a node we share no channel with is a customer's
-					// message on its way out (a BOLT12 invoice request to Phoenix's LSP, say), not
+					// message on its way out (a BOLT12 invoice request to the payer's LSP, say), not
 					// one waiting for a customer's phone. Nothing would ever connect us to that
 					// node, so connect now from the addresses in our graph; once connected, the
 					// mailbox releases the message (`OnionMessagePeerConnected`) and it is
