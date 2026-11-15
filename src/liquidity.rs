@@ -412,6 +412,8 @@ where
 			webhook_result_handler: RwLock::new(None),
 			waiting_opens: Mutex::new(Vec::new()),
 			opening: Mutex::new(Vec::new()),
+			ready_waiting: Mutex::new(Vec::new()),
+			returned: Mutex::new(Vec::new()),
 			jit_wait: RwLock::new(crate::held_forwards::DEFAULT_HOLD),
 			on_jit_waiting: RwLock::new(None),
 			wallet: self.wallet,
@@ -444,6 +446,25 @@ struct WaitingOpen {
 	deadline: Instant,
 }
 
+/// Blocknil patch: a ready first-payment channel whose customer was gone when it became ready.
+#[derive(Clone)]
+struct ReadyWaiting {
+	user_channel_id: u128,
+	channel_id: ChannelId,
+	customer: PublicKey,
+	deadline: Instant,
+}
+
+/// Blocknil patch: a first payment our rust-lightning fork handed back as intercepted because the
+/// customer dropped while its forward was being processed.
+#[derive(Clone)]
+struct ReturnedFirstPayment {
+	intercept_id: InterceptId,
+	channel_id: ChannelId,
+	customer: PublicKey,
+	deadline: Instant,
+}
+
 pub(crate) struct LiquiditySource<L: Deref>
 where
 	L::Target: LdkLogger,
@@ -460,6 +481,11 @@ where
 	waiting_opens: Mutex<Vec<WaitingOpen>>,
 	/// First-payment channels being opened, until ready. Blocknil patch.
 	opening: Mutex<Vec<WaitingOpen>>,
+	/// First-payment channels that became ready while their customer was not connected, so the
+	/// payment held for them is not forwarded yet (see `channel_ready_when_usable`). Blocknil patch.
+	ready_waiting: Mutex<Vec<ReadyWaiting>>,
+	/// First payments handed back by LDK, waiting for their customer. Blocknil patch.
+	returned: Mutex<Vec<ReturnedFirstPayment>>,
 	/// How long a first payment waits for its customer. Blocknil patch.
 	jit_wait: RwLock<Duration>,
 	/// Wakes the customer a first payment waits for. Blocknil patch.
@@ -1981,6 +2007,204 @@ where
 				log_error!(self.logger, "Failed to build and sign invoice: {}", e);
 				Error::InvoiceCreationFailed
 			})
+	}
+
+	/// Blocknil patch: the first-payment channel to `counterparty_node_id` is ready; forward the
+	/// payment held for it only if the channel can carry it now. LSPS2 hands the held HTLCs to
+	/// LDK at once, and LDK fails an HTLC back to the payer when the channel's peer is gone — a
+	/// phone that drops the connection right after the channel became ready (the extension's run
+	/// cancelled as the app opens) lost its first payment that way. A channel that isn't usable
+	/// keeps the payment held until the customer is back (`forward_ready_for`), at most `jit_wait`
+	/// like any first payment waiting for its customer; then it is failed back.
+	pub(crate) async fn channel_ready_when_usable(
+		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) {
+		// The open finished: a later close is an ordinary close, not a dropped open.
+		self.opening.lock().unwrap().retain(|o| o.user_channel_id != user_channel_id);
+		let deadline = Instant::now() + *self.jit_wait.read().unwrap();
+		self.try_ready(ReadyWaiting {
+			user_channel_id,
+			channel_id: *channel_id,
+			customer: *counterparty_node_id,
+			deadline,
+		})
+		.await;
+	}
+
+	/// Blocknil patch: hands a ready channel's held first payment to LSPS2 once the channel is
+	/// usable, or once its deadline has passed: LSPS2 then forwards it, the forward finds the
+	/// customer gone and fails it back to the payer, and LSPS2 moves on (a retry of the payment
+	/// can still open nothing new and go through when they are back), exactly as before the
+	/// hold. A channel gone meanwhile fails the open in LSPS2, which fails the payment back.
+	async fn try_ready(&self, w: ReadyWaiting) {
+		match self.channel_usable(&w.customer, &w.channel_id) {
+			Some(false) if Instant::now() < w.deadline => {
+				let mut waiting = self.ready_waiting.lock().unwrap();
+				if !waiting.iter().any(|x| x.channel_id == w.channel_id) {
+					log_info!(
+						self.logger,
+						"First payment channel {} to {} is ready but not usable (customer gone): holding the payment until they are back",
+						w.channel_id,
+						w.customer
+					);
+					waiting.push(w);
+				}
+			},
+			Some(_) => {
+				self.handle_channel_ready(w.user_channel_id, &w.channel_id, &w.customer).await
+			},
+			None => {
+				if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+					let _ = handler.channel_open_failed(&w.customer, w.user_channel_id).await;
+				}
+			},
+		}
+	}
+
+	/// Blocknil patch: `Some(usable)` for `customer`'s channel `channel_id` (usable = ready with
+	/// the customer connected), `None` if it no longer exists.
+	fn channel_usable(&self, customer: &PublicKey, channel_id: &ChannelId) -> Option<bool> {
+		self.channel_manager
+			.list_channels_with_counterparty(customer)
+			.into_iter()
+			.find(|c| c.channel_id == *channel_id)
+			.map(|c| c.is_usable)
+	}
+
+	/// Blocknil patch: a first payment our rust-lightning fork handed back (its customer dropped
+	/// while its forward was processed), already queued again in LSPS2 by
+	/// `handle_htlc_intercepted`. It waits for the customer (`forward_ready_for`) at most
+	/// `jit_wait`.
+	pub(crate) fn note_handed_back(&self, intercept_scid: u64, intercept_id: InterceptId) {
+		let channel = self
+			.liquidity_manager
+			.lsps2_service_handler()
+			.and_then(|h| h.jit_channel_for_intercept_scid(intercept_scid));
+		match channel {
+			Some((customer, channel_id)) => {
+				log_info!(
+					self.logger,
+					"First payment to {} handed back (customer gone during its forward): holding it until they are back",
+					customer
+				);
+				let deadline = Instant::now() + *self.jit_wait.read().unwrap();
+				let mut returned = self.returned.lock().unwrap();
+				if !returned.iter().any(|r| r.intercept_id == intercept_id) {
+					returned.push(ReturnedFirstPayment { intercept_id, channel_id, customer, deadline });
+				}
+			},
+			// Not a first-payment channel LSPS2 knows: fail it back as before the fork's patch.
+			None => {
+				log_error!(
+					self.logger,
+					"A payment came back for intercept SCID {} with no known first-payment channel: failing it back",
+					intercept_scid
+				);
+				let _ = self.channel_manager.fail_intercepted_htlc(intercept_id);
+			},
+		}
+	}
+
+	/// Blocknil patch: for `customer`, forwards held first payments whose channel is usable now,
+	/// fails back those past their deadline or whose channel is gone, and keeps the rest.
+	pub(crate) async fn forward_ready_for(&self, customer: PublicKey) {
+		let ready: Vec<ReadyWaiting> = {
+			let mut waiting = self.ready_waiting.lock().unwrap();
+			let (due, keep): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|w| w.customer == customer);
+			*waiting = keep;
+			due
+		};
+		for w in ready {
+			self.try_ready(w).await;
+		}
+
+		let returned: Vec<ReturnedFirstPayment> = {
+			let mut r = self.returned.lock().unwrap();
+			let (due, keep): (Vec<_>, Vec<_>) = r.drain(..).partition(|x| x.customer == customer);
+			*r = keep;
+			due
+		};
+		// LSPS2 queued a returned HTLC again; its failed-forward path offers the queued payment
+		// once more with the same opening fee. Once per channel and pass: one call releases every
+		// returned part of the payment. Past the deadline the same call lets LSPS2 forward it to
+		// the absent customer, which fails it back to the payer and resets LSPS2, as before the
+		// hold.
+		//
+		// That call tells LSPS2 "the forward on this channel failed", so it is only made while it
+		// is true: the returned HTLC is still held by LDK and nothing is in flight on the channel.
+		// Otherwise LSPS2 already forwarded it (or a later pass released it), and a second call
+		// while a forward is in flight would reset LSPS2 under it: the payment's success would be
+		// refused and the opening fee charged again on the next one. Such an entry is dropped.
+		let mut released: Vec<ChannelId> = Vec::new();
+		for r in returned {
+			let still_held =
+				self.channel_manager.intercepted_htlc_inbound_amount_msat(r.intercept_id).is_some();
+			let in_flight = self
+				.channel_manager
+				.list_channels_with_counterparty(&r.customer)
+				.into_iter()
+				.find(|c| c.channel_id == r.channel_id)
+				.map_or(false, |c| !c.pending_outbound_htlcs.is_empty());
+			if !still_held || in_flight {
+				continue;
+			}
+			match self.channel_usable(&r.customer, &r.channel_id) {
+				Some(false) if Instant::now() < r.deadline => {
+					self.returned.lock().unwrap().push(r);
+				},
+				Some(usable) => {
+					if !released.contains(&r.channel_id) {
+						released.push(r.channel_id);
+						if usable {
+							log_info!(
+								self.logger,
+								"Customer {} is back: forwarding their returned first payment on channel {}",
+								r.customer,
+								r.channel_id
+							);
+						} else {
+							log_info!(
+								self.logger,
+								"Customer {} did not come back for their returned first payment: failing it back",
+								r.customer
+							);
+						}
+						self.handle_htlc_handling_failed(HTLCHandlingFailureType::Forward {
+							node_id: Some(r.customer),
+							channel_id: r.channel_id,
+						})
+						.await;
+					}
+				},
+				// The channel closed: LSPS2 cannot forward anywhere; fail it back directly.
+				None => {
+					let _ = self.channel_manager.fail_intercepted_htlc(r.intercept_id);
+				},
+			}
+		}
+	}
+
+	/// Blocknil patch: whether `customer` still has a held first payment.
+	pub(crate) fn has_ready_waiting(&self, customer: &PublicKey) -> bool {
+		self.ready_waiting.lock().unwrap().iter().any(|w| w.customer == *customer)
+			|| self.returned.lock().unwrap().iter().any(|r| r.customer == *customer)
+	}
+
+	/// Blocknil patch: the timer's pass over every customer with a held first payment: a channel
+	/// that became usable again without an event (a reestablish fires none) forwards it here, and
+	/// deadlines are applied.
+	pub(crate) async fn forward_ready_all(&self) {
+		let customers: Vec<PublicKey> = {
+			let mut c: Vec<PublicKey> =
+				self.ready_waiting.lock().unwrap().iter().map(|w| w.customer).collect();
+			c.extend(self.returned.lock().unwrap().iter().map(|r| r.customer));
+			c.sort();
+			c.dedup();
+			c
+		};
+		for customer in customers {
+			self.forward_ready_for(customer).await;
+		}
 	}
 
 	pub(crate) async fn handle_channel_ready(

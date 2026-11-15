@@ -1605,8 +1605,9 @@ where
 				}
 
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+					// Blocknil patch: only into a channel that can carry it (see there).
 					liquidity_source
-						.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
+						.channel_ready_when_usable(user_channel_id, &channel_id, &counterparty_node_id)
 						.await;
 				}
 
@@ -1712,6 +1713,9 @@ where
 				payment_hash,
 				..
 			} => {
+				// Blocknil patch: asked for every interception, so our rust-lightning fork's
+				// record of hand-backs never outlives its event.
+				let handed_back = self.channel_manager.take_handed_back_intercept(intercept_id);
 				// Blocknil patch: a payment on a customer's hold SCID waits for them if needed.
 				if self.held_forwards.is_hold_scid(requested_next_hop_scid) {
 					self.held_forwards.intercepted(
@@ -1728,6 +1732,10 @@ where
 							payment_hash,
 						)
 						.await;
+					// Blocknil patch: a first payment handed back waits for its customer.
+					if handed_back {
+						liquidity_source.note_handed_back(requested_next_hop_scid, intercept_id);
+					}
 				}
 			},
 			LdkEvent::InvoiceReceived { .. } => {
@@ -1856,6 +1864,25 @@ where
 				// Blocknil patch: a first payment waiting for this customer opens their channel now.
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source.retry_jit_opens_for(peer_node_id).await;
+					// Blocknil patch: a first payment held because its ready channel's customer
+					// was gone. The connect arrives before the channel is reestablished, so retry
+					// for a couple of seconds, like the held forwards below.
+					liquidity_source.forward_ready_for(peer_node_id).await;
+					if liquidity_source.has_ready_waiting(&peer_node_id) {
+						let ls = Arc::clone(liquidity_source);
+						self.runtime.spawn_cancellable_background_task(async move {
+							for _ in 0..HOLD_RELEASE_TRIES {
+								tokio::time::sleep(std::time::Duration::from_millis(
+									HOLD_RELEASE_EVERY_MS,
+								))
+								.await;
+								ls.forward_ready_for(peer_node_id).await;
+								if !ls.has_ready_waiting(&peer_node_id) {
+									return;
+								}
+							}
+						});
+					}
 				}
 				if self.held_forwards.has_held(&peer_node_id) {
 					let held = Arc::clone(&self.held_forwards);

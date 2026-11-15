@@ -512,6 +512,8 @@ impl Node {
 						// First payments waiting for an offline customer: the same deadline rule.
 						if let Some(ls) = held_jit.as_ref() {
 							ls.expire_jit_opens().await;
+							// Blocknil patch: held first payments of ready channels usable again.
+							ls.forward_ready_all().await;
 						}
 					},
 				}
