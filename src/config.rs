@@ -169,6 +169,9 @@ pub struct Config {
 	pub node_alias: Option<NodeAlias>,
 	/// A list of peers that we allow to establish zero confirmation channels to us.
 	///
+	/// Blocknil patch: their splices are trusted at zero confirmations too, also on channels we
+	/// opened to them (LDK's `UserConfig::trusted_splice_peers_0conf`, our rust-lightning fork).
+	///
 	/// **Note:** Allowing payments via zero-confirmation channels is potentially insecure if the
 	/// funding transaction ends up never being confirmed on-chain. Zero-confirmation channels
 	/// should therefore only be accepted from trusted peers.
@@ -223,6 +226,12 @@ pub struct Config {
 	/// their channel on-chain. At most 1008: past that, our rust-lightning fork won't build a blinded
 	/// receive path through the hop (upstream LDK stops at 216).
 	pub forwarding_cltv_expiry_delta: Option<u16>,
+	/// Lock a splice at zero confirmations when every input other than the channel's shared one is
+	/// ours. Blocknil patch (splice on arrival): our provider splices its own funds into a customer's
+	/// channel when a payment arrives that doesn't fit, and forwards the payment over them at once.
+	/// The risk is only ours (a splice that never confirms, which we fee-bump). Off by default; see
+	/// LDK's `UserConfig::trust_own_splice_inputs_0conf` (our rust-lightning fork).
+	pub trust_own_splice_inputs_0conf: bool,
 }
 
 impl Default for Config {
@@ -240,6 +249,7 @@ impl Default for Config {
 			route_parameters: None,
 			node_alias: None,
 			inbound_channel_minimum_depth: None,
+			trust_own_splice_inputs_0conf: false,
 			one_channel_per_peer: false,
 			forwarding_fees: None,
 			forwarding_cltv_expiry_delta: None,
@@ -386,6 +396,12 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	if let Some(delta) = config.forwarding_cltv_expiry_delta {
 		user_config.channel_config.cltv_expiry_delta = delta;
 	}
+	// Blocknil patch: see `Config::trust_own_splice_inputs_0conf`.
+	user_config.trust_own_splice_inputs_0conf = config.trust_own_splice_inputs_0conf;
+	// Blocknil patch: a peer whose channels we accept at zero confirmations is trusted with its
+	// splices too, including on channels we opened to it (a wallet's own channel to its provider,
+	// into which the provider splices room when a payment arrives).
+	user_config.trusted_splice_peers_0conf = config.trusted_peers_0conf.clone();
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
