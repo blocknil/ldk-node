@@ -2475,7 +2475,8 @@ struct SpliceOnArrival {
 
 const SPLICE_ON_ARRIVAL_CLTV_DELTA: u16 = 144;
 
-async fn splice_on_arrival_setup() -> SpliceOnArrival {
+/// `max_onchain_fee_msat`: how much of a splice's on-chain fee the customer accepts.
+async fn splice_on_arrival_setup(max_onchain_fee_msat: u64) -> SpliceOnArrival {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 	let sync_config = EsploraSyncConfig { background_sync_config: None };
@@ -2561,6 +2562,7 @@ async fn splice_on_arrival_setup() -> SpliceOnArrival {
 		provider: provider_id,
 		max_fee_ppm: 5_000,
 		min_fee_msat: 0,
+		max_onchain_fee_msat,
 	}));
 	let (tx, short_of_room) = std::sync::mpsc::channel();
 	let tx = std::sync::Mutex::new(tx);
@@ -2598,11 +2600,12 @@ async fn next_matching<T>(
 }
 
 /// Blocknil patch (splice on arrival): a payment larger than the customer's room is held; the
-/// provider splices its own funds in and keeps 0.5%; both sides lock the splice at zero
-/// confirmations, so the customer receives the rest without a single block being mined.
+/// provider splices its own funds in and keeps 0.5% plus the splice's on-chain fee; both sides lock
+/// the splice at zero confirmations, so the customer receives the rest without a single block being
+/// mined.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn splice_on_arrival_pays_a_customer_without_room() {
-	let s = splice_on_arrival_setup().await;
+	let s = splice_on_arrival_setup(5_000_000).await;
 	let customer_id = s.customer.node_id();
 	let scid = s.provider.hold_scid_for(customer_id).unwrap();
 	let amount_msat = 200_000_000;
@@ -2627,18 +2630,28 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 	assert_eq!(short.amount_msat, amount_msat);
 	assert!(short.room_msat < amount_msat, "room {}", short.room_msat);
 
-	// It splices twice the payment in, of its own coins, and keeps 0.5%.
+	// It splices twice the payment in, of its own coins, and keeps 0.5% and the on-chain fee.
 	let fee_msat = amount_msat / 200;
 	s.provider.splice_in(&s.provider_user_channel_id, customer_id, 400_000).unwrap();
-	s.provider.set_held_payment_fee(short.intercept_id, fee_msat).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, fee_msat, 5_000_000).unwrap();
 
-	// The customer receives the payment less the fee; no block was needed.
+	// The customer receives the payment less both; no block was needed.
 	let received_msat = next_matching(&s.customer, 60, |e| match e {
 		Event::PaymentReceived { amount_msat, .. } => Some(*amount_msat),
 		_ => None,
 	})
 	.await;
-	assert_eq!(received_msat, amount_msat - fee_msat);
+	// The on-chain fee is exactly what the splice transaction, the only one in the mempool, pays.
+	let mempool = s.bitcoind.client.get_raw_mempool().unwrap().into_model().unwrap();
+	assert_eq!(mempool.0.len(), 1, "the splice, alone in the mempool: {:?}", mempool.0);
+	let entry: serde_json::Value = s
+		.bitcoind
+		.client
+		.call("getmempoolentry", &[serde_json::json!(mempool.0[0].to_string())])
+		.unwrap();
+	let onchain_fee_sats = (entry["fees"]["base"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+	assert!(onchain_fee_sats > 0);
+	assert_eq!(received_msat, amount_msat - fee_msat - onchain_fee_sats * 1_000);
 	next_matching(&s.payer, 60, |e| match e {
 		Event::PaymentSuccessful { payment_id: Some(id), .. } if *id == payment_id => Some(()),
 		Event::PaymentFailed { .. } => panic!("the payment failed: {e:?}"),
@@ -2647,10 +2660,11 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 	.await;
 	assert_eq!(s.bitcoind.client.get_block_count().unwrap().0, height_before, "a block was mined");
 
-	// The provider's record shows the fee it kept.
+	// The provider's record shows what it kept, and how much of it was the on-chain fee.
 	let record = s.provider.recent_held_payments().into_iter().next().unwrap();
 	assert!(record.forwarded);
-	assert_eq!(record.fee_msat, fee_msat);
+	assert_eq!(record.fee_msat, fee_msat + onchain_fee_sats * 1_000);
+	assert_eq!(record.onchain_fee_msat, onchain_fee_sats * 1_000);
 	// And the room it added is the customer's to receive into, still unconfirmed.
 	let channel = s.customer.list_channels().into_iter().next().unwrap();
 	assert!(channel.inbound_capacity_msat > 100_000_000, "{}", channel.inbound_capacity_msat);
@@ -2665,7 +2679,7 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 /// back at once, not after the hold runs out, and the customer's node never sees it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn splice_on_arrival_refusal_fails_the_payment_at_once() {
-	let s = splice_on_arrival_setup().await;
+	let s = splice_on_arrival_setup(5_000_000).await;
 	let customer_id = s.customer.node_id();
 	let scid = s.provider.hold_scid_for(customer_id).unwrap();
 	let invoice = s
@@ -2696,6 +2710,49 @@ async fn splice_on_arrival_refusal_fails_the_payment_at_once() {
 	assert!(!record.forwarded);
 	assert_eq!(record.refused.as_deref(), Some("over this customer's room limit"));
 	assert_eq!(s.customer.list_channels()[0].inbound_capacity_msat, 0, "nothing was spliced");
+
+	let _ = (&s.electrsd, &s.bitcoind);
+	s.provider.stop().unwrap();
+	s.customer.stop().unwrap();
+	s.payer.stop().unwrap();
+}
+
+/// Blocknil patch (splice on arrival): a customer accepts a splice's on-chain fee only up to its own
+/// limit. Here it accepts 1 sat, the splice costs more, and the customer's node refuses the payment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_on_arrival_onchain_fee_above_the_customers_limit_is_refused() {
+	let s = splice_on_arrival_setup(1_000).await;
+	let customer_id = s.customer.node_id();
+	let scid = s.provider.hold_scid_for(customer_id).unwrap();
+	let amount_msat = 200_000_000;
+	let invoice = s
+		.customer
+		.bolt11_payment()
+		.receive_via_hold_scid(
+			Some(amount_msat),
+			&Bolt11InvoiceDescription::Direct(Description::new("too dear".to_string()).unwrap()),
+			3600,
+			s.provider.node_id(),
+			scid,
+			SPLICE_ON_ARRIVAL_CLTV_DELTA,
+		)
+		.unwrap();
+	let payment_id = s.payer.bolt11_payment().send(&invoice, None).unwrap();
+	let short = s.short_of_room.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+	s.provider.splice_in(&s.provider_user_channel_id, customer_id, 400_000).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, amount_msat / 200, 5_000_000).unwrap();
+
+	next_matching(&s.payer, 60, |e| match e {
+		Event::PaymentFailed { payment_id: Some(id), .. } if *id == payment_id => Some(()),
+		Event::PaymentSuccessful { .. } => panic!("the customer accepted the on-chain fee: {e:?}"),
+		_ => None,
+	})
+	.await;
+	let this_payment = PaymentId(invoice.payment_hash().to_byte_array());
+	assert!(
+		s.customer.payment(&this_payment).map_or(true, |p| p.status != PaymentStatus::Succeeded),
+		"the customer received it"
+	);
 
 	let _ = (&s.electrsd, &s.bitcoind);
 	s.provider.stop().unwrap();

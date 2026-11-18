@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::msgs::OnionMessage;
+use lightning::ln::types::ChannelId;
 use lightning::util::persist::KVStoreSync;
 
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
@@ -63,8 +64,10 @@ pub type OnShortOfRoom = Arc<dyn Fn(ShortOfRoom) + Send + Sync>;
 /// channel when the payment arrived (Blocknil patch: splice on arrival, the client side).
 ///
 /// A payment that arrived only over channels with `provider` may carry a withheld fee of up to
-/// `max_fee_ppm` of what the payer sent, or `min_fee_msat` when that is larger. Anything above is
-/// refused, as is any withheld fee on a payment that came over another peer's channel.
+/// `max_fee_ppm` of what the payer sent, or `min_fee_msat` when that is larger. On top, once within
+/// [`ONCHAIN_FEE_WINDOW`] after one of those channels became ready (a splice of it locked), it may
+/// carry the splice's on-chain fee, up to `max_onchain_fee_msat`. Anything above is refused, as is
+/// any withheld fee on a payment that came over another peer's channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderFeeLimit {
 	/// Our provider: the only peer allowed to withhold a fee outside a just-in-time channel open.
@@ -73,7 +76,18 @@ pub struct ProviderFeeLimit {
 	pub max_fee_ppm: u32,
 	/// A floor for small payments.
 	pub min_fee_msat: u64,
+	/// The most of a splice's on-chain fee the provider may pass on, once per splice. Zero: none.
+	pub max_onchain_fee_msat: u64,
 }
+
+/// How long after one of our channels with the provider becomes ready (its splice locked) a payment
+/// over it may carry that splice's on-chain fee. The payment that caused the splice is forwarded
+/// within milliseconds of the lock.
+pub const ONCHAIN_FEE_WINDOW: Duration = Duration::from_secs(600);
+
+/// How long a splice's on-chain fee waits for the held payment it was made for, when the
+/// provider's answer for that payment comes after the splice was signed.
+const SPLICE_FEE_WAIT: Duration = Duration::from_secs(120);
 
 /// The longest a reconnected customer's onion messages wait for their channel to come back.
 const ONION_WAIT: Duration = Duration::from_secs(10);
@@ -94,8 +108,11 @@ pub struct HoldRecord {
 	pub ended_at: u64,
 	/// Forwarded once the customer was back, or failed back after the hold ran out.
 	pub forwarded: bool,
-	/// What we kept out of it: the fee for the room a splice on arrival added. Zero otherwise.
+	/// What we kept out of it: the fee for the room a splice on arrival added, including
+	/// `onchain_fee_msat`. Zero otherwise.
 	pub fee_msat: u64,
+	/// The part of `fee_msat` that was the splice transaction's on-chain fee.
+	pub onchain_fee_msat: u64,
 	/// Why it was failed back before its deadline, when the provider refused it.
 	pub refused: Option<String>,
 }
@@ -111,6 +128,18 @@ struct Held {
 	room_asked: bool,
 	/// Kept out of what is forwarded, once the provider spliced room in for it.
 	fee_msat: u64,
+	/// The most of its splice's on-chain fee this payment carries. Zero: none.
+	max_onchain_fee_msat: u64,
+	/// Its splice's on-chain fee, once the splice was signed, at most `max_onchain_fee_msat`.
+	onchain_fee_msat: u64,
+}
+
+impl Held {
+	/// What the provider keeps out of it: its fee and its splice's on-chain fee, never more than the
+	/// payment.
+	fn kept_msat(&self) -> u64 {
+		self.fee_msat.saturating_add(self.onchain_fee_msat).min(self.amount_msat)
+	}
 }
 
 pub(crate) struct HeldForwards {
@@ -122,6 +151,12 @@ pub(crate) struct HeldForwards {
 	on_held: RwLock<Option<OnHeld>>,
 	on_short_of_room: RwLock<Option<OnShortOfRoom>>,
 	provider_fee_limit: RwLock<Option<ProviderFeeLimit>>,
+	/// Provider side: on-chain fees of our splices into a customer's channel that no held payment
+	/// has taken yet, in sats, and when the splice was signed.
+	splice_fees: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+	/// Client side: our channels with the provider that became ready recently, so one payment over
+	/// each may carry its splice's on-chain fee.
+	onchain_fee_credit: Mutex<HashMap<ChannelId, Instant>>,
 	kv_store: Arc<DynStore>,
 	channel_manager: Arc<ChannelManager>,
 	onion_messenger: Arc<OnionMessenger>,
@@ -164,6 +199,8 @@ impl HeldForwards {
 			on_held: RwLock::new(None),
 			on_short_of_room: RwLock::new(None),
 			provider_fee_limit: RwLock::new(None),
+			splice_fees: Mutex::new(HashMap::new()),
+			onchain_fee_credit: Mutex::new(HashMap::new()),
 			kv_store,
 			channel_manager,
 			onion_messenger,
@@ -246,34 +283,120 @@ impl HeldForwards {
 		}
 	}
 
-	/// Client side: the most our provider may withhold from a payment of `sent_msat` (what the payer
-	/// sent) that arrived over `receiving_channel_ids`: zero unless every one of them is a channel
-	/// with our provider and a limit is set.
-	pub(crate) fn provider_fee_allowance(
-		&self, receiving_channel_ids: &[(lightning::ln::types::ChannelId, Option<u128>)],
-		sent_msat: u64,
-	) -> u64 {
-		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return 0 };
+	/// Client side: one of our channels became ready. When it is with our provider, a splice of it
+	/// may just have locked, so one payment over it may carry that splice's on-chain fee for the next
+	/// [`ONCHAIN_FEE_WINDOW`].
+	pub(crate) fn channel_ready_from(&self, channel_id: &ChannelId, peer: &PublicKey) {
+		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return };
+		if &limit.provider != peer || limit.max_onchain_fee_msat == 0 {
+			return;
+		}
+		let mut credit = self.onchain_fee_credit.lock().unwrap();
+		credit.retain(|_, since| since.elapsed() < ONCHAIN_FEE_WINDOW);
+		credit.insert(*channel_id, Instant::now());
+	}
+
+	/// Client side: the parts of what our provider may withhold from a payment of `sent_msat` (what
+	/// the payer sent) that arrived over `receiving_channel_ids`, as `(proportional, on-chain)`:
+	/// zero unless every one of them is a channel with our provider and a limit is set. The on-chain
+	/// part is there only while one of those channels has a fresh credit (`channel_ready_from`).
+	fn provider_fee_parts(
+		&self, receiving_channel_ids: &[(ChannelId, Option<u128>)], sent_msat: u64,
+	) -> (u64, u64) {
+		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return (0, 0) };
 		if receiving_channel_ids.is_empty() {
-			return 0;
+			return (0, 0);
 		}
 		let channels = self.channel_manager.list_channels_with_counterparty(&limit.provider);
 		let all_from_provider = receiving_channel_ids
 			.iter()
 			.all(|(id, _)| channels.iter().any(|c| &c.channel_id == id));
 		if !all_from_provider {
-			return 0;
+			return (0, 0);
 		}
 		let proportional = sent_msat.saturating_mul(limit.max_fee_ppm as u64) / 1_000_000;
-		proportional.max(limit.min_fee_msat)
+		let credited = {
+			let credit = self.onchain_fee_credit.lock().unwrap();
+			receiving_channel_ids.iter().any(|(id, _)| {
+				credit.get(id).is_some_and(|since| since.elapsed() < ONCHAIN_FEE_WINDOW)
+			})
+		};
+		let onchain = if credited { limit.max_onchain_fee_msat } else { 0 };
+		(proportional.max(limit.min_fee_msat), onchain)
 	}
 
-	/// The provider spliced room in for this held payment: forward it less `fee_msat` as soon as it
-	/// fits. Returns the customer, or `None` when the payment is no longer held.
-	pub(crate) fn set_fee(&self, intercept_id: InterceptId, fee_msat: u64) -> Option<PublicKey> {
+	/// Client side: the most our provider may withhold from this payment (see
+	/// [`ProviderFeeLimit`]).
+	pub(crate) fn provider_fee_allowance(
+		&self, receiving_channel_ids: &[(ChannelId, Option<u128>)], sent_msat: u64,
+	) -> u64 {
+		let (proportional, onchain) = self.provider_fee_parts(receiving_channel_ids, sent_msat);
+		proportional + onchain
+	}
+
+	/// Client side: we accepted a payment from which our provider withheld `skimmed_msat`. When that
+	/// used the on-chain part, the credit is spent: the next payment carries no on-chain fee.
+	pub(crate) fn provider_fee_taken(
+		&self, receiving_channel_ids: &[(ChannelId, Option<u128>)], sent_msat: u64,
+		skimmed_msat: u64,
+	) {
+		let (proportional, _) = self.provider_fee_parts(receiving_channel_ids, sent_msat);
+		if skimmed_msat <= proportional {
+			return;
+		}
+		let mut credit = self.onchain_fee_credit.lock().unwrap();
+		for (id, _) in receiving_channel_ids {
+			credit.remove(id);
+		}
+	}
+
+	/// Provider side: we signed a splice into `customer`'s channel whose on-chain fee, all ours, is
+	/// `fee_sats`. The held payment it was made for carries it (up to its cap); when the provider
+	/// hasn't answered for that payment yet, the fee waits for it.
+	pub(crate) fn splice_fee_paid(&self, customer: PublicKey, fee_sats: u64) {
+		let fee_msat = fee_sats.saturating_mul(1_000);
+		{
+			let mut held = self.held.lock().unwrap();
+			if let Some(h) = held.iter_mut().find(|h| {
+				h.customer == customer && h.max_onchain_fee_msat > 0 && h.onchain_fee_msat == 0
+			}) {
+				h.onchain_fee_msat = fee_msat.min(h.max_onchain_fee_msat);
+				h.max_onchain_fee_msat = 0;
+				log_info!(
+					self.logger,
+					"The splice for a payment of {} msat to customer {} paid {} sats on chain; the payment carries {} msat of it",
+					h.amount_msat,
+					customer,
+					fee_sats,
+					h.onchain_fee_msat
+				);
+				return;
+			}
+		}
+		let mut fees = self.splice_fees.lock().unwrap();
+		fees.retain(|_, (_, since)| since.elapsed() < SPLICE_FEE_WAIT);
+		fees.insert(customer, (fee_sats, Instant::now()));
+	}
+
+	/// The provider spliced room in for this held payment: forward it less `fee_msat`, and less
+	/// its splice's on-chain fee up to `max_onchain_fee_msat`, as soon as it fits. Returns the
+	/// customer, or `None` when the payment is no longer held.
+	pub(crate) fn set_fee(
+		&self, intercept_id: InterceptId, fee_msat: u64, max_onchain_fee_msat: u64,
+	) -> Option<PublicKey> {
 		let mut held = self.held.lock().unwrap();
 		let h = held.iter_mut().find(|h| h.intercept_id == intercept_id)?;
 		h.fee_msat = fee_msat.min(h.amount_msat);
+		h.max_onchain_fee_msat = max_onchain_fee_msat;
+		if max_onchain_fee_msat > 0 {
+			// The splice may already have been signed: its fee waited for this answer.
+			let mut fees = self.splice_fees.lock().unwrap();
+			fees.retain(|_, (_, since)| since.elapsed() < SPLICE_FEE_WAIT);
+			if let Some((fee_sats, _)) = fees.remove(&h.customer) {
+				h.onchain_fee_msat = fee_sats.saturating_mul(1_000).min(max_onchain_fee_msat);
+				h.max_onchain_fee_msat = 0;
+			}
+		}
 		Some(h.customer)
 	}
 
@@ -331,7 +454,8 @@ impl HeldForwards {
 			held_secs: h.since.elapsed().as_secs(),
 			ended_at,
 			forwarded,
-			fee_msat: if forwarded { h.fee_msat } else { 0 },
+			fee_msat: if forwarded { h.kept_msat() } else { 0 },
+			onchain_fee_msat: if forwarded { h.kept_msat().saturating_sub(h.fee_msat) } else { 0 },
 			refused,
 		});
 		recent.truncate(RECENT);
@@ -406,6 +530,8 @@ impl HeldForwards {
 			announced: false,
 			room_asked: false,
 			fee_msat: 0,
+			max_onchain_fee_msat: 0,
+			onchain_fee_msat: 0,
 		});
 		self.process();
 	}
@@ -443,7 +569,7 @@ impl HeldForwards {
 					continue;
 				}
 				// What goes to the customer: all of it, or all but the fee for room spliced in for it.
-				let forward_msat = h.amount_msat - h.fee_msat;
+				let forward_msat = h.amount_msat - h.kept_msat();
 				let channels = self.channel_manager.list_channels_with_counterparty(&h.customer);
 				let channel = channels
 					.iter()
@@ -463,13 +589,19 @@ impl HeldForwards {
 								forward_msat,
 								h.customer,
 								if h.announced { " after holding it" } else { "" },
-								if h.fee_msat > 0 {
+								if h.onchain_fee_msat > 0 {
+									format!(
+										", keeping {} msat for the room added ({} msat of it the on-chain fee)",
+										h.kept_msat(),
+										h.onchain_fee_msat
+									)
+								} else if h.fee_msat > 0 {
 									format!(", keeping {} msat for the room added", h.fee_msat)
 								} else {
 									String::new()
 								}
 							);
-							if h.announced || h.fee_msat > 0 {
+							if h.announced || h.kept_msat() > 0 {
 								self.record(&h, true);
 							}
 							continue;

@@ -849,6 +849,18 @@ impl Wallet {
 	}
 
 	#[allow(deprecated)]
+	/// The value of each of `tx`'s inputs that this wallet holds, `None` for the others. Blocknil
+	/// patch: the provider works out the on-chain fee of a splice it is about to sign.
+	pub(crate) fn owned_input_values(&self, tx: &Transaction) -> Vec<Option<u64>> {
+		let locked_wallet = self.inner.lock().unwrap();
+		tx.input
+			.iter()
+			.map(|txin| {
+				locked_wallet.get_utxo(txin.previous_output).map(|u| u.txout.value.to_sat())
+			})
+			.collect()
+	}
+
 	pub(crate) fn sign_owned_inputs(&self, unsigned_tx: Transaction) -> Result<Transaction, ()> {
 		let locked_wallet = self.inner.lock().unwrap();
 

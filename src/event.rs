@@ -547,6 +547,40 @@ where
 		}
 	}
 
+	/// Blocknil patch (splice on arrival): the on-chain fee of a splice of `channel_id` that we are
+	/// about to sign, when it is ours to pay: at least one input is our wallet's, and every input's
+	/// value is known (ours, or the channel's current funding output). `None` when the counterparty
+	/// added an input, whose value we don't know, or when we added none.
+	fn our_splice_fee(
+		&self, channel_id: &ChannelId, unsigned_transaction: &bitcoin::Transaction,
+	) -> Option<u64> {
+		let owned = self.wallet.owned_input_values(unsigned_transaction);
+		if !owned.iter().any(Option::is_some) {
+			return None;
+		}
+		let funding = self
+			.channel_manager
+			.list_channels()
+			.into_iter()
+			.find(|c| &c.channel_id == channel_id)
+			.and_then(|c| Some((c.funding_txo?.into_bitcoin_outpoint(), c.channel_value_satoshis)));
+		let mut inputs_sats = 0u64;
+		for (txin, value) in unsigned_transaction.input.iter().zip(owned) {
+			let value = match (value, funding) {
+				(Some(value), _) => value,
+				(None, Some((outpoint, sats))) if outpoint == txin.previous_output => sats,
+				_ => return None,
+			};
+			inputs_sats = inputs_sats.checked_add(value)?;
+		}
+		let outputs_sats = unsigned_transaction
+			.output
+			.iter()
+			.map(|o| o.value.to_sat())
+			.try_fold(0u64, |a, b| a.checked_add(b))?;
+		inputs_sats.checked_sub(outputs_sats)
+	}
+
 	pub async fn handle_event(&self, event: LdkEvent) -> Result<(), ReplayEvent> {
 		match event {
 			LdkEvent::FundingGenerationReady {
@@ -874,6 +908,16 @@ where
 					);
 					self.channel_manager.fail_htlc_backwards(&payment_hash);
 					return Ok(());
+				}
+
+				// Blocknil patch (splice on arrival): a payment that carried a splice's on-chain fee
+				// spends the credit for it, so the next one can't.
+				if counterparty_skimmed_fee_msat > 0 {
+					self.held_forwards.provider_fee_taken(
+						&receiving_channel_ids,
+						amount_msat + counterparty_skimmed_fee_msat,
+						counterparty_skimmed_fee_msat,
+					);
 				}
 
 				log_info!(
@@ -1638,8 +1682,10 @@ where
 				// Blocknil patch: a payment held for this customer goes out now that their channel
 				// can take it, instead of waiting for the next sweep.
 				self.held_forwards.release_for(counterparty_node_id);
-				// Blocknil patch: a new channel with our provider can carry its fee too.
+				// Blocknil patch: a new channel with our provider can carry its fee too, and a
+				// payment right after its splice locked may carry that splice's on-chain fee.
 				self.held_forwards.allow_underpaying_from(&counterparty_node_id);
+				self.held_forwards.channel_ready_from(&channel_id, &counterparty_node_id);
 
 				let event = Event::ChannelReady {
 					channel_id,
@@ -2007,7 +2053,16 @@ where
 				counterparty_node_id,
 				unsigned_transaction,
 				..
-			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
+			} => match {
+				// Blocknil patch (splice on arrival): the on-chain fee of a splice of our own coins,
+				// known now that every input is, and passed on to the payment it was made for before
+				// the splice can lock and that payment be forwarded.
+				if let Some(fee_sats) = self.our_splice_fee(&channel_id, &unsigned_transaction) {
+					self.held_forwards.splice_fee_paid(counterparty_node_id, fee_sats);
+				}
+				self.wallet.sign_owned_inputs(unsigned_transaction)
+			}
+			.and_then(|tx| {
 				// Blocknil patch: inputs from a wallet outside ldk-node are signed by the
 				// signer it registered (see `FundingInputSigner`), told the channel's current
 				// funding output so it needn't look it up.
