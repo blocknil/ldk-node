@@ -2341,8 +2341,7 @@ impl Wallet {
 	/// splice's change is only counted there once wallet sync has seen its transaction, while its
 	/// inputs are locked from the start.
 	///
-	/// Blocknil: as upstream ldk-node #1223 (`6fb3d52`) has it, taken alone for
-	/// [`crate::Node::confirmed_spendable_onchain_balance_sats`].
+	/// Blocknil: also behind [`crate::Node::confirmed_spendable_onchain_balance_sats`].
 	pub(crate) fn get_confirmed_unlocked_amount_sats(&self) -> u64 {
 		let locked_wallet = self.inner.lock().expect("lock");
 		locked_wallet
@@ -13904,8 +13903,7 @@ mod tests {
 	/// The anchor reserve check of a splice must not depend on whether wallet sync has seen the
 	/// splice transaction yet, so neither may the funds it checks against.
 	///
-	/// Blocknil: upstream ldk-node #1223's test (`6fb3d52`), with its helper. The splice is signed
-	/// here, for bdk_wallet 3.2.1.
+	/// Blocknil: the splice is signed here, for bdk_wallet 3.2.1.
 	#[tokio::test]
 	async fn confirmed_unlocked_amount_does_not_depend_on_seeing_a_splice() {
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
