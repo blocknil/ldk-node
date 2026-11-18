@@ -689,12 +689,12 @@ where
 				..
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
-				// Blocknil patch (splice on arrival): what our provider may keep out of a payment
-				// that came over our channel with it, for room it added when the payment arrived.
-				let provider_fee_allowance_msat = self.held_forwards.provider_fee_allowance(
-					&receiving_channel_ids,
-					amount_msat + counterparty_skimmed_fee_msat,
-				);
+				// Blocknil patch (splice on arrival): what our provider may keep out of this payment,
+				// when it came over our channel with it: the fee we agreed to for room it added when
+				// the payment arrived. Zero for any payment we didn't agree a fee on.
+				let provider_fee_allowance_msat = self
+					.held_forwards
+					.provider_fee_allowance(&receiving_channel_ids, &payment_hash);
 
 				if let Some((tlv_type, _)) = onion_fields
 					.as_ref()
@@ -810,8 +810,8 @@ where
 								};
 							},
 							// Blocknil patch: our provider's fee for room it added (splice on
-							// arrival), already checked against our limit above. The payment's
-							// amount is what reached us.
+							// arrival), already checked against what we agreed for this payment
+							// above. The payment's amount is what reached us.
 							_ => log_info!(
 								self.logger,
 								"Our provider kept {}msat of payment {} for the room it added",
@@ -865,7 +865,7 @@ where
 					// previously registered. Any other payment (e.g., BOLT12 offer or spontaneous
 					// payments, for which no record exists yet) must not have fees skimmed.
 					// Blocknil patch: except our provider's fee for room it added when the payment
-					// arrived, up to our limit (splice on arrival).
+					// arrived, up to what we agreed for this payment (splice on arrival).
 					log_info!(
 						self.logger,
 						"Refusing inbound payment with hash {} as the counterparty withheld {}msat without a corresponding JIT-channel payment authorizing it",
@@ -1021,6 +1021,8 @@ where
 					hex_utils::to_string(&payment_hash.0),
 					amount_msat,
 				);
+				// Blocknil patch (splice on arrival): a fee allowance for it is spent now.
+				self.held_forwards.provider_fee_used(&payment_hash);
 
 				let update = match purpose {
 					PaymentPurpose::Bolt11InvoicePayment {
@@ -1747,6 +1749,7 @@ where
 					self.held_forwards.intercepted(
 						requested_next_hop_scid,
 						intercept_id,
+						payment_hash,
 						expected_outbound_amount_msat,
 					);
 				} else if let Some(liquidity_source) = self.liquidity_source.as_ref() {

@@ -2462,7 +2462,8 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 /// Blocknil patch (splice on arrival): the three nodes of a payment to a customer whose channel has
 /// no room. The provider runs LSPS2 (for hold SCIDs) and trusts its own splices at zero
 /// confirmations; the customer opened its channel from its own coins, trusts the provider at zero
-/// confirmations and accepts its fee up to 0.5%; the payer has a channel to the provider.
+/// confirmations and accepts its fee on the payments it agrees a fee for; the payer has a channel
+/// to the provider.
 struct SpliceOnArrival {
 	bitcoind: electrsd::corepc_node::Node,
 	electrsd: electrsd::ElectrsD,
@@ -2557,11 +2558,7 @@ async fn splice_on_arrival_setup() -> SpliceOnArrival {
 	let customer_channel = customer.list_channels().into_iter().next().unwrap();
 	assert_eq!(customer_channel.inbound_capacity_msat, 0, "the customer has no room");
 
-	customer.set_provider_fee_limit(Some(ldk_node::ProviderFeeLimit {
-		provider: provider_id,
-		max_fee_ppm: 5_000,
-		min_fee_msat: 0,
-	}));
+	customer.set_fee_provider(Some(provider_id));
 	let (tx, short_of_room) = std::sync::mpsc::channel();
 	let tx = std::sync::Mutex::new(tx);
 	provider.set_short_of_room_handler(Arc::new(move |short| {
@@ -2621,14 +2618,19 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 	let height_before = s.bitcoind.client.get_block_count().unwrap().0;
 	let payment_id = s.payer.bolt11_payment().send(&invoice, None).unwrap();
 
-	// The provider is told, once, that the payment doesn't fit.
+	// The provider is told, once, that the payment doesn't fit, and which payment it is.
 	let short = s.short_of_room.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
 	assert_eq!(short.customer, customer_id);
 	assert_eq!(short.amount_msat, amount_msat);
+	assert_eq!(short.payment_hash, PaymentHash(invoice.payment_hash().to_byte_array()));
 	assert!(short.room_msat < amount_msat, "room {}", short.room_msat);
 
-	// It splices twice the payment in, of its own coins, and keeps 0.5%.
+	// The customer agrees to a fee of 0.5% on this payment (in the wallet, after the quote).
 	let fee_msat = amount_msat / 200;
+	s.customer.allow_provider_fee(short.payment_hash, fee_msat).unwrap();
+	assert_eq!(s.customer.provider_fee_allowances().len(), 1);
+
+	// The provider splices twice the payment in, of its own coins, and keeps the fee.
 	s.provider.splice_in(&s.provider_user_channel_id, customer_id, 400_000).unwrap();
 	s.provider.set_held_payment_fee(short.intercept_id, fee_msat).unwrap();
 
@@ -2646,6 +2648,8 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 	})
 	.await;
 	assert_eq!(s.bitcoind.client.get_block_count().unwrap().0, height_before, "a block was mined");
+	// The allowance was spent with the payment.
+	assert!(s.customer.provider_fee_allowances().is_empty());
 
 	// The provider's record shows the fee it kept.
 	let record = s.provider.recent_held_payments().into_iter().next().unwrap();
@@ -2656,6 +2660,65 @@ async fn splice_on_arrival_pays_a_customer_without_room() {
 	assert!(channel.inbound_capacity_msat > 100_000_000, "{}", channel.inbound_capacity_msat);
 
 	let _ = &s.electrsd;
+	s.provider.stop().unwrap();
+	s.customer.stop().unwrap();
+	s.payer.stop().unwrap();
+}
+
+/// Blocknil patch (splice on arrival): the provider keeps more than the customer agreed to for this
+/// payment, so the customer's node refuses it, and the payer's money goes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_on_arrival_fee_over_the_allowance_is_refused() {
+	let s = splice_on_arrival_setup().await;
+	let customer_id = s.customer.node_id();
+	let scid = s.provider.hold_scid_for(customer_id).unwrap();
+	let amount_msat = 200_000_000;
+	let invoice = s
+		.customer
+		.bolt11_payment()
+		.receive_via_hold_scid(
+			Some(amount_msat),
+			&Bolt11InvoiceDescription::Direct(Description::new("over".to_string()).unwrap()),
+			3600,
+			s.provider.node_id(),
+			scid,
+			SPLICE_ON_ARRIVAL_CLTV_DELTA,
+		)
+		.unwrap();
+	let payment_id = s.payer.bolt11_payment().send(&invoice, None).unwrap();
+	let short = s.short_of_room.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+
+	// The customer agreed to 0.5%, and an allowance for another payment doesn't count.
+	let agreed_msat = amount_msat / 200;
+	s.customer.allow_provider_fee(short.payment_hash, agreed_msat).unwrap();
+	s.customer.allow_provider_fee(PaymentHash([7; 32]), amount_msat).unwrap();
+	// The provider keeps one msat more.
+	s.provider.splice_in(&s.provider_user_channel_id, customer_id, 400_000).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, agreed_msat + 1).unwrap();
+
+	next_matching(&s.payer, 60, |e| match e {
+		Event::PaymentFailed { payment_id: Some(id), .. } if *id == payment_id => Some(()),
+		Event::PaymentSuccessful { .. } => panic!("the payment went through: {e:?}"),
+		_ => None,
+	})
+	.await;
+	let customer_payment_id = PaymentId(invoice.payment_hash().to_byte_array());
+	assert!(
+		s.customer
+			.list_payments_with_filter(
+				|p| p.id == customer_payment_id && p.status == PaymentStatus::Succeeded
+			)
+			.is_empty(),
+		"the customer received it"
+	);
+	// The unused allowance stays until it lapses.
+	assert!(s
+		.customer
+		.provider_fee_allowances()
+		.iter()
+		.any(|a| a.payment_hash == short.payment_hash && a.fee_msat == agreed_msat));
+
+	let _ = (&s.electrsd, &s.bitcoind);
 	s.provider.stop().unwrap();
 	s.customer.stop().unwrap();
 	s.payer.stop().unwrap();

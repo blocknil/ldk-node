@@ -95,7 +95,7 @@ mod ffi;
 mod gossip;
 pub mod graph;
 mod held_forwards;
-pub use held_forwards::{HoldRecord, OnHeld, OnShortOfRoom, ProviderFeeLimit, ShortOfRoom};
+pub use held_forwards::{HoldRecord, OnHeld, OnShortOfRoom, ProviderFeeAllowance, ShortOfRoom};
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -1608,12 +1608,29 @@ impl Node {
 		}
 	}
 
-	/// Blocknil patch (splice on arrival, the client side): accept a fee our provider withholds
-	/// from a payment that arrived over our channel with it, for room it added then, up to `limit`.
-	/// Our channels with the provider are set to accept such payments. `None` refuses every such fee
-	/// again (the default).
-	pub fn set_provider_fee_limit(&self, limit: Option<ProviderFeeLimit>) {
-		self.held_forwards.set_provider_fee_limit(limit);
+	/// Blocknil patch (splice on arrival, the client side): `provider` is the peer that may keep a
+	/// fee out of a payment it forwards to us, for room it added when the payment arrived, and only
+	/// on a payment given an allowance with [`Node::allow_provider_fee`]. Our channels with it are
+	/// set to accept such payments. `None` refuses every such fee again (the default).
+	pub fn set_fee_provider(&self, provider: Option<PublicKey>) {
+		self.held_forwards.set_fee_provider(provider);
+	}
+
+	/// Blocknil patch (splice on arrival, the client side): our provider may keep up to `fee_msat`
+	/// out of the payment `payment_hash` (all its parts together), when it arrives over our channel
+	/// with the provider set by [`Node::set_fee_provider`]. A fee on any other payment is refused.
+	/// The allowance is saved, replaces an earlier one for the same payment, is spent when the
+	/// payment is claimed, and lapses after a day.
+	pub fn allow_provider_fee(
+		&self, payment_hash: lightning::types::payment::PaymentHash, fee_msat: u64,
+	) -> Result<(), Error> {
+		self.held_forwards.allow_provider_fee(payment_hash, fee_msat)
+	}
+
+	/// Blocknil patch (splice on arrival, the client side): the fee allowances given with
+	/// [`Node::allow_provider_fee`] and not yet spent or lapsed.
+	pub fn provider_fee_allowances(&self) -> Vec<ProviderFeeAllowance> {
+		self.held_forwards.provider_fee_allowances()
 	}
 
 	/// Blocknil patch: where LSPS5 notifications go (see [`liquidity::OnWebhook`]). It is called
