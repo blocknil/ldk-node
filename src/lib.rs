@@ -95,7 +95,7 @@ mod ffi;
 mod gossip;
 pub mod graph;
 mod held_forwards;
-pub use held_forwards::{HoldRecord, OnHeld};
+pub use held_forwards::{HoldRecord, OnHeld, OnShortOfRoom, ProviderFeeLimit, ShortOfRoom};
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -1566,6 +1566,46 @@ impl Node {
 			ls.set_on_jit_waiting(Arc::clone(&on_held));
 		}
 		self.held_forwards.set_on_held(on_held);
+	}
+
+	/// Blocknil patch (splice on arrival): called once for each held payment whose customer is
+	/// online but whose channel is too small for it. Answer with [`Node::set_held_payment_fee`] or
+	/// [`Node::refuse_held_payment`]; until then it stays held, under its usual deadline. The
+	/// handler must not block (see [`OnShortOfRoom`]).
+	pub fn set_short_of_room_handler(&self, handler: held_forwards::OnShortOfRoom) {
+		self.held_forwards.set_on_short_of_room(handler);
+	}
+
+	/// Blocknil patch (splice on arrival): room is being added for this held payment (a splice of
+	/// our own funds into the customer's channel): forward it, less `fee_msat`, as soon as it fits.
+	/// The customer's node has to accept the withheld fee.
+	pub fn set_held_payment_fee(
+		&self, intercept_id: lightning::ln::channelmanager::InterceptId, fee_msat: u64,
+	) -> Result<(), Error> {
+		let customer =
+			self.held_forwards.set_fee(intercept_id, fee_msat).ok_or(Error::InvalidPaymentId)?;
+		self.held_forwards.release_for(customer);
+		Ok(())
+	}
+
+	/// Blocknil patch (splice on arrival): no room will be added for this held payment: fail it
+	/// back now, with `reason` in the log and in [`Node::recent_held_payments`].
+	pub fn refuse_held_payment(
+		&self, intercept_id: lightning::ln::channelmanager::InterceptId, reason: &str,
+	) -> Result<(), Error> {
+		if self.held_forwards.refuse(intercept_id, reason) {
+			Ok(())
+		} else {
+			Err(Error::InvalidPaymentId)
+		}
+	}
+
+	/// Blocknil patch (splice on arrival, the client side): accept a fee our provider withholds
+	/// from a payment that arrived over our channel with it, for room it added then, up to `limit`.
+	/// Our channels with the provider are set to accept such payments. `None` refuses every such fee
+	/// again (the default).
+	pub fn set_provider_fee_limit(&self, limit: Option<ProviderFeeLimit>) {
+		self.held_forwards.set_provider_fee_limit(limit);
 	}
 
 	/// Blocknil patch: where LSPS5 notifications go (see [`liquidity::OnWebhook`]). It is called
