@@ -162,13 +162,13 @@ harness = false
 # carries the LDK patches this code calls. Only applies when building ldk-node by itself; the
 # wallet core sets the same patches in its own Cargo.toml.
 [patch.crates-io]
-lightning = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-types = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-invoice = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-net-tokio = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-persister = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-background-processor = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-rapid-gossip-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-block-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-liquidity = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
-lightning-macros = { git = "https://github.com/blocknil/rust-lightning", rev = "f9373a19aab0ae4bc562549730dd7ef9937cae1a" }
+lightning = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-types = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-invoice = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-net-tokio = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-persister = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-background-processor = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-rapid-gossip-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-block-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-liquidity = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }
+lightning-macros = { git = "https://github.com/blocknil/rust-lightning", rev = "1f4c856c219e37003ea981bbd5f2211fd1684910" }

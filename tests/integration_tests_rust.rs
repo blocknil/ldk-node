@@ -2458,3 +2458,247 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 		Some(6)
 	);
 }
+
+/// Blocknil patch (splice on arrival): the three nodes of a payment to a customer whose channel has
+/// no room. The provider runs LSPS2 (for hold SCIDs) and trusts its own splices at zero
+/// confirmations; the customer opened its channel from its own coins, trusts the provider at zero
+/// confirmations and accepts its fee up to 0.5%; the payer has a channel to the provider.
+struct SpliceOnArrival {
+	bitcoind: electrsd::corepc_node::Node,
+	electrsd: electrsd::ElectrsD,
+	provider: ldk_node::Node,
+	customer: ldk_node::Node,
+	payer: ldk_node::Node,
+	provider_user_channel_id: ldk_node::UserChannelId,
+	short_of_room: std::sync::mpsc::Receiver<ldk_node::ShortOfRoom>,
+}
+
+const SPLICE_ON_ARRIVAL_CLTV_DELTA: u16 = 144;
+
+async fn splice_on_arrival_setup() -> SpliceOnArrival {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let sync_config = EsploraSyncConfig { background_sync_config: None };
+
+	let mut provider_config = random_config(true);
+	provider_config.node_config.trust_own_splice_inputs_0conf = true;
+	provider_config.node_config.forwarding_cltv_expiry_delta = Some(SPLICE_ON_ARRIVAL_CLTV_DELTA);
+	setup_builder!(provider_builder, provider_config.node_config);
+	provider_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	provider_builder.set_liquidity_provider_lsps2(LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm: 5_000,
+		channel_over_provisioning_ppm: 1_000_000,
+		max_payment_size_msat: 1_000_000_000,
+		min_payment_size_msat: 0,
+		min_channel_lifetime: 100,
+		min_channel_opening_fee_msat: 0,
+		max_client_to_self_delay: 1024,
+		client_trusts_lsp: true,
+		disable_client_reserve: true,
+	});
+	let provider = provider_builder.build().unwrap();
+	provider.start().unwrap();
+	let provider_id = provider.node_id();
+	let provider_addr = provider.listening_addresses().unwrap().first().unwrap().clone();
+
+	let mut customer_config = random_config(true);
+	customer_config.node_config.trusted_peers_0conf.push(provider_id);
+	setup_builder!(customer_builder, customer_config.node_config);
+	customer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	customer_builder.set_liquidity_source_lsps2(provider_id, provider_addr, None);
+	let customer = customer_builder.build().unwrap();
+	customer.start().unwrap();
+
+	let payer_config = random_config(true);
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer = payer_builder.build().unwrap();
+	payer.start().unwrap();
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			provider.onchain_payment().new_address().unwrap(),
+			provider.onchain_payment().new_address().unwrap(),
+			customer.onchain_payment().new_address().unwrap(),
+			payer.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(5_000_000),
+	)
+	.await;
+	provider.sync_wallets().unwrap();
+	customer.sync_wallets().unwrap();
+	payer.sync_wallets().unwrap();
+
+	// The payer's channel to the provider, and the customer's own, from its own coins: no room.
+	open_channel(&payer, &provider, 3_000_000, false, &electrsd).await;
+	open_channel(&customer, &provider, 1_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	provider.sync_wallets().unwrap();
+	customer.sync_wallets().unwrap();
+	payer.sync_wallets().unwrap();
+	expect_channel_ready_event!(payer, provider_id);
+	expect_channel_ready_event!(customer, provider_id);
+	let mut provider_user_channel_id = None;
+	for _ in 0..2 {
+		match provider.next_event_async().await {
+			Event::ChannelReady { user_channel_id, counterparty_node_id, .. } => {
+				if counterparty_node_id == Some(customer.node_id()) {
+					provider_user_channel_id = Some(user_channel_id);
+				}
+				provider.event_handled().unwrap();
+			},
+			e => panic!("unexpected event {e:?}"),
+		}
+	}
+	let customer_channel = customer.list_channels().into_iter().next().unwrap();
+	assert_eq!(customer_channel.inbound_capacity_msat, 0, "the customer has no room");
+
+	customer.set_provider_fee_limit(Some(ldk_node::ProviderFeeLimit {
+		provider: provider_id,
+		max_fee_ppm: 5_000,
+		min_fee_msat: 0,
+	}));
+	let (tx, short_of_room) = std::sync::mpsc::channel();
+	let tx = std::sync::Mutex::new(tx);
+	provider.set_short_of_room_handler(Arc::new(move |short| {
+		let _ = tx.lock().unwrap().send(short);
+	}));
+
+	SpliceOnArrival {
+		bitcoind,
+		electrsd,
+		provider,
+		customer,
+		payer,
+		provider_user_channel_id: provider_user_channel_id.unwrap(),
+		short_of_room,
+	}
+}
+
+/// Waits for `node`'s next event matching `pick`, handling (and skipping) every other one.
+async fn next_matching<T>(
+	node: &ldk_node::Node, secs: u64, pick: impl Fn(&Event) -> Option<T>,
+) -> T {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+	loop {
+		let left = deadline.saturating_duration_since(std::time::Instant::now());
+		let event = tokio::time::timeout(left, node.next_event_async())
+			.await
+			.expect("timed out waiting for the event");
+		let picked = pick(&event);
+		node.event_handled().unwrap();
+		if let Some(picked) = picked {
+			return picked;
+		}
+	}
+}
+
+/// Blocknil patch (splice on arrival): a payment larger than the customer's room is held; the
+/// provider splices its own funds in and keeps 0.5%; both sides lock the splice at zero
+/// confirmations, so the customer receives the rest without a single block being mined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_on_arrival_pays_a_customer_without_room() {
+	let s = splice_on_arrival_setup().await;
+	let customer_id = s.customer.node_id();
+	let scid = s.provider.hold_scid_for(customer_id).unwrap();
+	let amount_msat = 200_000_000;
+	let invoice = s
+		.customer
+		.bolt11_payment()
+		.receive_via_hold_scid(
+			Some(amount_msat),
+			&Bolt11InvoiceDescription::Direct(Description::new("room".to_string()).unwrap()),
+			3600,
+			s.provider.node_id(),
+			scid,
+			SPLICE_ON_ARRIVAL_CLTV_DELTA,
+		)
+		.unwrap();
+	let height_before = s.bitcoind.client.get_block_count().unwrap().0;
+	let payment_id = s.payer.bolt11_payment().send(&invoice, None).unwrap();
+
+	// The provider is told, once, that the payment doesn't fit.
+	let short = s.short_of_room.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+	assert_eq!(short.customer, customer_id);
+	assert_eq!(short.amount_msat, amount_msat);
+	assert!(short.room_msat < amount_msat, "room {}", short.room_msat);
+
+	// It splices twice the payment in, of its own coins, and keeps 0.5%.
+	let fee_msat = amount_msat / 200;
+	s.provider.splice_in(&s.provider_user_channel_id, customer_id, 400_000).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, fee_msat).unwrap();
+
+	// The customer receives the payment less the fee; no block was needed.
+	let received_msat = next_matching(&s.customer, 60, |e| match e {
+		Event::PaymentReceived { amount_msat, .. } => Some(*amount_msat),
+		_ => None,
+	})
+	.await;
+	assert_eq!(received_msat, amount_msat - fee_msat);
+	next_matching(&s.payer, 60, |e| match e {
+		Event::PaymentSuccessful { payment_id: Some(id), .. } if *id == payment_id => Some(()),
+		Event::PaymentFailed { .. } => panic!("the payment failed: {e:?}"),
+		_ => None,
+	})
+	.await;
+	assert_eq!(s.bitcoind.client.get_block_count().unwrap().0, height_before, "a block was mined");
+
+	// The provider's record shows the fee it kept.
+	let record = s.provider.recent_held_payments().into_iter().next().unwrap();
+	assert!(record.forwarded);
+	assert_eq!(record.fee_msat, fee_msat);
+	// And the room it added is the customer's to receive into, still unconfirmed.
+	let channel = s.customer.list_channels().into_iter().next().unwrap();
+	assert!(channel.inbound_capacity_msat > 100_000_000, "{}", channel.inbound_capacity_msat);
+
+	let _ = &s.electrsd;
+	s.provider.stop().unwrap();
+	s.customer.stop().unwrap();
+	s.payer.stop().unwrap();
+}
+
+/// Blocknil patch (splice on arrival): when the provider won't add room, the payment is failed
+/// back at once, not after the hold runs out, and the customer's node never sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_on_arrival_refusal_fails_the_payment_at_once() {
+	let s = splice_on_arrival_setup().await;
+	let customer_id = s.customer.node_id();
+	let scid = s.provider.hold_scid_for(customer_id).unwrap();
+	let invoice = s
+		.customer
+		.bolt11_payment()
+		.receive_via_hold_scid(
+			Some(200_000_000),
+			&Bolt11InvoiceDescription::Direct(Description::new("no room".to_string()).unwrap()),
+			3600,
+			s.provider.node_id(),
+			scid,
+			SPLICE_ON_ARRIVAL_CLTV_DELTA,
+		)
+		.unwrap();
+	let payment_id = s.payer.bolt11_payment().send(&invoice, None).unwrap();
+	let short = s.short_of_room.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+	let refused_at = std::time::Instant::now();
+	s.provider.refuse_held_payment(short.intercept_id, "over this customer's room limit").unwrap();
+
+	next_matching(&s.payer, 30, |e| match e {
+		Event::PaymentFailed { payment_id: Some(id), .. } if *id == payment_id => Some(()),
+		Event::PaymentSuccessful { .. } => panic!("the payment went through: {e:?}"),
+		_ => None,
+	})
+	.await;
+	assert!(refused_at.elapsed() < std::time::Duration::from_secs(20), "not at once");
+	let record = s.provider.recent_held_payments().into_iter().next().unwrap();
+	assert!(!record.forwarded);
+	assert_eq!(record.refused.as_deref(), Some("over this customer's room limit"));
+	assert_eq!(s.customer.list_channels()[0].inbound_capacity_msat, 0, "nothing was spliced");
+
+	let _ = (&s.electrsd, &s.bitcoind);
+	s.provider.stop().unwrap();
+	s.customer.stop().unwrap();
+	s.payer.stop().unwrap();
+}

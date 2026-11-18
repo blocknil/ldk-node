@@ -36,6 +36,45 @@ pub const DEFAULT_HOLD: Duration = Duration::from_secs(50);
 /// Called with the customer whose payment is being held, once per payment.
 pub type OnHeld = Arc<dyn Fn(PublicKey) + Send + Sync>;
 
+/// A held payment whose customer is online, with a usable channel that is too small for it.
+///
+/// Blocknil patch (splice on arrival): the provider decides what to do, off this crate's threads,
+/// and answers with [`crate::Node::set_held_payment_fee`] once it has started a splice of its own
+/// funds into the channel, or [`crate::Node::refuse_held_payment`]. Until then the payment stays
+/// held, under its usual deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortOfRoom {
+	/// Names the payment in the answer.
+	pub intercept_id: InterceptId,
+	/// The customer the payment is for.
+	pub customer: PublicKey,
+	/// What the payment carries for the customer.
+	pub amount_msat: u64,
+	/// The most the customer's channel can take right now.
+	pub room_msat: u64,
+}
+
+/// Called once per held payment that is short of room (see [`ShortOfRoom`]). It runs on the
+/// thread that processes held payments, so it must not block: hand the work to a thread of its
+/// own.
+pub type OnShortOfRoom = Arc<dyn Fn(ShortOfRoom) + Send + Sync>;
+
+/// The most our provider may keep out of a payment it forwards to us, for room it spliced into our
+/// channel when the payment arrived (Blocknil patch: splice on arrival, the client side).
+///
+/// A payment that arrived only over channels with `provider` may carry a withheld fee of up to
+/// `max_fee_ppm` of what the payer sent, or `min_fee_msat` when that is larger. Anything above is
+/// refused, as is any withheld fee on a payment that came over another peer's channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderFeeLimit {
+	/// Our provider: the only peer allowed to withhold a fee outside a just-in-time channel open.
+	pub provider: PublicKey,
+	/// Parts per million of what the payer sent.
+	pub max_fee_ppm: u32,
+	/// A floor for small payments.
+	pub min_fee_msat: u64,
+}
+
 /// The longest a reconnected customer's onion messages wait for their channel to come back.
 const ONION_WAIT: Duration = Duration::from_secs(10);
 
@@ -55,6 +94,10 @@ pub struct HoldRecord {
 	pub ended_at: u64,
 	/// Forwarded once the customer was back, or failed back after the hold ran out.
 	pub forwarded: bool,
+	/// What we kept out of it: the fee for the room a splice on arrival added. Zero otherwise.
+	pub fee_msat: u64,
+	/// Why it was failed back before its deadline, when the provider refused it.
+	pub refused: Option<String>,
 }
 
 struct Held {
@@ -64,6 +107,10 @@ struct Held {
 	since: Instant,
 	deadline: Instant,
 	announced: bool,
+	/// The provider was asked about room for it (once per payment).
+	room_asked: bool,
+	/// Kept out of what is forwarded, once the provider spliced room in for it.
+	fee_msat: u64,
 }
 
 pub(crate) struct HeldForwards {
@@ -73,6 +120,8 @@ pub(crate) struct HeldForwards {
 	onions: Mutex<Vec<(PublicKey, Vec<OnionMessage>, Instant)>>,
 	hold_for: RwLock<Duration>,
 	on_held: RwLock<Option<OnHeld>>,
+	on_short_of_room: RwLock<Option<OnShortOfRoom>>,
+	provider_fee_limit: RwLock<Option<ProviderFeeLimit>>,
 	kv_store: Arc<DynStore>,
 	channel_manager: Arc<ChannelManager>,
 	onion_messenger: Arc<OnionMessenger>,
@@ -113,6 +162,8 @@ impl HeldForwards {
 			onions: Mutex::new(Vec::new()),
 			hold_for: RwLock::new(DEFAULT_HOLD),
 			on_held: RwLock::new(None),
+			on_short_of_room: RwLock::new(None),
+			provider_fee_limit: RwLock::new(None),
 			kv_store,
 			channel_manager,
 			onion_messenger,
@@ -154,6 +205,102 @@ impl HeldForwards {
 		*self.on_held.write().unwrap() = Some(on_held);
 	}
 
+	pub(crate) fn set_on_short_of_room(&self, on_short_of_room: OnShortOfRoom) {
+		*self.on_short_of_room.write().unwrap() = Some(on_short_of_room);
+	}
+
+	/// Client side: accept fees withheld by our provider up to `limit`, and have our channels with
+	/// it accept payments that carry less than the payer sent (LDK's `accept_underpaying_htlcs`).
+	pub(crate) fn set_provider_fee_limit(&self, limit: Option<ProviderFeeLimit>) {
+		*self.provider_fee_limit.write().unwrap() = limit;
+		if let Some(limit) = limit {
+			self.allow_underpaying_from(&limit.provider);
+		}
+	}
+
+	/// Sets `accept_underpaying_htlcs` on our channels with `peer`, when it is our provider. Called
+	/// when the limit is set and whenever one of our channels becomes ready.
+	pub(crate) fn allow_underpaying_from(&self, peer: &PublicKey) {
+		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return };
+		if &limit.provider != peer {
+			return;
+		}
+		let channel_ids: Vec<_> = self
+			.channel_manager
+			.list_channels_with_counterparty(peer)
+			.into_iter()
+			.filter(|c| !c.config.is_some_and(|config| config.accept_underpaying_htlcs))
+			.map(|c| c.channel_id)
+			.collect();
+		if channel_ids.is_empty() {
+			return;
+		}
+		let update = lightning::util::config::ChannelConfigUpdate {
+			accept_underpaying_htlcs: Some(true),
+			..Default::default()
+		};
+		if let Err(e) =
+			self.channel_manager.update_partial_channel_config(peer, &channel_ids, &update)
+		{
+			log_error!(self.logger, "Failed to let our provider's channels carry its fee: {:?}", e);
+		}
+	}
+
+	/// Client side: the most our provider may withhold from a payment of `sent_msat` (what the payer
+	/// sent) that arrived over `receiving_channel_ids`: zero unless every one of them is a channel
+	/// with our provider and a limit is set.
+	pub(crate) fn provider_fee_allowance(
+		&self, receiving_channel_ids: &[(lightning::ln::types::ChannelId, Option<u128>)],
+		sent_msat: u64,
+	) -> u64 {
+		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return 0 };
+		if receiving_channel_ids.is_empty() {
+			return 0;
+		}
+		let channels = self.channel_manager.list_channels_with_counterparty(&limit.provider);
+		let all_from_provider = receiving_channel_ids
+			.iter()
+			.all(|(id, _)| channels.iter().any(|c| &c.channel_id == id));
+		if !all_from_provider {
+			return 0;
+		}
+		let proportional = sent_msat.saturating_mul(limit.max_fee_ppm as u64) / 1_000_000;
+		proportional.max(limit.min_fee_msat)
+	}
+
+	/// The provider spliced room in for this held payment: forward it less `fee_msat` as soon as it
+	/// fits. Returns the customer, or `None` when the payment is no longer held.
+	pub(crate) fn set_fee(&self, intercept_id: InterceptId, fee_msat: u64) -> Option<PublicKey> {
+		let mut held = self.held.lock().unwrap();
+		let h = held.iter_mut().find(|h| h.intercept_id == intercept_id)?;
+		h.fee_msat = fee_msat.min(h.amount_msat);
+		Some(h.customer)
+	}
+
+	/// The provider won't make room for this held payment: fail it back now rather than at its
+	/// deadline. Returns whether it was still held.
+	pub(crate) fn refuse(&self, intercept_id: InterceptId, reason: &str) -> bool {
+		let h = {
+			let mut held = self.held.lock().unwrap();
+			let Some(index) = held.iter().position(|h| h.intercept_id == intercept_id) else {
+				return false;
+			};
+			held.remove(index)
+		};
+		if let Err(e) = self.channel_manager.fail_intercepted_htlc(h.intercept_id) {
+			log_error!(self.logger, "Failed to fail back a refused payment: {:?}", e);
+		}
+		log_info!(
+			self.logger,
+			"Refused a payment of {} msat for customer {}: {}",
+			h.amount_msat,
+			h.customer,
+			reason
+		);
+		self.record_ended(&h, false, Some(reason.to_string()));
+		true
+	}
+
 	/// Payments held right now: `(customer, amount_msat, seconds left)`.
 	pub(crate) fn held(&self) -> Vec<(PublicKey, u64, u64)> {
 		let now = Instant::now();
@@ -171,6 +318,10 @@ impl HeldForwards {
 	}
 
 	fn record(&self, h: &Held, forwarded: bool) {
+		self.record_ended(h, forwarded, None);
+	}
+
+	fn record_ended(&self, h: &Held, forwarded: bool, refused: Option<String>) {
 		let ended_at =
 			SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
 		let mut recent = self.recent.lock().unwrap();
@@ -180,6 +331,8 @@ impl HeldForwards {
 			held_secs: h.since.elapsed().as_secs(),
 			ended_at,
 			forwarded,
+			fee_msat: if forwarded { h.fee_msat } else { 0 },
+			refused,
 		});
 		recent.truncate(RECENT);
 	}
@@ -251,6 +404,8 @@ impl HeldForwards {
 			since,
 			deadline,
 			announced: false,
+			room_asked: false,
+			fee_msat: 0,
 		});
 		self.process();
 	}
@@ -277,6 +432,7 @@ impl HeldForwards {
 		self.process_onions();
 		let now = Instant::now();
 		let mut announce = Vec::new();
+		let mut short_of_room = Vec::new();
 		{
 			let mut held = self.held.lock().unwrap();
 			let mut keep = Vec::with_capacity(held.len());
@@ -286,28 +442,34 @@ impl HeldForwards {
 					keep.push(h);
 					continue;
 				}
-				let channel = self
-					.channel_manager
-					.list_channels_with_counterparty(&h.customer)
-					.into_iter()
-					.filter(|c| c.is_usable && c.next_outbound_htlc_limit_msat >= h.amount_msat)
+				// What goes to the customer: all of it, or all but the fee for room spliced in for it.
+				let forward_msat = h.amount_msat - h.fee_msat;
+				let channels = self.channel_manager.list_channels_with_counterparty(&h.customer);
+				let channel = channels
+					.iter()
+					.filter(|c| c.is_usable && c.next_outbound_htlc_limit_msat >= forward_msat)
 					.max_by_key(|c| c.next_outbound_htlc_limit_msat);
 				if let Some(channel) = channel {
 					match self.channel_manager.forward_intercepted_htlc(
 						h.intercept_id,
 						&channel.channel_id,
 						h.customer,
-						h.amount_msat,
+						forward_msat,
 					) {
 						Ok(()) => {
 							log_info!(
 								self.logger,
-								"Forwarded a payment of {} msat to customer {}{}",
-								h.amount_msat,
+								"Forwarded a payment of {} msat to customer {}{}{}",
+								forward_msat,
 								h.customer,
-								if h.announced { " after holding it" } else { "" }
+								if h.announced { " after holding it" } else { "" },
+								if h.fee_msat > 0 {
+									format!(", keeping {} msat for the room added", h.fee_msat)
+								} else {
+									String::new()
+								}
 							);
-							if h.announced {
+							if h.announced || h.fee_msat > 0 {
 								self.record(&h, true);
 							}
 							continue;
@@ -330,7 +492,32 @@ impl HeldForwards {
 					self.record(&h, false);
 					continue;
 				}
-				if !h.announced {
+				// Online, with a usable channel that is too small: the provider decides about room,
+				// once per payment. An offline customer is woken first, as before.
+				let room_msat = channels
+					.iter()
+					.filter(|c| c.is_usable)
+					.map(|c| c.next_outbound_htlc_limit_msat)
+					.max();
+				let deciding = self.on_short_of_room.read().unwrap().is_some();
+				if let (Some(room_msat), true) = (room_msat, deciding) {
+					if !h.room_asked {
+						h.room_asked = true;
+						log_info!(
+							self.logger,
+							"A payment of {} msat for customer {} is larger than their room of {} msat",
+							h.amount_msat,
+							h.customer,
+							room_msat
+						);
+						short_of_room.push(ShortOfRoom {
+							intercept_id: h.intercept_id,
+							customer: h.customer,
+							amount_msat: h.amount_msat,
+							room_msat,
+						});
+					}
+				} else if !h.announced {
 					h.announced = true;
 					log_info!(
 						self.logger,
@@ -343,6 +530,14 @@ impl HeldForwards {
 				keep.push(h);
 			}
 			*held = keep;
+		}
+		// Outside the lock: the provider's answer comes back through `set_fee` or `refuse`.
+		if !short_of_room.is_empty() {
+			if let Some(on_short_of_room) = self.on_short_of_room.read().unwrap().clone() {
+				for short in short_of_room {
+					on_short_of_room(short);
+				}
+			}
 		}
 		// Outside the lock: waking the phone may reach out to the network.
 		if !announce.is_empty() {

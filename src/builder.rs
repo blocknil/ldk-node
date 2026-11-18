@@ -585,6 +585,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Locks a splice at zero confirmations when every input other than the channel's shared one is
+	/// ours. Blocknil patch; see [`Config::trust_own_splice_inputs_0conf`].
+	pub fn set_trust_own_splice_inputs_0conf(&mut self, trust: bool) -> &mut Self {
+		self.config.trust_own_splice_inputs_0conf = trust;
+		self
+	}
+
 	/// Sets the used storage directory path.
 	pub fn set_storage_dir_path(&mut self, storage_dir_path: String) -> &mut Self {
 		self.config.storage_dir_path = storage_dir_path;
