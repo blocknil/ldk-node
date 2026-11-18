@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::msgs::OnionMessage;
+use lightning::types::payment::PaymentHash;
 use lightning::util::persist::KVStoreSync;
 
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
@@ -28,6 +29,11 @@ use crate::Error;
 
 const NAMESPACE: &str = "blocknil";
 const SCIDS_KEY: &str = "hold_scids";
+const ALLOWANCES_KEY: &str = "provider_fee_allowances";
+
+/// How long a fee allowance the wallet gave its provider lasts when its payment never arrives: past
+/// any hold, and short enough that the store stays small.
+const ALLOWANCE_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 /// How long a payment for an offline customer is held before it is failed back: inside a
 /// payer's patience, and time enough for a push to wake the phone.
@@ -39,13 +45,16 @@ pub type OnHeld = Arc<dyn Fn(PublicKey) + Send + Sync>;
 /// A held payment whose customer is online, with a usable channel that is too small for it.
 ///
 /// Blocknil patch (splice on arrival): the provider decides what to do, off this crate's threads,
-/// and answers with [`crate::Node::set_held_payment_fee`] once it has started a splice of its own
-/// funds into the channel, or [`crate::Node::refuse_held_payment`]. Until then the payment stays
-/// held, under its usual deadline.
+/// and answers with [`crate::Node::set_held_payment_fee`] once the customer agreed to the fee and it
+/// has started a splice of its own funds into the channel, or [`crate::Node::refuse_held_payment`].
+/// Until then the payment stays held, under its usual deadline. A multi-part payment is one of
+/// these per part, all with the same `payment_hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShortOfRoom {
-	/// Names the payment in the answer.
+	/// Names the part in the answer.
 	pub intercept_id: InterceptId,
+	/// The payment the part belongs to: the customer's wallet agrees to a fee per payment hash.
+	pub payment_hash: PaymentHash,
 	/// The customer the payment is for.
 	pub customer: PublicKey,
 	/// What the payment carries for the customer.
@@ -59,20 +68,17 @@ pub struct ShortOfRoom {
 /// own.
 pub type OnShortOfRoom = Arc<dyn Fn(ShortOfRoom) + Send + Sync>;
 
-/// The most our provider may keep out of a payment it forwards to us, for room it spliced into our
-/// channel when the payment arrived (Blocknil patch: splice on arrival, the client side).
-///
-/// A payment that arrived only over channels with `provider` may carry a withheld fee of up to
-/// `max_fee_ppm` of what the payer sent, or `min_fee_msat` when that is larger. Anything above is
-/// refused, as is any withheld fee on a payment that came over another peer's channel.
+/// A fee our provider may keep out of one payment it forwards to us, for room it spliced into our
+/// channel when the payment arrived (Blocknil patch: splice on arrival, the client side). The
+/// wallet gives one per payment, after agreeing to the provider's quote for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProviderFeeLimit {
-	/// Our provider: the only peer allowed to withhold a fee outside a just-in-time channel open.
-	pub provider: PublicKey,
-	/// Parts per million of what the payer sent.
-	pub max_fee_ppm: u32,
-	/// A floor for small payments.
-	pub min_fee_msat: u64,
+pub struct ProviderFeeAllowance {
+	/// The payment it is for.
+	pub payment_hash: PaymentHash,
+	/// The most the provider may keep out of it, all parts together.
+	pub fee_msat: u64,
+	/// When it was given, in seconds since the Unix epoch. It lapses a day later.
+	pub given_at: u64,
 }
 
 /// The longest a reconnected customer's onion messages wait for their channel to come back.
@@ -102,6 +108,7 @@ pub struct HoldRecord {
 
 struct Held {
 	intercept_id: InterceptId,
+	payment_hash: PaymentHash,
 	customer: PublicKey,
 	amount_msat: u64,
 	since: Instant,
@@ -121,7 +128,10 @@ pub(crate) struct HeldForwards {
 	hold_for: RwLock<Duration>,
 	on_held: RwLock<Option<OnHeld>>,
 	on_short_of_room: RwLock<Option<OnShortOfRoom>>,
-	provider_fee_limit: RwLock<Option<ProviderFeeLimit>>,
+	/// Client side: our provider, the only peer that may keep a fee outside a just-in-time
+	/// channel open, and only on a payment we gave an allowance for.
+	fee_provider: RwLock<Option<PublicKey>>,
+	allowances: Mutex<Vec<ProviderFeeAllowance>>,
 	kv_store: Arc<DynStore>,
 	channel_manager: Arc<ChannelManager>,
 	onion_messenger: Arc<OnionMessenger>,
@@ -147,6 +157,43 @@ fn decode(bytes: &[u8]) -> HashMap<u64, PublicKey> {
 		.collect()
 }
 
+/// One `payment_hash fee_msat given_at` triple per line: hex, decimal, decimal.
+fn encode_allowances(allowances: &[ProviderFeeAllowance]) -> Vec<u8> {
+	let mut out = String::new();
+	for a in allowances {
+		out.push_str(&format!("{} {} {}\n", a.payment_hash, a.fee_msat, a.given_at));
+	}
+	out.into_bytes()
+}
+
+fn decode_allowances(bytes: &[u8]) -> Vec<ProviderFeeAllowance> {
+	String::from_utf8_lossy(bytes)
+		.lines()
+		.filter_map(|line| {
+			let mut fields = line.split(' ');
+			let hash = fields.next()?;
+			let fee_msat = fields.next()?.parse().ok()?;
+			let given_at = fields.next()?.parse().ok()?;
+			let mut payment_hash = [0u8; 32];
+			if hash.len() != 64 {
+				return None;
+			}
+			for (i, byte) in payment_hash.iter_mut().enumerate() {
+				*byte = u8::from_str_radix(hash.get(2 * i..2 * i + 2)?, 16).ok()?;
+			}
+			Some(ProviderFeeAllowance {
+				payment_hash: PaymentHash(payment_hash),
+				fee_msat,
+				given_at,
+			})
+		})
+		.collect()
+}
+
+fn now_secs() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
 impl HeldForwards {
 	pub(crate) fn new(
 		kv_store: Arc<DynStore>, channel_manager: Arc<ChannelManager>,
@@ -154,6 +201,9 @@ impl HeldForwards {
 	) -> Self {
 		let scids = KVStoreSync::read(&*kv_store, NAMESPACE, "", SCIDS_KEY)
 			.map(|bytes| decode(&bytes))
+			.unwrap_or_default();
+		let allowances = KVStoreSync::read(&*kv_store, NAMESPACE, "", ALLOWANCES_KEY)
+			.map(|bytes| decode_allowances(&bytes))
 			.unwrap_or_default();
 		Self {
 			scids: RwLock::new(scids),
@@ -163,7 +213,8 @@ impl HeldForwards {
 			hold_for: RwLock::new(DEFAULT_HOLD),
 			on_held: RwLock::new(None),
 			on_short_of_room: RwLock::new(None),
-			provider_fee_limit: RwLock::new(None),
+			fee_provider: RwLock::new(None),
+			allowances: Mutex::new(allowances),
 			kv_store,
 			channel_manager,
 			onion_messenger,
@@ -209,20 +260,79 @@ impl HeldForwards {
 		*self.on_short_of_room.write().unwrap() = Some(on_short_of_room);
 	}
 
-	/// Client side: accept fees withheld by our provider up to `limit`, and have our channels with
-	/// it accept payments that carry less than the payer sent (LDK's `accept_underpaying_htlcs`).
-	pub(crate) fn set_provider_fee_limit(&self, limit: Option<ProviderFeeLimit>) {
-		*self.provider_fee_limit.write().unwrap() = limit;
-		if let Some(limit) = limit {
-			self.allow_underpaying_from(&limit.provider);
+	/// Client side: the peer that may keep a fee for room it added (on a payment we gave an
+	/// allowance for), and have our channels with it accept payments that carry less than the payer
+	/// sent (LDK's `accept_underpaying_htlcs`). `None` refuses every such fee.
+	pub(crate) fn set_fee_provider(&self, provider: Option<PublicKey>) {
+		*self.fee_provider.write().unwrap() = provider;
+		if let Some(provider) = provider {
+			self.allow_underpaying_from(&provider);
 		}
 	}
 
+	/// Client side: our provider may keep up to `fee_msat` out of the payment `payment_hash`, all
+	/// its parts together. Saved, so it holds across a restart; it replaces an earlier one for the
+	/// same payment, and lapses after `ALLOWANCE_LIFETIME`.
+	pub(crate) fn allow_provider_fee(
+		&self, payment_hash: PaymentHash, fee_msat: u64,
+	) -> Result<(), Error> {
+		let now = now_secs();
+		let mut allowances = self.allowances.lock().unwrap();
+		allowances.retain(|a| {
+			a.payment_hash != payment_hash
+				&& now.saturating_sub(a.given_at) < ALLOWANCE_LIFETIME.as_secs()
+		});
+		allowances.push(ProviderFeeAllowance { payment_hash, fee_msat, given_at: now });
+		self.save_allowances(&allowances)?;
+		log_info!(
+			self.logger,
+			"Our provider may keep up to {} msat of payment {}",
+			fee_msat,
+			payment_hash
+		);
+		Ok(())
+	}
+
+	/// Client side: the allowances given and not yet used or lapsed.
+	pub(crate) fn provider_fee_allowances(&self) -> Vec<ProviderFeeAllowance> {
+		let now = now_secs();
+		self.allowances
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|a| now.saturating_sub(a.given_at) < ALLOWANCE_LIFETIME.as_secs())
+			.copied()
+			.collect()
+	}
+
+	/// Client side: the payment was claimed, so its allowance is spent.
+	pub(crate) fn provider_fee_used(&self, payment_hash: &PaymentHash) {
+		let mut allowances = self.allowances.lock().unwrap();
+		let before = allowances.len();
+		allowances.retain(|a| &a.payment_hash != payment_hash);
+		if allowances.len() != before {
+			let _ = self.save_allowances(&allowances);
+		}
+	}
+
+	fn save_allowances(&self, allowances: &[ProviderFeeAllowance]) -> Result<(), Error> {
+		KVStoreSync::write(
+			&*self.kv_store,
+			NAMESPACE,
+			"",
+			ALLOWANCES_KEY,
+			encode_allowances(allowances),
+		)
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to save provider fee allowances: {}", e);
+			Error::PersistenceFailed
+		})
+	}
+
 	/// Sets `accept_underpaying_htlcs` on our channels with `peer`, when it is our provider. Called
-	/// when the limit is set and whenever one of our channels becomes ready.
+	/// when the provider is set and whenever one of our channels becomes ready.
 	pub(crate) fn allow_underpaying_from(&self, peer: &PublicKey) {
-		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return };
-		if &limit.provider != peer {
+		if self.fee_provider.read().unwrap().as_ref() != Some(peer) {
 			return;
 		}
 		let channel_ids: Vec<_> = self
@@ -246,26 +356,29 @@ impl HeldForwards {
 		}
 	}
 
-	/// Client side: the most our provider may withhold from a payment of `sent_msat` (what the payer
-	/// sent) that arrived over `receiving_channel_ids`: zero unless every one of them is a channel
-	/// with our provider and a limit is set.
+	/// Client side: the most our provider may have kept out of the payment `payment_hash` that
+	/// arrived over `receiving_channel_ids`: its allowance, when every one of those channels is
+	/// with our provider; zero otherwise.
 	pub(crate) fn provider_fee_allowance(
 		&self, receiving_channel_ids: &[(lightning::ln::types::ChannelId, Option<u128>)],
-		sent_msat: u64,
+		payment_hash: &PaymentHash,
 	) -> u64 {
-		let Some(limit) = *self.provider_fee_limit.read().unwrap() else { return 0 };
+		let Some(provider) = *self.fee_provider.read().unwrap() else { return 0 };
 		if receiving_channel_ids.is_empty() {
 			return 0;
 		}
-		let channels = self.channel_manager.list_channels_with_counterparty(&limit.provider);
+		let channels = self.channel_manager.list_channels_with_counterparty(&provider);
 		let all_from_provider = receiving_channel_ids
 			.iter()
 			.all(|(id, _)| channels.iter().any(|c| &c.channel_id == id));
 		if !all_from_provider {
 			return 0;
 		}
-		let proportional = sent_msat.saturating_mul(limit.max_fee_ppm as u64) / 1_000_000;
-		proportional.max(limit.min_fee_msat)
+		self.provider_fee_allowances()
+			.iter()
+			.find(|a| &a.payment_hash == payment_hash)
+			.map(|a| a.fee_msat)
+			.unwrap_or(0)
 	}
 
 	/// The provider spliced room in for this held payment: forward it less `fee_msat` as soon as it
@@ -393,12 +506,15 @@ impl HeldForwards {
 	}
 
 	/// An HTLC arrived on one of our hold SCIDs.
-	pub(crate) fn intercepted(&self, scid: u64, intercept_id: InterceptId, amount_msat: u64) {
+	pub(crate) fn intercepted(
+		&self, scid: u64, intercept_id: InterceptId, payment_hash: PaymentHash, amount_msat: u64,
+	) {
 		let Some(customer) = self.scids.read().unwrap().get(&scid).copied() else { return };
 		let since = Instant::now();
 		let deadline = since + *self.hold_for.read().unwrap();
 		self.held.lock().unwrap().push(Held {
 			intercept_id,
+			payment_hash,
 			customer,
 			amount_msat,
 			since,
@@ -512,6 +628,7 @@ impl HeldForwards {
 						);
 						short_of_room.push(ShortOfRoom {
 							intercept_id: h.intercept_id,
+							payment_hash: h.payment_hash,
 							customer: h.customer,
 							amount_msat: h.amount_msat,
 							room_msat,
@@ -563,5 +680,19 @@ mod tests {
 		scids.insert(42, customer);
 		assert_eq!(decode(&encode(&scids)), scids);
 		assert!(decode(b"garbage\n").is_empty());
+	}
+
+	#[test]
+	fn provider_fee_allowances_survive_encoding() {
+		let allowances = vec![
+			ProviderFeeAllowance {
+				payment_hash: PaymentHash([0xab; 32]),
+				fee_msat: 1_234_000,
+				given_at: 1_790_000_000,
+			},
+			ProviderFeeAllowance { payment_hash: PaymentHash([7; 32]), fee_msat: 0, given_at: 1 },
+		];
+		assert_eq!(decode_allowances(&encode_allowances(&allowances)), allowances);
+		assert!(decode_allowances(b"garbage\nab 1 2\n").is_empty());
 	}
 }
