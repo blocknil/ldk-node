@@ -1586,12 +1586,19 @@ impl Node {
 
 	/// Blocknil patch (splice on arrival): room is being added for this held payment (a splice of
 	/// our own funds into the customer's channel): forward it, less `fee_msat`, as soon as it fits.
-	/// The customer's node has to accept the withheld fee.
+	///
+	/// With `max_onchain_fee_msat` above zero, the payment also carries that splice's on-chain fee,
+	/// up to that much: ldk-node works it out when it signs the splice, from the values of every
+	/// input, before the splice can lock. The customer's node has to accept the withheld fee (see
+	/// [`ProviderFeeLimit`]).
 	pub fn set_held_payment_fee(
 		&self, intercept_id: lightning::ln::channelmanager::InterceptId, fee_msat: u64,
+		max_onchain_fee_msat: u64,
 	) -> Result<(), Error> {
-		let customer =
-			self.held_forwards.set_fee(intercept_id, fee_msat).ok_or(Error::InvalidPaymentId)?;
+		let customer = self
+			.held_forwards
+			.set_fee(intercept_id, fee_msat, max_onchain_fee_msat)
+			.ok_or(Error::InvalidPaymentId)?;
 		self.held_forwards.release_for(customer);
 		Ok(())
 	}
