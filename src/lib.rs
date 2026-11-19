@@ -2705,6 +2705,12 @@ impl Node {
 		}
 	}
 
+	/// Every transaction the node's own on-chain wallet knows. Blocknil patch: the app's history
+	/// links a channel-wallet transaction to the ones it spends, and counts the wallet's coins.
+	pub fn wallet_transactions(&self) -> Vec<bitcoin::Transaction> {
+		self.wallet.get_cached_txs().into_iter().map(|tx| (*tx).clone()).collect()
+	}
+
 	/// Update the config for a previously opened channel.
 	pub fn update_channel_config(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,

@@ -2776,6 +2776,37 @@ async fn onchain_send_all_retains_reserve() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn wallet_transactions_lists_the_onchain_wallets_transactions() {
+	// Blocknil patch: `wallet_transactions` gives every transaction the on-chain wallet knows,
+	// received and sent, unconfirmed ones included.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node = setup_node(&chain_source, random_config());
+	assert!(node.wallet_transactions().is_empty());
+
+	let address = node.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address.clone()],
+		Amount::from_sat(500_000),
+	)
+	.await;
+	node.sync_wallets().unwrap();
+	let received = node.wallet_transactions();
+	assert_eq!(received.len(), 1);
+	assert!(received[0].output.iter().any(|o| o.script_pubkey == address.script_pubkey()));
+
+	let elsewhere = bitcoind.client.new_address().unwrap();
+	let sent_txid = node.onchain_payment().send_to_address(&elsewhere, 100_000, None).unwrap();
+	let txids: HashSet<Txid> =
+		node.wallet_transactions().iter().map(|tx| tx.compute_txid()).collect();
+	assert_eq!(txids, HashSet::from([received[0].compute_txid(), sent_txid]));
+
+	node.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn onchain_wallet_recovery() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 
