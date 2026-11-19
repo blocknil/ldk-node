@@ -2174,7 +2174,9 @@ fn build_with_store_internal(
 		// be held (client offline) or wait for a splice (client short of room). See
 		// `held_payments`.
 		user_config.htlc_interception_flags |= HTLCInterceptionFlags::ToOnlinePrivateChannels as u8
-			| HTLCInterceptionFlags::ToOfflinePrivateChannels as u8;
+			| HTLCInterceptionFlags::ToOfflinePrivateChannels as u8
+			// Hold SCIDs of invoices handed out before them, as an LSPS2 service sets too.
+			| HTLCInterceptionFlags::ToInterceptSCIDs as u8;
 		user_config.accept_forwards_to_priv_channels = true;
 	}
 
@@ -2385,8 +2387,13 @@ fn build_with_store_internal(
 	};
 
 	// Blocknil patch: payments held for our clients (see `held_payments`).
-	let held_payments =
-		Arc::new(HeldPayments::new(Arc::clone(&channel_manager), Arc::clone(&logger)));
+	let held_payments = Arc::new(HeldPayments::new(
+		Arc::clone(&channel_manager),
+		Arc::clone(&kv_store),
+		Arc::clone(&logger),
+	));
+	// Blocknil patch: hold SCIDs of invoices handed out before (see `held_payments`).
+	runtime.block_on(held_payments.load_hold_scids()).map_err(|_| BuildError::ReadFailed)?;
 
 	let (liquidity_source, custom_message_handler) = {
 		let mut liquidity_source_builder = LiquiditySourceBuilder::new(

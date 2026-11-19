@@ -1192,6 +1192,7 @@ impl Node {
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
+			Arc::clone(&self.keys_manager),
 		)
 	}
 
@@ -1210,6 +1211,7 @@ impl Node {
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
+			Arc::clone(&self.keys_manager),
 		))
 	}
 
@@ -3192,6 +3194,18 @@ impl Node {
 		} else {
 			Err(Error::InvalidPaymentId)
 		}
+	}
+
+	/// The hold SCID payments to `customer` may be routed through (in their invoices' route
+	/// hints), for a wallet still on r8, which asks for one. New wallets need none: every payment
+	/// to a client's channel is intercepted. Theirs while it is honoured (30 days after this
+	/// version first saw it), a new one when they have none, an error once theirs lapsed.
+	pub fn hold_scid_for(&self, customer: PublicKey) -> Result<u64, Error> {
+		let channel_manager = Arc::clone(&self.channel_manager);
+		self.runtime.block_on(
+			self.held_payments
+				.hold_scid_for(customer, move || channel_manager.get_intercept_scid()),
+		)
 	}
 
 	/// Payments held right now, as `(customer, amount_msat, seconds left)`.
