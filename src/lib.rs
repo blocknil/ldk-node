@@ -3015,9 +3015,17 @@ impl Node {
 		self.liquidity_source.lsps5_service().notify_onion_message_incoming(client)
 	}
 
+	/// Where the LSP's answers to [`Node::set_webhook`] go (see [`liquidity::WebhookResult`]), so a
+	/// wallet can show whether waking the phone really is on. Called on the node's event handling:
+	/// it must not block. Blocknil patch.
+	pub fn set_webhook_result_handler(&self, handler: liquidity::OnWebhookResult) {
+		self.liquidity_source.lsps5_client().set_result_handler(handler);
+	}
+
 	/// Registers `url` as `app_name`'s webhook with the LSP `lsp` ([LSPS5]), so it can wake this
 	/// phone when a payment waits for it while the app is closed. Needs
-	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP answers later, and
+	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP answers later
+	/// ([`Node::set_webhook_result_handler`]), and
 	/// registering again replaces the URL for the same `app_name`, so a wallet can repeat the call
 	/// when it starts. Blocknil patch.
 	///

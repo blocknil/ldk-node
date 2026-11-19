@@ -34,6 +34,7 @@ use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 pub use service::jit_wait::OnJitWaiting;
 pub use service::lsps2::LSPS2ServiceConfig;
 // Blocknil patch: LSPS5.
+pub use client::lsps5::{OnWebhookResult, WebhookResult};
 pub use service::lsps5::{LSPS5ServiceConfig, OnWebhook, WebhookPost};
 // Blocknil patch: the lifetimes of the opening fee parameters an LSPS2 service offers.
 pub use service::lsps2::{
@@ -492,6 +493,7 @@ where
 				logger: self.logger.clone(),
 			}),
 			lsps5_client: Arc::new(LSPS5ClientLiquiditySource {
+				result_handler: RwLock::new(None),
 				liquidity_manager: Arc::clone(&liquidity_manager),
 				logger: self.logger.clone(),
 			}),
