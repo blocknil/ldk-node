@@ -554,6 +554,50 @@ impl Bolt11Payment {
 		Ok(maybe_wrap(invoice))
 	}
 
+	/// Blocknil patch: an invoice whose only route hint is our channel with `provider` (its SCID,
+	/// fees and CLTV delta), with no HTLC maximum. LDK's own invoices cap the hint at what the
+	/// channel can take today, so a payer never tries a payment larger than our room; through
+	/// this one it reaches the provider, which holds it and can splice room in for it (splice on
+	/// arrival), or hold it while we're offline. `amount_msat: None` is an any-amount invoice.
+	/// Claimed on arrival like any other. Replaces r8's hold-SCID invoices for a provider on this
+	/// version (`Config::hold_private_forwards`).
+	pub fn receive_via_provider(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		provider: PublicKey,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+		let channel = self
+			.channel_manager
+			.list_channels_with_counterparty(&provider)
+			.into_iter()
+			.filter(|c| c.is_channel_ready)
+			.max_by_key(|c| c.channel_value_satoshis);
+		let hop = channel.and_then(|channel| {
+			let forwarding = channel.counterparty.forwarding_info.clone()?;
+			Some(RouteHintHop {
+				src_node_id: provider,
+				short_channel_id: channel.get_inbound_payment_scid()?,
+				fees: RoutingFees {
+					base_msat: forwarding.fee_base_msat,
+					proportional_millionths: forwarding.fee_proportional_millionths,
+				},
+				cltv_expiry_delta: forwarding.cltv_expiry_delta,
+				htlc_minimum_msat: None,
+				htlc_maximum_msat: None,
+			})
+		});
+		let Some(hop) = hop else {
+			log_error!(
+				self.logger,
+				"No ready channel with {} to route an invoice through",
+				provider
+			);
+			return Err(Error::InvoiceCreationFailed);
+		};
+		let invoice = self.receive_via_hint_inner(amount_msat, &description, expiry_secs, hop)?;
+		Ok(maybe_wrap(invoice))
+	}
+
 	/// Returns a payable invoice that can be used to request and receive a payment of the amount
 	/// given.
 	///

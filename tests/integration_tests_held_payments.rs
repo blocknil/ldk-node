@@ -610,3 +610,39 @@ async fn old_hold_scid_invoices_keep_working_for_30_days() {
 	assert!(s.provider.hold_scid_for(customer_id).is_err(), "no new hold SCID once it lapsed");
 	s.stop();
 }
+
+/// A customer's ordinary invoice caps the provider's hint at the room it has today, so a payer
+/// can't even try a payment larger than that. The provider invoice carries no cap: the payment
+/// reaches the provider, which splices room in, and the customer gets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_invoice_lets_a_payment_larger_than_the_room_arrive() {
+	let s = setup(&[1_500_000], 300_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	assert!(s.room_msat() < 400_000_000);
+
+	let capped = invoice(&s.customer, 400_000_000);
+	let sent = s.payer.bolt11_payment().send(&capped, None);
+	if sent.is_ok() {
+		wait_for(&s.payer, "the capped invoice's failure", is_failed).await;
+	}
+	assert!(next_report(&reports, Duration::from_secs(1)).await.is_none(), "never reached it");
+
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("room".to_string()).unwrap());
+	let uncapped = s
+		.customer
+		.bolt11_payment()
+		.receive_via_provider(Some(400_000_000), &description, 3600, s.provider.node_id())
+		.unwrap();
+	let hint = &uncapped.route_hints()[0].0[0];
+	assert_eq!(hint.src_node_id, s.provider.node_id());
+	assert_eq!(hint.htlc_maximum_msat, None);
+	s.payer.bolt11_payment().send(&uncapped, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reached the provider");
+	assert_eq!(short.amount_msat, 400_000_000);
+	s.provider.splice_in(&s.customer_channel(), s.customer.node_id(), 300_000, None).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, 0).unwrap();
+	wait_for(&s.customer, "the large payment", is_received(400_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	s.stop();
+}
