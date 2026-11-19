@@ -24,6 +24,7 @@ use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::event::LSPS0ClientEvent;
 use lightning_liquidity::lsps1::client::LSPS1ClientConfig as LdkLSPS1ClientConfig;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfig;
+use lightning_liquidity::lsps2::event::LSPS2ServiceEvent;
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 pub use service::jit_wait::OnJitWaiting;
@@ -449,6 +450,7 @@ where
 				config: self.config.clone(),
 				logger: self.logger.clone(),
 				jit_waits: JitWaits::new(),
+				stuck_channel_opens_failed: Mutex::new(None),
 			}),
 			pending_lsps0_discovery: Mutex::new(HashMap::new()),
 			discovery_done_tx,
@@ -495,7 +497,13 @@ where
 	}
 
 	pub(crate) async fn handle_next_event(&self) {
-		match self.liquidity_manager.next_event_async().await {
+		let event = self.liquidity_manager.next_event_async().await;
+		self.handle_event(event).await
+	}
+
+	/// Blocknil patch: split out of `handle_next_event`, for `drop_replayed_jit_opens`.
+	async fn handle_event(&self, event: LiquidityEvent) {
+		match event {
 			LiquidityEvent::LSPS1Client(event) => self.lsps1_client.handle_event(event).await,
 			LiquidityEvent::LSPS2Client(event) => self.lsps2_client.handle_event(event).await,
 			LiquidityEvent::LSPS2Service(event) => self.lsps2_service.handle_event(event).await,
@@ -532,6 +540,29 @@ where
 			e => {
 				log_error!(self.logger, "Received unexpected liquidity event: {:?}", e);
 			},
+		}
+	}
+
+	/// Blocknil patch: at the first start of an LSPS2 service, after
+	/// `LSPS2ServiceLiquiditySource::fail_stuck_channel_opens_at_first_start`, handles the
+	/// liquidity events LDK kept across the restart, except `OpenChannel`s: each is for a flow the
+	/// sweep just reset after failing its payment back, or for one whose channel already exists,
+	/// so handling it would open a channel no payment pays for.
+	pub(crate) async fn drop_replayed_jit_opens(&self) {
+		while let Some(event) = self.liquidity_manager.next_event() {
+			match event {
+				LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+					their_network_key,
+					user_channel_id,
+					..
+				}) => log_info!(
+					self.logger,
+					"Dropped the JIT channel open to {} (user_channel_id {}) kept across the restart.",
+					their_network_key,
+					user_channel_id,
+				),
+				event => self.handle_event(event).await,
+			}
 		}
 	}
 

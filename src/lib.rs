@@ -814,6 +814,31 @@ impl Node {
 			});
 		}
 
+		// Blocknil patch: as an LSPS2 service, fail back the payments held for JIT channel opens
+		// lost with a restart (nothing would open them, so their payers would wait for their
+		// HTLCs' timeout). Both LDK and LSPS2 replay events at startup, and neither replay may
+		// reach a flow after the sweep reset it, or the flow would open a channel for a payment
+		// already failed back:
+		// - LDK hands every intercepted HTLC to the event handler again, so the events pending now
+		//   are handled first;
+		// - LSPS2 keeps the `OpenChannel` events it emitted, so those pending after the sweep are
+		//   dropped (`drop_replayed_jit_opens`).
+		// All of it before the background processor can intercept new HTLCs.
+		if self.liquidity_source.lsps2_service().lsps2_service.is_some() {
+			let startup_event_handler = Arc::clone(&event_handler);
+			let liquidity_source = Arc::clone(&self.liquidity_source);
+			let channel_manager = Arc::clone(&self.channel_manager);
+			self.runtime.block_on(async move {
+				channel_manager
+					.process_pending_events_async(|e| startup_event_handler.handle_event(e))
+					.await;
+				let lsps2_service = liquidity_source.lsps2_service();
+				if lsps2_service.fail_stuck_channel_opens_at_first_start().await {
+					liquidity_source.drop_replayed_jit_opens().await;
+				}
+			});
+		}
+
 		// Setup background processing
 		let background_persister = Arc::clone(&self.kv_store);
 		let background_event_handler = Arc::clone(&event_handler);
@@ -2955,6 +2980,18 @@ impl Node {
 	/// can open: `(client, amount to forward in msat)`. Blocknil patch.
 	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
 		self.liquidity_source.lsps2_service().jit_waits.waiting()
+	}
+
+	/// How many payments held for just-in-time channels whose open was lost to a restart were
+	/// failed back when this node first started. Their LSPS2 flow waited for a channel that didn't
+	/// exist and that nothing would open, so their payers would have waited for their HTLCs'
+	/// timeout.
+	///
+	/// Blocknil patch: r8's name. In r8 the provider made the sweep by calling this after
+	/// [`Node::start`]; on LDK 0.3 that races with the HTLCs LDK hands to LSPS2 again at startup,
+	/// so [`Node::start`] makes it itself and this only reports it.
+	pub fn fail_stuck_jit_payments(&self) -> usize {
+		self.liquidity_source.lsps2_service().stuck_channel_opens_failed()
 	}
 }
 
