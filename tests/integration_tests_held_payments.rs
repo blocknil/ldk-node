@@ -490,15 +490,23 @@ async fn held_payment_survives_a_provider_restart() {
 	s.provider.stop().unwrap();
 	let chain_source = TestChainSource::Esplora(&s.electrsd);
 	let provider = setup_node(&chain_source, s.provider_config.clone());
-	let woken = wake_requests(&provider);
 	// The provider may be dialling the payer at the same time: a failed connect is no matter.
 	let _ = s.payer.connect(
 		provider.node_id(),
 		provider.listening_addresses().unwrap()[0].clone(),
 		true,
 	);
-	let who = tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(30)))
-		.expect("held again after the restart");
+	// The HTLC comes back as the node starts, before the application sets its wake handler (an
+	// LSPS2 provider may even handle it inside `start`): it is held, and the handler set later
+	// is still told.
+	let back = Instant::now();
+	while provider.held_payments().is_empty() {
+		assert!(back.elapsed() < Duration::from_secs(30), "never held again");
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	let woken = wake_requests(&provider);
+	let who = tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(10)))
+		.expect("the wake handler set after the restart is told");
 	assert_eq!(who, customer_id);
 	assert_eq!(provider.held_payments().len(), 1);
 

@@ -133,6 +133,8 @@ struct Held {
 	room_asked: bool,
 	/// Kept out of what is forwarded, once the LSP is adding room for it.
 	fee_msat: u64,
+	/// It couldn't go out at once (it is recorded in `recent` when it ends).
+	was_held: bool,
 }
 
 /// Where an intercepted HTLC goes.
@@ -300,12 +302,17 @@ impl HeldPayments {
 		*self.hold_for.write().expect("lock") = hold_for;
 	}
 
+	/// Payments already held are announced to a handler set late: rust-lightning hands
+	/// intercepted HTLCs back as the node starts, possibly before the application sets it.
 	pub(crate) fn set_on_held(&self, on_held: OnHeld) {
 		*self.on_held.write().expect("lock") = Some(on_held);
+		self.process();
 	}
 
+	/// The same as `set_on_held`: payments already held are reported to a handler set late.
 	pub(crate) fn set_on_short_of_room(&self, on_short_of_room: OnShortOfRoom) {
 		*self.on_short_of_room.write().expect("lock") = Some(on_short_of_room);
+		self.process();
 	}
 
 	/// An HTLC for `customer` was intercepted: forward it now if it fits, otherwise hold it.
@@ -325,6 +332,7 @@ impl HeldPayments {
 			announced: false,
 			room_asked: false,
 			fee_msat: 0,
+			was_held: false,
 		});
 		self.release_for(customer);
 	}
@@ -471,7 +479,7 @@ impl HeldPayments {
 									String::new()
 								}
 							);
-							if h.announced || h.room_asked {
+							if h.was_held {
 								self.record_ended(&h, true, None);
 							}
 							continue;
@@ -507,6 +515,8 @@ impl HeldPayments {
 					.map(|c| c.next_outbound_htlc_limit_msat)
 					.max();
 				let deciding = self.on_short_of_room.read().expect("lock").is_some();
+				// Announced only to a handler: one set later still gets it (`set_on_held`).
+				let waking = self.on_held.read().expect("lock").is_some();
 				if let (Some(room_msat), true) = (room_msat, deciding) {
 					if !h.room_asked {
 						h.room_asked = true;
@@ -525,7 +535,7 @@ impl HeldPayments {
 							room_msat,
 						});
 					}
-				} else if room_msat.is_none() && !h.announced {
+				} else if room_msat.is_none() && !h.announced && waking {
 					h.announced = true;
 					log_info!(
 						self.logger,
@@ -535,6 +545,7 @@ impl HeldPayments {
 					);
 					announce.push(h.customer);
 				}
+				h.was_held = true;
 				keep.push(h);
 			}
 			*held = keep;
