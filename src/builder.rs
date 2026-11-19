@@ -108,6 +108,7 @@ use crate::probing::{
 	HighDegreeStrategy, Prober, ProbingConfig, ProbingStrategy, ProbingStrategyKind,
 	RandomWalkStrategy,
 };
+use crate::provider_fee::ProviderFees;
 use crate::runtime::{Runtime, RuntimeSpawner};
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
@@ -2572,6 +2573,16 @@ fn build_with_store_internal(
 	));
 	// Blocknil patch: hold SCIDs of invoices handed out before (see `held_payments`).
 	runtime.block_on(held_payments.load_hold_scids()).map_err(|_| BuildError::ReadFailed)?;
+	// Blocknil patch: fee allowances given to our provider (see `provider_fee`).
+	let provider_fees = Arc::new(
+		runtime
+			.block_on(ProviderFees::load(
+				Arc::clone(&kv_store),
+				Arc::clone(&channel_manager),
+				Arc::clone(&logger),
+			))
+			.map_err(|_| BuildError::ReadFailed)?,
+	);
 
 	let (liquidity_source, custom_message_handler) = {
 		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
@@ -2864,6 +2875,7 @@ fn build_with_store_internal(
 		pending_funding_fee_rates: Arc::new(Mutex::new(std::collections::HashMap::new())),
 		external_funding: Arc::new(Default::default()),
 		held_payments,
+		provider_fees,
 		#[cfg(feature = "unified-payments")]
 		hrn_resolver,
 		prober,

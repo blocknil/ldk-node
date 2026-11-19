@@ -68,6 +68,7 @@ use crate::payment::store::{
 };
 use crate::payment::PaymentMetadata;
 use crate::probing::Prober;
+use crate::provider_fee::ProviderFees;
 use crate::runtime::Runtime;
 use crate::types::{
 	ChainMonitor, CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper,
@@ -775,6 +776,7 @@ where
 	/// Blocknil patch: funding from a wallet outside the node (see `FundingInputSigner`).
 	external_funding: Arc<ExternalFunding>,
 	held_payments: Arc<HeldPayments>,
+	provider_fees: Arc<ProviderFees>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -794,6 +796,7 @@ where
 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 		pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
 		external_funding: Arc<ExternalFunding>, held_payments: Arc<HeldPayments>,
+		provider_fees: Arc<ProviderFees>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -819,6 +822,7 @@ where
 			pending_funding_fee_rates,
 			external_funding,
 			held_payments,
+			provider_fees,
 		}
 	}
 
@@ -1417,6 +1421,7 @@ where
 				claim_deadline,
 				onion_fields,
 				counterparty_skimmed_fee_msat,
+				receiving_channel_ids,
 				..
 			} => {
 				let (payment_id, mut payment_info) =
@@ -1503,7 +1508,13 @@ where
 							})
 						},
 						_ => None,
-					};
+					}
+					// Blocknil patch: or the fee our provider may keep for room it added when the
+					// payment arrived: the allowance we gave for this payment, when it came over
+					// our channels with the provider (see `provider_fee`).
+					.or_else(|| {
+						self.provider_fees.allowance_for(&receiving_channel_ids, &payment_hash)
+					});
 
 					let Some(max_total_opening_fee_msat) = max_total_opening_fee_msat else {
 						log_info!(
@@ -1841,6 +1852,8 @@ where
 					hex_utils::to_string(&payment_hash.0),
 					amount_msat,
 				);
+				// Blocknil patch: a fee allowance for it is spent now (see `provider_fee`).
+				self.provider_fees.used(&payment_hash).await;
 
 				let (update, kind_for_insert) = match purpose {
 					PaymentPurpose::Bolt11InvoicePayment {
@@ -3676,6 +3689,7 @@ mod tests {
 			Arc::clone(&node.pending_funding_fee_rates),
 			Arc::clone(&node.external_funding),
 			Arc::clone(&node.held_payments),
+			Arc::clone(&node.provider_fees),
 		);
 		(node, event_handler)
 	}
