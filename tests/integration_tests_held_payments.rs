@@ -24,6 +24,7 @@ use common::{
 };
 use electrsd::corepc_node::Node as BitcoinD;
 use electrsd::ElectrsD;
+use ldk_node::config::AsyncPaymentsRole;
 use ldk_node::io::sqlite_store::{SqliteStore, KV_TABLE_NAME, SQLITE_DB_FILE_NAME};
 use ldk_node::{Event, ShortOfRoom, UserChannelId};
 use lightning::util::persist::KVStore;
@@ -175,6 +176,14 @@ struct Setup {
 }
 
 async fn setup(payer_channels_sats: &[u64], customer_channel_sats: u64) -> Setup {
+	setup_with(payer_channels_sats, customer_channel_sats, |_, _| {}).await
+}
+
+/// [`setup`], with the provider's and the customer's configs adjusted by `adjust` first.
+async fn setup_with(
+	payer_channels_sats: &[u64], customer_channel_sats: u64,
+	adjust: impl FnOnce(&mut TestConfig, &mut TestConfig),
+) -> Setup {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
 
@@ -183,8 +192,9 @@ async fn setup(payer_channels_sats: &[u64], customer_channel_sats: u64) -> Setup
 	provider_config.store_type = TestStoreType::Sqlite;
 	provider_config.node_config.hold_private_forwards = true;
 	provider_config.node_config.trust_own_splice_inputs_0conf = true;
-	let provider = setup_node(&chain_source, provider_config.clone());
 	let mut customer_config = random_config();
+	adjust(&mut provider_config, &mut customer_config);
+	let provider = setup_node(&chain_source, provider_config.clone());
 	customer_config.node_config.trusted_peers_0conf.push(provider.node_id());
 	let customer = setup_node(&chain_source, customer_config);
 
@@ -798,5 +808,46 @@ async fn offer_payment_larger_than_the_room_reaches_the_provider() {
 	s.provider.set_held_payment_fee(short.intercept_id, 0).unwrap();
 	wait_for(&s.customer, "the offer payment", is_received(400_000_000)).await;
 	wait_for(&s.payer, "its success", is_successful).await;
+	s.stop();
+}
+
+/// A BOLT 12 invoice request for an offline customer waits in the provider's mailbox (an
+/// async-payments server) and is handed over the moment the customer connects. The customer must
+/// answer with an invoice that has a path to it, and the payment must arrive. r8 held such
+/// messages until the customer's channel was usable, as an invoice built before it is has no path
+/// (`MissingPaths`); on rust-lightning 0.3 the provider's `channel_reestablish` reaches the
+/// customer before the released messages do, which this test guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_request_for_an_offline_customer_is_answered_when_it_is_back() {
+	let s = setup_with(&[1_000_000], 500_000, |provider, customer| {
+		// As the provider and the wallet run: the provider keeps onion messages for offline
+		// clients, the wallet is its async-payments client.
+		provider.async_payments_role = Some(AsyncPaymentsRole::Server);
+		customer.async_payments_role = Some(AsyncPaymentsRole::Client);
+	})
+	.await;
+	s.customer.set_fee_provider(Some(s.provider.node_id()));
+	let offer = s.customer.bolt12_payment().receive_variable_amount("offline", None).unwrap();
+	let customer_id = s.customer.node_id();
+	s.customer.stop().unwrap();
+	wait_until_disconnected(&s.provider, customer_id).await;
+
+	s.payer.bolt12_payment().send_using_amount(&offer, 50_000_000, None, None, None).unwrap();
+	// The invoice request reaches the provider and waits there for the customer. So does the
+	// payer's one retry of it, sent on the first message the payer receives afterwards (a ping
+	// within 30 s, in a debug build): from here on, only the provider's mailbox can answer it.
+	tokio::time::sleep(Duration::from_secs(35)).await;
+
+	// The customer comes back as a phone does: it starts, then dials its provider.
+	s.customer.start().unwrap();
+	s.customer
+		.connect(s.provider.node_id(), s.provider.listening_addresses().unwrap()[0].clone(), true)
+		.unwrap();
+	let connected = Instant::now();
+	let outcome =
+		wait_for(&s.payer, "the payment's outcome", |e| is_successful(e) || is_failed(e)).await;
+	assert!(is_successful(&outcome), "the customer answered with a usable invoice: {outcome:?}");
+	println!("the payment succeeded {:?} after the customer connected", connected.elapsed());
+	wait_for(&s.customer, "the offer payment", is_received(50_000_000)).await;
 	s.stop();
 }
