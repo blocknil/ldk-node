@@ -433,9 +433,17 @@ pub(crate) fn random_storage_path() -> PathBuf {
 	temp_path
 }
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(20000);
+static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Blocknil (test-only): the first listening port this process hands out, from
+/// `LDK_NODE_TEST_PORT_BASE` (default 20000), so test binaries running side by side can each take a
+/// range of their own instead of colliding on the same ports.
+fn first_test_port() -> u16 {
+	std::env::var("LDK_NODE_TEST_PORT_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(20000)
+}
 
 pub(crate) fn generate_listening_addresses() -> Vec<SocketAddress> {
+	let _ = NEXT_PORT.compare_exchange(0, first_test_port(), Ordering::Relaxed, Ordering::Relaxed);
 	let port = NEXT_PORT.fetch_add(2, Ordering::Relaxed);
 	vec![
 		SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port },
