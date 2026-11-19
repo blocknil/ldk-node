@@ -342,11 +342,28 @@ impl Node {
 
 		self.runtime.allow_cancellable_background_task_spawns();
 
+		// Blocknil patch: a claim-only start (`Config::claim_only`) does not touch the chain. It
+		// claims payments on channels it already has, between a push and the end of a few seconds
+		// the system gives it, and each chain round trip (an Electrum connection, fee estimates, a
+		// Lightning-wallet sync) stands between the push and the claim. Claiming needs none of
+		// them: the node keeps the chain state it was persisted with, and the next normal start
+		// syncs before anything else, as below. Everything here that only reads or tidies the
+		// node's own records still runs.
+		let claim_only = self.config.claim_only;
+		if claim_only {
+			log_info!(
+				self.logger,
+				"Claim-only start: no chain source, fee estimates or chain sync."
+			);
+		}
+
 		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
+		if !claim_only {
+			self.chain_source.start(Arc::clone(&self.runtime)).map_err(|e| {
+				log_error!(self.logger, "Failed to start chain syncing: {}", e);
+				e
+			})?;
+		}
 
 		let manager_owns_any_0fc_channels =
 			self.channel_manager.list_channels().into_iter().any(|channel| {
@@ -426,36 +443,43 @@ impl Node {
 
 		// Synchronize Lightning chain state before peers or event processing can act on stale
 		// confirmations. Each restored ChannelMonitor may have been persisted at a different tip.
-		self.runtime.block_on(self.chain_source.initialize_wallets(
-			self.stop_sender.subscribe(),
-			Arc::clone(&self.wallet),
-			Arc::clone(&self.channel_manager),
-			Arc::clone(&self.offers_message_handler),
-			Arc::clone(&self.chain_monitor),
-			Arc::clone(&self.output_sweeper),
-			zero_fee_commitments_support_required,
-		))?;
+		//
+		// Blocknil patch: not on a claim-only start (see above). It claims on the persisted state,
+		// whose best block may be behind the chain: HTLC expiries are then checked against that
+		// older height, which only its one peer, the provider it trusts with zero-conf channels,
+		// could take advantage of.
+		if !claim_only {
+			self.runtime.block_on(self.chain_source.initialize_wallets(
+				self.stop_sender.subscribe(),
+				Arc::clone(&self.wallet),
+				Arc::clone(&self.channel_manager),
+				Arc::clone(&self.offers_message_handler),
+				Arc::clone(&self.chain_monitor),
+				Arc::clone(&self.output_sweeper),
+				zero_fee_commitments_support_required,
+			))?;
 
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let sync_wallet = Arc::clone(&self.wallet);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_offers = Arc::clone(&self.offers_message_handler);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		self.runtime.spawn_background_task(async move {
-			chain_source
-				.continuously_sync_wallets(
-					stop_sync_receiver,
-					sync_wallet,
-					sync_cman,
-					sync_offers,
-					sync_cmon,
-					sync_sweeper,
-				)
-				.await;
-		});
+			// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
+			let stop_sync_receiver = self.stop_sender.subscribe();
+			let chain_source = Arc::clone(&self.chain_source);
+			let sync_wallet = Arc::clone(&self.wallet);
+			let sync_cman = Arc::clone(&self.channel_manager);
+			let sync_offers = Arc::clone(&self.offers_message_handler);
+			let sync_cmon = Arc::clone(&self.chain_monitor);
+			let sync_sweeper = Arc::clone(&self.output_sweeper);
+			self.runtime.spawn_background_task(async move {
+				chain_source
+					.continuously_sync_wallets(
+						stop_sync_receiver,
+						sync_wallet,
+						sync_cman,
+						sync_offers,
+						sync_cmon,
+						sync_sweeper,
+					)
+					.await;
+			});
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -763,11 +787,16 @@ impl Node {
 			});
 		}
 
-		let stop_tx_bcast = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		self.runtime.spawn_cancellable_background_task(async move {
-			chain_source.continuously_process_broadcast_queue(stop_tx_bcast).await
-		});
+		// Blocknil patch: a claim-only start has no chain client to broadcast with (an Electrum
+		// source isn't started). What the node queues stays unsent: a channel monitor rebroadcasts
+		// its claims, and the sweeper its spends, once a normal start has synced.
+		if !claim_only {
+			let stop_tx_bcast = self.stop_sender.subscribe();
+			let chain_source = Arc::clone(&self.chain_source);
+			self.runtime.spawn_cancellable_background_task(async move {
+				chain_source.continuously_process_broadcast_queue(stop_tx_bcast).await
+			});
+		}
 
 		let retention_secs = self.forwarded_payment_aggregation_retention_secs;
 		let stop_aggregation = self.stop_sender.subscribe();

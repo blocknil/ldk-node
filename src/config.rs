@@ -277,6 +277,7 @@ impl Default for ForwardedPaymentTrackingMode {
 /// | `inbound_channel_minimum_depth`        | None                                 |
 /// | `one_channel_per_peer`                 | false                                |
 /// | `forwarding_fees`                      | None                                 |
+/// | `claim_only`                           | false                               |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -382,6 +383,14 @@ pub struct Config {
 	/// Blocknil patch: our provider forwards between its customers for nothing. Channels we open
 	/// take the [`ChannelConfig`] passed to the open, and LSPS2 JIT channels forward at 0 anyway.
 	pub forwarding_fees: Option<ForwardingFees>,
+	/// Blocknil patch: starts the node only to claim payments on channels it already has (a
+	/// wallet's notification extension, woken while its app is closed, with little memory and a
+	/// few seconds). See [`crate::NodeBuilder::set_claim_only`].
+	///
+	/// [`crate::Node::start`] then does not touch the chain: it does not start the chain source,
+	/// fetch fee estimates, sync the Lightning wallet before starting, or keep syncing afterwards.
+	/// The next start without it syncs as usual.
+	pub claim_only: bool,
 }
 
 /// Blocknil patch: the forwarding fee of [`Config::forwarding_fees`].
@@ -415,6 +424,7 @@ impl Default for Config {
 			inbound_channel_minimum_depth: None,
 			one_channel_per_peer: false,
 			forwarding_fees: None,
+			claim_only: false,
 		}
 	}
 }

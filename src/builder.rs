@@ -743,6 +743,21 @@ impl NodeBuilder {
 		Ok(self)
 	}
 
+	/// Blocknil patch: starts the node only to claim payments on channels it already has, as a
+	/// wallet's notification extension does while its app is closed. See [`Config::claim_only`].
+	///
+	/// [`Node::start`] then does not touch the chain (no chain-source start, fee estimates or
+	/// Lightning-wallet sync), so a claim isn't held up by round trips to a chain server. The
+	/// node keeps the chain state it was persisted with. Off by default.
+	///
+	/// A claim-only caller also keeps the network graph and scorer out of memory and out of its
+	/// store by building with a store that answers `NotFound` for them and drops their writes
+	/// (see [`Self::build_with_store`]), and bounds its threads with [`Self::set_runtime`].
+	pub fn set_claim_only(&mut self, claim_only: bool) -> &mut Self {
+		self.config.claim_only = claim_only;
+		self
+	}
+
 	/// Sets background probing config.
 	///
 	/// Use [`ProbingConfigBuilder`] to build the configuration:
