@@ -9204,7 +9204,8 @@ async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
-	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook; a first
+	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook and is told
+	// the service's answer (`set_webhook_result_handler`); a first
 	// payment then waits for the client while it is offline, the service is told to wake it
 	// (`set_payment_held_handler`, as the provider does), and the signed notification reaches the
 	// service's webhook sender.
@@ -9223,6 +9224,9 @@ async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
 	let wake = Arc::clone(&woken);
 	service_node
 		.set_payment_held_handler(Arc::new(move |client| wake.lock().unwrap().push(client)));
+	let results = Arc::new(std::sync::Mutex::new(Vec::<ldk_node::liquidity::WebhookResult>::new()));
+	let answers = Arc::clone(&results);
+	client_node.set_webhook_result_handler(Arc::new(move |r| answers.lock().unwrap().push(r)));
 	let posts_with = |method: &str| -> Vec<ldk_node::liquidity::WebhookPost> {
 		posts.lock().unwrap().iter().filter(|p| p.body.contains(method)).cloned().collect()
 	};
@@ -9264,6 +9268,17 @@ async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
 	})
 	.await;
 	assert_eq!(posts_with("lsps5.webhook_registered")[0].url, url);
+	wait_until("the registration answer", || !results.lock().unwrap().is_empty()).await;
+	assert_eq!(
+		results.lock().unwrap().clone(),
+		vec![ldk_node::liquidity::WebhookResult {
+			url: url.to_string(),
+			app_name: "blocknil".to_string(),
+			accepted: true,
+			no_change: false,
+			error: String::new(),
+		}]
+	);
 
 	// A second first payment, larger than the channel, waits for the client, which is offline.
 	let amount_msat = 200_000_000;
