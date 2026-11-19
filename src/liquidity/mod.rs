@@ -27,6 +27,10 @@ use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfi
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 pub use service::lsps2::LSPS2ServiceConfig;
+// Blocknil patch: the lifetimes of the opening fee parameters an LSPS2 service offers.
+pub use service::lsps2::{
+	DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS, SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+};
 use tokio::sync::oneshot;
 
 use crate::builder::BuildError;

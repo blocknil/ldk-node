@@ -45,7 +45,7 @@ use ldk_node::config::{
 	ADDRESS_POOL_SIZE, DEFAULT_FULL_SCAN_STOP_GAP,
 };
 use ldk_node::entropy::NodeEntropy;
-use ldk_node::liquidity::LSPS2ServiceConfig;
+use ldk_node::liquidity::{LSPS2ServiceConfig, DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS};
 use ldk_node::payment::{
 	ConfirmationStatus, ForwardedPaymentId, PayerProofOptions, PaymentDetails, PaymentDirection,
 	PaymentKind, PaymentStatus, TransactionType, UnifiedPaymentResult,
@@ -7129,6 +7129,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();
@@ -7469,6 +7470,7 @@ async fn bolt12_lsps2_client_service_integration() {
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();
@@ -7942,6 +7944,7 @@ async fn lsps2_client_trusts_lsp() {
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();
@@ -8115,6 +8118,7 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();
@@ -8261,6 +8265,7 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 		max_client_to_self_delay,
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();
@@ -8546,6 +8551,132 @@ async fn lsps2_service_opens_jit_channels_of_at_least_25k_sats() {
 		.find(|c| c.counterparty.node_id == client_node.node_id())
 		.expect("the JIT channel");
 	assert_eq!(jit_channel.channel_value_sats, 25_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_short_offer_lifetime_serves_wallet_invoices_without_filling_slots() {
+	// Blocknil patch: a service offering its opening fee parameters for
+	// `SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS` (2 h 15 min):
+	// - a client's BOLT12 offers get no cached lease, so they hold none of its ten LSPS2 slots
+	//   (with upstream's 48 hours each offer amount keeps one bought, and ten offers lock the
+	//   client out of BOLT11 JIT invoices);
+	// - a JIT invoice with the wallet's one-hour expiry is still made and paid (the client wants
+	//   the parameters to outlive it by 10 minutes; r8's one hour did not);
+	// - a BOLT12 JIT payment still works (the client's two-hour invoices need 2 h 10 min 5 s).
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+
+	let lsps2_service_config = LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm: 10_000,
+		channel_over_provisioning_ppm: 100_000,
+		max_payment_size_msat: 1_000_000_000,
+		min_payment_size_msat: 0,
+		min_channel_lifetime: 100,
+		min_channel_opening_fee_msat: 0,
+		max_client_to_self_delay: 1024,
+		client_trusts_lsp: false,
+		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs:
+			ldk_node::liquidity::SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+	};
+
+	let service_config = random_config();
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.enable_liquidity_provider(lsps2_service_config);
+	let service_node = service_builder.build(service_config.node_entropy.into()).unwrap();
+	service_node.start().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config();
+	let client_store =
+		TestSyncStore::new(client_config.node_config.storage_dir_path.clone().into());
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	client_builder.add_liquidity_source(service_node.node_id(), service_addr, None, true);
+	let client_node = client_builder
+		.build_with_store(client_config.node_entropy.into(), client_store.clone())
+		.unwrap();
+	client_node.start().unwrap();
+
+	let payer_config = random_config();
+	setup_builder!(payer_builder, payer_config.node_config);
+	payer_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	let payer_node = payer_builder.build(payer_config.node_entropy.into()).unwrap();
+	payer_node.start().unwrap();
+	let client_addr = client_node.listening_addresses().unwrap().first().unwrap().clone();
+	payer_node.connect(client_node.node_id(), client_addr, false).unwrap();
+
+	// Two JIT channels below, opened without a block in between: a coin for each.
+	let mut addrs: Vec<_> =
+		(0..2).map(|_| service_node.onchain_payment().new_address().unwrap()).collect();
+	addrs.push(payer_node.onchain_payment().new_address().unwrap());
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addrs,
+		Amount::from_sat(10_000_000),
+	)
+	.await;
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+	open_channel(&payer_node, &service_node, 5_000_000, true, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	service_node.sync_wallets().unwrap();
+	payer_node.sync_wallets().unwrap();
+	expect_channel_ready_event!(payer_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, payer_node.node_id());
+	while payer_node.status().latest_node_announcement_broadcast_timestamp.is_none() {
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	tokio::time::sleep(Duration::from_secs(1)).await;
+
+	// Ten offers for amounts the client can't receive yet: each asks for a lease to be cached.
+	let mut offers = Vec::new();
+	for i in 0..10u64 {
+		let amount_msat = 100_000_000 + i * 1_000_000;
+		offers
+			.push(client_node.bolt12_payment().receive(amount_msat, "offer", None, None).unwrap());
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	assert!(
+		KVStore::list(&client_store, "lsps2_leases", "").await.unwrap().is_empty(),
+		"no lease is cached on parameters shorter than a day"
+	);
+
+	// A BOLT11 JIT invoice with the wallet's expiry: made (a slot is free) and paid.
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("wallet")).unwrap());
+	let jit_amount_msat = 10_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &description.into(), 3600)
+		.expect("a JIT invoice with the wallet's one-hour expiry");
+	let payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	expect_payment_received_event!(client_node, jit_amount_msat * 99 / 100);
+
+	// A BOLT12 JIT payment, negotiated when the payer asks for the invoice.
+	let offer_amount_msat = 100_000_000;
+	let payment_id = payer_node.bolt12_payment().send(&offers[0], None, None, None).unwrap();
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	expect_payment_received_event!(client_node, offer_amount_msat * 99 / 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -9444,6 +9575,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 	let cheap_node_config = random_config();
 	setup_builder!(cheap_builder, cheap_node_config.node_config);
@@ -9467,6 +9599,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 	let expensive_node_config = random_config();
 	setup_builder!(expensive_builder, expensive_node_config.node_config);
@@ -9751,6 +9884,7 @@ async fn lsps2_service_funding_fee_does_not_spend_anchor_reserve() {
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 
 	let service_config = random_config();

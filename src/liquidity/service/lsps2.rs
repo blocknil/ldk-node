@@ -27,7 +27,6 @@ use crate::logger::{log_error, log_trace, LdkLogger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
 use crate::{total_anchor_channels_reserve_sats, Config};
 
-const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 48);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
 /// Blocknil patch: the smallest just-in-time channel we open, whatever the payment. Sized to the
@@ -114,7 +113,34 @@ pub struct LSPS2ServiceConfig {
 	///
 	/// [`Node::open_0reserve_channel`]: crate::Node::open_0reserve_channel
 	pub disable_client_reserve: bool,
+	/// How long the opening fee parameters we offer stay valid, in seconds.
+	///
+	/// Blocknil patch: upstream fixes this at 48 hours. Until it lapses, an offer a client bought
+	/// an intercept SCID with holds one of the ten LSPS2 slots each client gets, even if nobody
+	/// pays the invoice built on it, so a long lifetime lets a client run out of slots.
+	///
+	/// It can't be short either: an LDK Node client only takes parameters that outlive the invoice
+	/// it builds on them by 10 minutes plus its 5 second request timeout. That is 1 h 10 min 5 s
+	/// for a one-hour BOLT11 invoice and 2 h 10 min 5 s for a BOLT12 one (it uses two-hour
+	/// invoices). Its lease cache, which keeps a bought lease ready per BOLT12 offer amount, only
+	/// takes parameters valid for at least 24 hours more; below that it buys a lease only when an
+	/// invoice is asked for. Upstream's value is [`DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS`]; see
+	/// [`SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS`] for the shortest that serves both invoice kinds.
+	pub opening_fee_params_lifetime_secs: u64,
 }
+
+/// Upstream's lifetime of the opening fee parameters we offer: 48 hours. Long enough for an LDK
+/// Node client to cache leases. Blocknil patch: see
+/// [`LSPS2ServiceConfig::opening_fee_params_lifetime_secs`].
+pub const DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS: u64 = 48 * 60 * 60;
+
+/// The shortest lifetime of our opening fee parameters an LDK Node client accepts for both BOLT11
+/// invoices of up to one hour and BOLT12 invoices (two hours): 2 h 15 min, which leaves 4 min 55 s
+/// over the 2 h 10 min 5 s the BOLT12 path needs for the request round trip and the clocks of the
+/// two nodes disagreeing. Clients can't cache leases on it, so a lease, and the slot it holds,
+/// exists only for an invoice actually asked for, and lapses 2 h 15 min later if it isn't paid.
+/// Blocknil patch.
+pub const SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS: u64 = 2 * 60 * 60 + 15 * 60;
 
 impl<L: Deref> LSPS2ServiceLiquiditySource<L>
 where
@@ -349,7 +375,10 @@ where
 						}
 					}
 
-					let valid_until = LSPSDateTime(Utc::now() + LSPS2_GETINFO_REQUEST_EXPIRY);
+					// Blocknil patch: the lifetime is configured (upstream: 48 hours).
+					let lifetime =
+						Duration::from_secs(service_config.opening_fee_params_lifetime_secs);
+					let valid_until = LSPSDateTime(Utc::now() + lifetime);
 					let opening_fee_params = LSPS2RawOpeningFeeParams {
 						min_fee_msat: service_config.min_channel_opening_fee_msat,
 						proportional: service_config.channel_opening_fee_ppm,
