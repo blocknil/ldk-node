@@ -99,6 +99,7 @@ mod error;
 mod event;
 mod fee_estimator;
 mod ffi;
+mod funding_signer;
 mod gossip;
 pub mod graph;
 mod hex_utils;
@@ -142,11 +143,13 @@ pub use error::Error as NodeError;
 use error::Error;
 pub use event::{Event, SpliceFailureReason, SpliceOutput, SpliceParameters};
 use event::{EventHandler, EventQueue};
+// Blocknil patch: see `FundingInputSigner`.
 use fee_estimator::{
 	max_funding_feerate, rbf_splice_feerates, ConfirmationTarget, FeeEstimator, OnchainFeeEstimator,
 };
 #[cfg(feature = "uniffi")]
 use ffi::*;
+pub use funding_signer::FundingInputSigner;
 use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::update_and_persist_node_metrics;
@@ -289,6 +292,8 @@ pub struct Node {
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	pending_funding_fee_rates: Arc<Mutex<std::collections::HashMap<u128, bitcoin::FeeRate>>>,
+	/// Blocknil patch: funding from a wallet outside the node (see [`FundingInputSigner`]).
+	external_funding: Arc<funding_signer::ExternalFunding>,
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
@@ -788,6 +793,7 @@ impl Node {
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 			Arc::clone(&self.pending_funding_fee_rates),
+			Arc::clone(&self.external_funding),
 		));
 
 		if let Some(prober) = self.prober.clone() {
@@ -2207,6 +2213,121 @@ impl Node {
 			FundingAmount::Max,
 			maybe_map_fee_rate_opt(min_fee_rate),
 		)
+	}
+
+	/// Registers the signer for the inputs [`Node::splice_in_with_inputs`] contributes from a
+	/// wallet outside ldk-node. Register it before [`Node::start`], as [`FundingInputSigner`]
+	/// explains.
+	///
+	/// Blocknil patch.
+	pub fn set_funding_input_signer(&self, signer: Arc<dyn FundingInputSigner>) {
+		*self.external_funding.signer.write().expect("lock") = Some(signer);
+	}
+
+	/// The fee rate ldk-node would pay for a channel funding transaction right now. A caller
+	/// choosing coins for [`Node::splice_in_with_inputs`] can use it, so that its coins cover what
+	/// the splice will cost.
+	///
+	/// Blocknil patch.
+	pub fn channel_funding_fee_rate(&self) -> bitcoin::FeeRate {
+		self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
+	}
+
+	/// Adds `splice_amount_sats` to an existing channel from coins ldk-node's own wallet doesn't
+	/// hold.
+	///
+	/// Every one of `inputs` is spent. They must cover `splice_amount_sats` plus the fee, at
+	/// `fee_rate`, for themselves, a change output, and the channel's shared input and output;
+	/// what is left goes to `change_script` (or to the channel, when it would be dust). Once the
+	/// transaction is negotiated, the inputs are signed by the [`FundingInputSigner`] registered
+	/// with [`Node::set_funding_input_signer`], which must be registered first.
+	///
+	/// As with [`Node::splice_in`], we may pay up to 1.5 times `fee_rate` when the channel already
+	/// has a pending splice that requires a higher feerate, or when the counterparty initiates a
+	/// splice concurrently and our contribution is added to theirs; that is paid from the change.
+	///
+	/// Blocknil patch: upstream's [`Node::splice_in`] only spends ldk-node's own wallet.
+	pub fn splice_in_with_inputs(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		splice_amount_sats: u64, inputs: Vec<ConfirmedUtxo>, change_script: bitcoin::ScriptBuf,
+		fee_rate: bitcoin::FeeRate,
+	) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		if self.external_funding.signer.read().expect("lock").is_none() {
+			log_error!(self.logger, "Failed to splice channel: no funding input signer registered");
+			return Err(Error::ChannelSplicingFailed);
+		}
+
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		let channel_details = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
+			.ok_or_else(|| {
+				log_error!(
+					self.logger,
+					"Channel not found for user_channel_id {} and counterparty {}",
+					user_channel_id,
+					counterparty_node_id
+				);
+				Error::ChannelSplicingFailed
+			})?;
+
+		let max_feerate = max_funding_feerate(fee_rate);
+		let funding_template = self
+			.channel_manager
+			.splice_channel(&channel_details.channel_id, &counterparty_node_id)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel: {:?}", e);
+				Error::ChannelSplicingFailed
+			})?;
+
+		// As in `splice_in_inner`: one contribution at a time, and the RBF minimum when joining a
+		// pending splice of the counterparty's.
+		if funding_template.prior_contribution().is_some() {
+			log_error!(
+				self.logger,
+				"Failed to splice channel: a prior splice contribution is pending; use bump_channel_funding_fee to bump its fee"
+			);
+			return Err(Error::ChannelSplicingFailed);
+		}
+		let feerate = match funding_template.min_rbf_feerate() {
+			Some(min_rbf_feerate) if min_rbf_feerate <= max_feerate => {
+				fee_rate.max(min_rbf_feerate)
+			},
+			_ => fee_rate,
+		};
+
+		let contribution = funding_signer::external_splice_in_contribution(
+			funding_template,
+			Amount::from_sat(splice_amount_sats),
+			inputs,
+			change_script,
+			feerate,
+			max_feerate,
+		)
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to splice channel: {}", e);
+			match e {
+				FundingContributionError::CoinSelectionFailed
+				| FundingContributionError::ManuallySelectedInputsInsufficient => Error::InsufficientFunds,
+				_ => Error::ChannelSplicingFailed,
+			}
+		})?;
+
+		self.channel_manager
+			.funding_contributed(
+				&channel_details.channel_id,
+				&counterparty_node_id,
+				contribution,
+				None,
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to splice channel: {:?}", e);
+				Error::ChannelSplicingFailed
+			})
 	}
 
 	/// Remove funds from an existing channel, sending them to an on-chain address.
