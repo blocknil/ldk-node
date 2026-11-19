@@ -23,7 +23,9 @@ use common::{
 	random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node, TestChainSource,
 	TestConfig, TestNode, TestSyncStore,
 };
+use ldk_node::config::AsyncPaymentsRole;
 use ldk_node::{Builder, Event};
+use lightning::routing::gossip::NodeId;
 use lightning::util::persist::{
 	KVStore, PageToken, PaginatedKVStore, PaginatedListResponse, NETWORK_GRAPH_PERSISTENCE_KEY,
 	SCORER_PERSISTENCE_KEY,
@@ -421,6 +423,99 @@ async fn claim_only_wallet_answers_a_bolt12_payer_through_its_provider() {
 	expect_payment_successful_event!(payer, payment_id, None);
 	// The wallet never connected to the payer's LSP: everything went through its provider.
 	assert!(wallet.list_peers().iter().all(|peer| peer.node_id != payer_lsp.node_id()));
+
+	wallet.stop().unwrap();
+}
+
+/// Builds and starts a wallet node (not claim-only) for `config`, with `lsp` as its liquidity
+/// source.
+fn start_wallet(
+	chain_source: &TestChainSource, config: &TestConfig, store: TestSyncStore, lsp: &TestNode,
+) -> TestNode {
+	setup_builder!(builder, config.node_config);
+	common::configure_chain_source(chain_source, &mut builder, config);
+	let address = lsp.listening_addresses().unwrap().first().unwrap().clone();
+	builder.add_liquidity_source(lsp.node_id(), address, None, false);
+	let node = builder.build_with_store(config.node_entropy, store).unwrap();
+	node.start().unwrap();
+	node
+}
+
+fn has_node_announcement(graph_of: &TestNode, node: &TestNode) -> bool {
+	graph_of
+		.network_graph()
+		.node(&NodeId::from_pubkey(&node.node_id()))
+		.map_or(false, |info| info.announcement_info.is_some())
+}
+
+/// A wallet pays an offer whose introduction node its provider has no channel with and isn't
+/// connected to. The provider intercepts the wallet's invoice request for that node, connects to
+/// it from the addresses in its graph, and forwards the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn provider_connects_to_forward_a_wallets_onion_message() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let mut provider_config = random_config();
+	provider_config.async_payments_role = Some(AsyncPaymentsRole::Server);
+	let provider = setup_node(&chain_source, provider_config);
+	let hop = setup_node(&chain_source, random_config());
+	let recipient = setup_node(&chain_source, random_config());
+	let wallet_config = wallet_config_via(Some(&provider));
+	let wallet = start_wallet(
+		&chain_source,
+		&wallet_config,
+		TestSyncStore::new(wallet_config.node_config.storage_dir_path.clone().into()),
+		&provider,
+	);
+
+	let addresses = vec![
+		wallet.onchain_payment().new_address().unwrap(),
+		provider.onchain_payment().new_address().unwrap(),
+		hop.onchain_payment().new_address().unwrap(),
+	];
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addresses,
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	for node in [&wallet, &provider, &hop] {
+		node.sync_wallets().unwrap();
+	}
+
+	// wallet -- provider (unannounced), provider -- hop -- recipient (announced). The provider
+	// shares no channel with the recipient.
+	open_channel(&wallet, &provider, 1_000_000, false, &electrsd).await;
+	open_channel(&provider, &hop, 1_000_000, true, &electrsd).await;
+	open_channel(&hop, &recipient, 1_000_000, true, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	for node in [&wallet, &provider, &hop, &recipient] {
+		node.sync_wallets().unwrap();
+	}
+	expect_channel_ready_event!(wallet, provider.node_id());
+	expect_channel_ready_event!(provider, wallet.node_id());
+	expect_channel_ready_event!(provider, hop.node_id());
+	expect_channel_ready_event!(hop, provider.node_id());
+	expect_channel_ready_event!(hop, recipient.node_id());
+	expect_channel_ready_event!(recipient, hop.node_id());
+
+	// The provider has the recipient's address from gossip; the wallet has the channels.
+	while !has_node_announcement(&provider, &recipient) {
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	wait_for_graph_channels(&wallet, 2).await;
+	assert!(provider.list_peers().iter().all(|peer| peer.node_id != recipient.node_id()));
+
+	let amount_msat = 30_000_000;
+	let offer = recipient.bolt12_payment().receive(amount_msat, "forwarded", None, None).unwrap();
+	let payment_id = wallet.bolt12_payment().send(&offer, None, None, None).unwrap();
+	expect_payment_received_event!(recipient, amount_msat);
+	expect_payment_successful_event!(wallet, payment_id, None);
+	assert!(provider.list_peers().iter().any(|peer| peer.node_id == recipient.node_id()));
+	// The wallet itself never dialled the recipient.
+	assert!(wallet.list_peers().iter().all(|peer| peer.node_id != recipient.node_id()));
 
 	wallet.stop().unwrap();
 }
