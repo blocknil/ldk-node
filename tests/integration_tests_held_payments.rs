@@ -12,16 +12,20 @@
 
 mod common;
 
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Amount;
 use common::{
 	generate_blocks_and_wait, open_channel, open_channel_no_wait, premine_and_distribute_funds,
-	random_config, setup_bitcoind_and_electrsd, setup_node, TestChainSource, TestNode,
+	random_config, setup_bitcoind_and_electrsd, setup_node, TestChainSource, TestConfig, TestNode,
 	TestStoreType,
 };
-use ldk_node::{Event, UserChannelId};
+use electrsd::corepc_node::Node as BitcoinD;
+use electrsd::ElectrsD;
+use ldk_node::{Event, ShortOfRoom, UserChannelId};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 
 /// Waits for the first event matching `want`, handling (and printing) the others.
 async fn wait_for(node: &TestNode, what: &str, want: impl Fn(&Event) -> bool) -> Event {
@@ -153,4 +157,353 @@ async fn zero_conf_splice_depths_on_new_and_existing_channels() {
 
 	provider.stop().unwrap();
 	customer.stop().unwrap();
+}
+
+/// A payer with channels of `payer_channels_sats` to the provider; the provider with a channel of
+/// `customer_channel_sats` to the customer. The provider holds its clients' payments and locks
+/// its own splices at once; the customer trusts it with zero-conf splices. The provider is on
+/// disk, so it can restart.
+struct Setup {
+	bitcoind: BitcoinD,
+	electrsd: ElectrsD,
+	payer: TestNode,
+	provider: TestNode,
+	provider_config: TestConfig,
+	customer: TestNode,
+}
+
+async fn setup(payer_channels_sats: &[u64], customer_channel_sats: u64) -> Setup {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let payer = setup_node(&chain_source, random_config());
+	let mut provider_config = random_config();
+	provider_config.store_type = TestStoreType::Sqlite;
+	provider_config.node_config.hold_private_forwards = true;
+	provider_config.node_config.trust_own_splice_inputs_0conf = true;
+	let provider = setup_node(&chain_source, provider_config.clone());
+	let mut customer_config = random_config();
+	customer_config.node_config.trusted_peers_0conf.push(provider.node_id());
+	let customer = setup_node(&chain_source, customer_config);
+
+	let mut addresses = vec![];
+	for _ in payer_channels_sats {
+		addresses.push(payer.onchain_payment().new_address().unwrap());
+	}
+	for _ in 0..3 {
+		addresses.push(provider.onchain_payment().new_address().unwrap());
+	}
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addresses,
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	payer.sync_wallets().unwrap();
+	provider.sync_wallets().unwrap();
+
+	let mut txids = vec![];
+	for sats in payer_channels_sats {
+		txids.push(open_channel_no_wait(&payer, &provider, *sats, None, false).await.txid);
+	}
+	txids.push(
+		open_channel_no_wait(&provider, &customer, customer_channel_sats, None, false).await.txid,
+	);
+	for txid in txids {
+		common::wait_for_tx(&electrsd.client, txid).await;
+	}
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	for node in [&payer, &provider, &customer] {
+		node.sync_wallets().unwrap();
+	}
+	// In whatever order: the customer's channel is zero-conf (it trusts the provider).
+	for _ in payer_channels_sats {
+		wait_for(&payer, "a payer channel", is_ready_with(provider.node_id())).await;
+	}
+	for _ in 0..=payer_channels_sats.len() {
+		wait_for(&provider, "a channel", |e| matches!(e, Event::ChannelReady { .. })).await;
+	}
+	wait_for(&customer, "the customer channel", is_ready_with(provider.node_id())).await;
+	for sats in payer_channels_sats {
+		common::wait_for_channel_ready_to_send(&payer, &provider, sats * 900).await;
+	}
+
+	Setup { bitcoind, electrsd, payer, provider, provider_config, customer }
+}
+
+impl Setup {
+	fn stop(&self) {
+		for node in [&self.payer, &self.provider, &self.customer] {
+			let _ = node.stop();
+		}
+	}
+
+	/// What the provider's channel to the customer can take right now.
+	fn room_msat(&self) -> u64 {
+		self.provider
+			.list_channels()
+			.into_iter()
+			.filter(|c| c.counterparty.node_id == self.customer.node_id() && c.is_usable)
+			.map(|c| c.next_outbound_htlc_limit_msat)
+			.max()
+			.unwrap_or(0)
+	}
+
+	/// Leaves the customer about `room_msat` of room, by paying them the rest (a payment that
+	/// fits, forwarded at once although it is intercepted).
+	async fn shrink_room_to(&self, room_msat: u64) {
+		let amount_msat = self.room_msat() - room_msat;
+		self.payer.bolt11_payment().send(&invoice(&self.customer, amount_msat), None).unwrap();
+		wait_for(&self.customer, "the payment that fits", is_received(amount_msat)).await;
+		wait_for(&self.payer, "its success", is_successful).await;
+	}
+
+	fn customer_channel(&self) -> UserChannelId {
+		self.provider
+			.list_channels()
+			.into_iter()
+			.find(|c| c.counterparty.node_id == self.customer.node_id())
+			.unwrap()
+			.user_channel_id
+	}
+
+	fn height(&self) -> u64 {
+		self.bitcoind.client.get_block_count().unwrap().0
+	}
+}
+
+fn invoice(customer: &TestNode, amount_msat: u64) -> Bolt11Invoice {
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("held".to_string()).unwrap());
+	customer.bolt11_payment().receive(amount_msat, &description, 3600).unwrap()
+}
+
+fn is_received(amount_msat: u64) -> impl Fn(&Event) -> bool {
+	move |e| matches!(e, Event::PaymentReceived { amount_msat: a, .. } if *a == amount_msat)
+}
+
+fn is_successful(e: &Event) -> bool {
+	matches!(e, Event::PaymentSuccessful { .. })
+}
+
+fn is_failed(e: &Event) -> bool {
+	matches!(e, Event::PaymentFailed { .. })
+}
+
+/// Collects the provider's short-of-room reports.
+fn short_of_room_reports(provider: &TestNode) -> mpsc::Receiver<ShortOfRoom> {
+	let (tx, rx) = mpsc::channel();
+	let tx = Mutex::new(tx);
+	provider.set_short_of_room_handler(Arc::new(move |short| {
+		let _ = tx.lock().unwrap().send(short);
+	}));
+	rx
+}
+
+async fn next_report(rx: &mpsc::Receiver<ShortOfRoom>, wait: Duration) -> Option<ShortOfRoom> {
+	tokio::task::block_in_place(|| rx.recv_timeout(wait).ok())
+}
+
+/// A payment that fits goes straight through; one too large for the customer's room is held
+/// and reported once; the provider splices its own coins in and lets it go; the customer gets it
+/// with no block mined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_of_room_is_spliced_and_forwarded_without_a_block() {
+	let s = setup(&[1_000_000], 300_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	let large = invoice(&s.customer, 150_000_000);
+
+	s.shrink_room_to(50_000_000).await;
+	assert!(next_report(&reports, Duration::from_secs(1)).await.is_none(), "it fit");
+	assert!(s.provider.held_payments().is_empty());
+	assert!(s.provider.recent_held_payments().is_empty(), "a payment that fits isn't a hold");
+
+	let height = s.height();
+	s.payer.bolt11_payment().send(&large, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reported");
+	assert_eq!(short.customer, s.customer.node_id());
+	assert_eq!(short.amount_msat, 150_000_000);
+	assert_eq!(short.payment_hash.0, large.payment_hash().0);
+	assert!(short.room_msat < short.amount_msat);
+	assert_eq!(s.provider.held_payments().len(), 1);
+	assert!(next_report(&reports, Duration::from_secs(1)).await.is_none(), "reported once");
+
+	s.provider.splice_in(&s.customer_channel(), s.customer.node_id(), 300_000, None).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, 0).unwrap();
+	// The payment goes out as the splice locks (re-signalled as `ChannelReady`), not on the
+	// provider's 5 s fallback timer.
+	wait_for(&s.provider, "the splice to lock", is_ready_with(s.customer.node_id())).await;
+	let locked = Instant::now();
+	while s.provider.recent_held_payments().is_empty() {
+		assert!(locked.elapsed() < Duration::from_secs(10), "never forwarded");
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	println!("forwarded {:?} after the splice locked", locked.elapsed());
+	assert!(locked.elapsed() < Duration::from_millis(500), "released as the splice locked");
+	wait_for(&s.customer, "the large payment", is_received(150_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	assert!(s.provider.held_payments().is_empty());
+	assert_eq!(s.height(), height, "the splice locked with no block mined");
+	let record = &s.provider.recent_held_payments()[0];
+	assert!(record.forwarded);
+	assert_eq!(record.amount_msat, 150_000_000);
+	s.stop();
+}
+
+/// A refused payment fails back to the payer at once, not at the hold's deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_payment_fails_back_at_once() {
+	let s = setup(&[1_000_000], 300_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	let large = invoice(&s.customer, 150_000_000);
+	s.shrink_room_to(50_000_000).await;
+
+	s.payer.bolt11_payment().send(&large, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reported");
+	let started = Instant::now();
+	s.provider.refuse_held_payment(short.intercept_id, "no coins").unwrap();
+	wait_for(&s.payer, "the refusal", is_failed).await;
+	assert!(started.elapsed() < Duration::from_secs(10), "failed at once");
+	assert!(s.provider.held_payments().is_empty());
+	assert!(s.provider.refuse_held_payment(short.intercept_id, "again").is_err());
+	let record = &s.provider.recent_held_payments()[0];
+	assert!(!record.forwarded);
+	assert_eq!(record.refused.as_deref(), Some("no coins"));
+	s.stop();
+}
+
+/// A multi-part payment too large for the room: each part is reported, with the payment's hash;
+/// once room is added, every part goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_part_payment_short_of_room_is_reported_per_part() {
+	// Payer channels too small for the payment alone: the payer splits it.
+	let s = setup(&[120_000, 120_000, 120_000, 120_000], 250_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	let large = invoice(&s.customer, 200_000_000);
+	s.shrink_room_to(40_000_000).await;
+
+	s.payer.bolt11_payment().send(&large, None).unwrap();
+	let mut parts = vec![];
+	while parts.iter().map(|p: &ShortOfRoom| p.amount_msat).sum::<u64>() < 200_000_000 {
+		parts.push(next_report(&reports, Duration::from_secs(30)).await.expect("a part reported"));
+	}
+	println!("{} parts reported: {:?}", parts.len(), parts);
+	assert!(parts.len() >= 2, "a multi-part payment");
+	for part in &parts {
+		assert_eq!(part.payment_hash.0, large.payment_hash().0);
+		assert!(part.room_msat < part.amount_msat);
+	}
+	assert_eq!(parts.iter().map(|p| p.amount_msat).sum::<u64>(), 200_000_000);
+	assert_eq!(s.provider.held_payments().len(), parts.len());
+
+	s.provider.splice_in(&s.customer_channel(), s.customer.node_id(), 300_000, None).unwrap();
+	for part in &parts {
+		s.provider.set_held_payment_fee(part.intercept_id, 0).unwrap();
+	}
+	wait_for(&s.customer, "the multi-part payment", is_received(200_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	assert!(s.provider.held_payments().is_empty());
+	s.stop();
+}
+
+/// Waits until the provider sees the customer gone.
+async fn wait_until_disconnected(provider: &TestNode, customer: PublicKey) {
+	for _ in 0..100 {
+		if provider.list_peers().iter().all(|p| p.node_id != customer || !p.is_connected) {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	panic!("the customer is still connected");
+}
+
+/// Collects the customers the provider asks to wake.
+fn wake_requests(provider: &TestNode) -> mpsc::Receiver<PublicKey> {
+	let (tx, rx) = mpsc::channel();
+	let tx = Mutex::new(tx);
+	provider.set_payment_held_handler(Arc::new(move |customer| {
+		let _ = tx.lock().unwrap().send(customer);
+	}));
+	rx
+}
+
+/// A payment for an offline customer is held and the customer woken; it goes out the moment they
+/// reconnect, well before the fallback timer would have caught it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_customer_payment_goes_out_on_reconnect() {
+	let s = setup(&[1_000_000], 500_000).await;
+	let woken = wake_requests(&s.provider);
+	let payment = invoice(&s.customer, 50_000_000);
+	let customer_id = s.customer.node_id();
+	s.customer.stop().unwrap();
+	wait_until_disconnected(&s.provider, customer_id).await;
+
+	s.payer.bolt11_payment().send(&payment, None).unwrap();
+	let who = tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(30)))
+		.expect("the provider holds the payment and asks to wake the customer");
+	assert_eq!(who, customer_id);
+	assert_eq!(s.provider.held_payments().len(), 1);
+
+	// The customer comes back, and dials its provider as a phone does. The provider forwards
+	// the payment once the channel is reestablished: well before its 5 s fallback timer.
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	s.customer.start().unwrap();
+	s.customer
+		.connect(s.provider.node_id(), s.provider.listening_addresses().unwrap()[0].clone(), true)
+		.unwrap();
+	let connected = Instant::now();
+	while s.provider.recent_held_payments().is_empty() {
+		assert!(connected.elapsed() < Duration::from_secs(10), "never forwarded");
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	let took = connected.elapsed();
+	println!("the provider forwarded the held payment {:?} after the customer connected", took);
+	assert!(
+		took < Duration::from_millis(1500),
+		"released on reconnect, not by the timer: {took:?}"
+	);
+	assert!(s.provider.recent_held_payments()[0].forwarded);
+	wait_for(&s.customer, "the held payment", is_received(50_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	assert!(s.provider.held_payments().is_empty());
+	s.stop();
+}
+
+/// The provider restarts while it holds a payment for an offline customer: LDK hands the
+/// intercepted HTLC back after the restart, it is held again, and goes out when the customer is
+/// back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_payment_survives_a_provider_restart() {
+	let s = setup(&[1_000_000], 500_000).await;
+	let woken = wake_requests(&s.provider);
+	let payment = invoice(&s.customer, 50_000_000);
+	let customer_id = s.customer.node_id();
+	s.customer.stop().unwrap();
+	wait_until_disconnected(&s.provider, customer_id).await;
+	s.payer.bolt11_payment().send(&payment, None).unwrap();
+	tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(30))).expect("held");
+
+	// Restart the provider with the payment held.
+	s.provider.stop().unwrap();
+	let chain_source = TestChainSource::Esplora(&s.electrsd);
+	let provider = setup_node(&chain_source, s.provider_config.clone());
+	let woken = wake_requests(&provider);
+	s.payer
+		.connect(provider.node_id(), provider.listening_addresses().unwrap()[0].clone(), true)
+		.unwrap();
+	let who = tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(30)))
+		.expect("held again after the restart");
+	assert_eq!(who, customer_id);
+	assert_eq!(provider.held_payments().len(), 1);
+
+	s.customer.start().unwrap();
+	s.customer
+		.connect(provider.node_id(), provider.listening_addresses().unwrap()[0].clone(), true)
+		.unwrap();
+	wait_for(&s.customer, "the held payment", is_received(50_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	assert!(provider.held_payments().is_empty());
+	provider.stop().unwrap();
+	s.stop();
 }

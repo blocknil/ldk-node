@@ -70,6 +70,7 @@ use crate::entropy::NodeEntropy;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
+use crate::held_payments::HeldPayments;
 #[cfg(feature = "storage-filesystem")]
 use crate::io::fs_store::open_or_migrate_fs_store;
 #[cfg(feature = "storage-sqlite")]
@@ -2323,6 +2324,15 @@ fn build_with_store_internal(
 		user_config.accept_forwards_to_priv_channels = true;
 	}
 
+	if config.hold_private_forwards {
+		// Blocknil patch: every forward to a client's private channel is intercepted, so it can
+		// be held (client offline) or wait for a splice (client short of room). See
+		// `held_payments`.
+		user_config.htlc_interception_flags |= HTLCInterceptionFlags::ToOnlinePrivateChannels as u8
+			| HTLCInterceptionFlags::ToOfflinePrivateChannels as u8;
+		user_config.accept_forwards_to_priv_channels = true;
+	}
+
 	if let Some(role) = async_payments_role {
 		match role {
 			AsyncPaymentsRole::Server => {
@@ -2552,6 +2562,10 @@ fn build_with_store_internal(
 		},
 	};
 
+	// Blocknil patch: payments held for our clients (see `held_payments`).
+	let held_payments =
+		Arc::new(HeldPayments::new(Arc::clone(&channel_manager), Arc::clone(&logger)));
+
 	let (liquidity_source, custom_message_handler) = {
 		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
 			Arc::clone(&wallet),
@@ -2592,8 +2606,10 @@ fn build_with_store_internal(
 
 		let liquidity_source = runtime
 			.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
-		let custom_message_handler =
-			Arc::new(NodeCustomMessageHandler::new(Arc::clone(&liquidity_source)));
+		let custom_message_handler = Arc::new(NodeCustomMessageHandler::new(
+			Arc::clone(&liquidity_source),
+			Arc::clone(&held_payments),
+		));
 
 		(liquidity_source, custom_message_handler)
 	};
@@ -2840,6 +2856,7 @@ fn build_with_store_internal(
 		async_payments_role,
 		pending_funding_fee_rates: Arc::new(Mutex::new(std::collections::HashMap::new())),
 		external_funding: Arc::new(Default::default()),
+		held_payments,
 		#[cfg(feature = "unified-payments")]
 		hrn_resolver,
 		prober,
