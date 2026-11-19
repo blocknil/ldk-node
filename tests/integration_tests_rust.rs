@@ -3454,7 +3454,12 @@ async fn zero_conf_queued_splice_is_recorded_as_its_own_payment() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
 
-	let node_a = setup_node(&chain_source, random_config());
+	// Blocknil patch: on rust-lightning 0.3 a splice's depth comes from each side's per-channel
+	// splice depths, no longer from the channel being zero-conf: node A locks the splices it funds
+	// at 0 conf, node B those of the peer it trusts (`trusted_peers_0conf`).
+	let mut config_a = random_config();
+	config_a.node_config.trust_own_splice_inputs_0conf = true;
+	let node_a = setup_node(&chain_source, config_a);
 	let mut config_b = random_config();
 	config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
 	let node_b = setup_node(&chain_source, config_b);
@@ -5386,7 +5391,11 @@ async fn signed_splice_round_the_monitor_does_not_watch_is_dropped_at_close() {
 async fn superseded_zero_conf_splice_round_keeps_its_payment_at_close() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = TestChainSource::Esplora(&electrsd);
-	let (node_a, logs_a) = setup_logged_node(&chain_source, random_config());
+	// Blocknil patch: node A locks the splices it funds at 0 conf, node B those of the peer it
+	// trusts (see `zero_conf_queued_splice_is_recorded_as_its_own_payment`).
+	let mut config_a = random_config();
+	config_a.node_config.trust_own_splice_inputs_0conf = true;
+	let (node_a, logs_a) = setup_logged_node(&chain_source, config_a);
 	let mut config_b = random_config();
 	config_b.node_config.trusted_peers_0conf.push(node_a.node_id());
 	let node_b = setup_node(&chain_source, config_b);

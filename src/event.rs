@@ -43,7 +43,9 @@ use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use lightning_types::string::UntrustedString;
 
-use crate::config::{may_announce_channel, Config, PEER_RECONNECTION_INTERVAL};
+use crate::config::{
+	may_announce_channel, zero_conf_splice_depths, Config, PEER_RECONNECTION_INTERVAL,
+};
 use crate::connection::ConnectionManager;
 use crate::data_store::{DataStoreUpdateResult, UpdatableObject};
 use crate::fee_estimator::ConfirmationTarget;
@@ -2113,6 +2115,15 @@ where
 							.unannounced_channel_max_inbound_htlc_value_in_flight_percentage,
 						100
 					);
+				}
+				// Blocknil patch: a peer we trust with zero-conf channels gets zero-conf splices
+				// too (see `config::zero_conf_splice_depths`).
+				if allow_0conf {
+					let depths = zero_conf_splice_depths(&self.config, true);
+					let overrides = channel_override_config.get_or_insert_with(Default::default);
+					let update = overrides.update_overrides.get_or_insert_with(Default::default);
+					update.inbound_splice_min_depth = depths.inbound_splice_min_depth;
+					update.outbound_splice_min_depth = depths.outbound_splice_min_depth;
 				}
 				let res = if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer(

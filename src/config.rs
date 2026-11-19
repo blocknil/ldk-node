@@ -18,7 +18,8 @@ use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
 use lightning::routing::router::{RouteParameters, RouteParametersConfig};
 use lightning::util::config::{
-	ChannelConfig as LdkChannelConfig, MaxDustHTLCExposure as LdkMaxDustHTLCExposure, UserConfig,
+	ChannelConfig as LdkChannelConfig, ChannelConfigUpdate,
+	MaxDustHTLCExposure as LdkMaxDustHTLCExposure, UserConfig,
 };
 
 use crate::logger::LogLevel;
@@ -274,6 +275,7 @@ impl Default for ForwardedPaymentTrackingMode {
 )]
 /// | `manually_handle_unknown_bolt11_payments` | false                              |
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
+/// | `trust_own_splice_inputs_0conf`        | false                               |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -305,6 +307,11 @@ pub struct Config {
 	/// unannounced channels.
 	pub node_alias: Option<NodeAlias>,
 	/// A list of peers that we allow to establish zero confirmation channels to us.
+	///
+	/// Blocknil patch: splices with these peers lock at zero confirmations too, whoever put funds
+	/// into them, also on channels we opened to them: both splice depths of our channels with them
+	/// are 0 (see [`ChannelConfig::inbound_splice_min_depth`]). Set when such a channel is opened
+	/// or accepted, and at start on channels opened before.
 	///
 	/// **Note:** Allowing payments via zero-confirmation channels is potentially insecure if the
 	/// funding transaction ends up never being confirmed on-chain. Zero-confirmation channels
@@ -362,6 +369,16 @@ pub struct Config {
 	pub manually_handle_unknown_bolt11_payments: bool,
 	/// The mode used for tracking forwarded payments.
 	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	/// Blocknil patch: lock a splice we put funds into at zero confirmations, as long as the
+	/// counterparty put none in: our channels' [`ChannelConfig::outbound_splice_min_depth`] is 0,
+	/// their [`ChannelConfig::inbound_splice_min_depth`] stays as it is. An LSP that splices its own
+	/// coins into a client's channel when a payment arrives forwards the payment over them at once;
+	/// the risk, a splice that never confirms, is only ours. Set when a channel is opened or
+	/// accepted, and at start on channels opened before.
+	///
+	/// **Note:** a channel with a zero splice depth can't fee-bump its splices with RBF: a stuck
+	/// splice has to be bumped with a child spending its change (CPFP).
+	pub trust_own_splice_inputs_0conf: bool,
 }
 
 impl Default for Config {
@@ -382,6 +399,7 @@ impl Default for Config {
 			hrn_config: HumanReadableNamesConfig::default(),
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			trust_own_splice_inputs_0conf: false,
 		}
 	}
 }
@@ -583,6 +601,9 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
 		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	// Blocknil patch: inbound channels (and an LSPS2 service's just-in-time channels) start with
+	// these; `Node::open_channel` replaces the channel config, and applies them again.
+	user_config.channel_config.apply(&zero_conf_splice_depths(config, false));
 
 	let may_announce = may_announce_channel(config).is_ok();
 	user_config.accept_forwards_to_priv_channels = may_announce;
@@ -592,6 +613,23 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	}
 
 	user_config
+}
+
+/// Blocknil patch: the splice depths a channel with a peer must have, as an update that only sets
+/// a depth to 0 (it never raises one). Both are 0 with a peer we trust with zero-confirmation
+/// channels ([`Config::trusted_peers_0conf`], or an LSP added as trusted): r8's
+/// `trusted_splice_peers_0conf`. Our outbound depth is 0 everywhere with
+/// [`Config::trust_own_splice_inputs_0conf`]. rust-lightning 0.3 keeps these per channel, so
+/// they are applied to each channel at open, at accept and at start.
+pub(crate) fn zero_conf_splice_depths(config: &Config, trusted_peer: bool) -> ChannelConfigUpdate {
+	let mut update = ChannelConfigUpdate::default();
+	if trusted_peer || config.trust_own_splice_inputs_0conf {
+		update.outbound_splice_min_depth = Some(0);
+	}
+	if trusted_peer {
+		update.inbound_splice_min_depth = Some(0);
+	}
+	update
 }
 
 /// Options related to background syncing the Lightning and on-chain wallets.
@@ -962,6 +1000,27 @@ mod tests {
 		ElectrumSyncConfig, EsploraSyncConfig, NodeAlias, SocketAddress,
 		DEFAULT_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
 	};
+
+	#[test]
+	fn zero_conf_splice_depths_by_trust() {
+		// Blocknil patch: a trusted peer gets both depths at 0; our own splices lock at 0 with
+		// `trust_own_splice_inputs_0conf`, a splice the counterparty funds still waits; the
+		// default leaves both alone.
+		let mut config = Config::default();
+		let none = super::zero_conf_splice_depths(&config, false);
+		assert_eq!((none.inbound_splice_min_depth, none.outbound_splice_min_depth), (None, None));
+		let trusted = super::zero_conf_splice_depths(&config, true);
+		assert_eq!(
+			(trusted.inbound_splice_min_depth, trusted.outbound_splice_min_depth),
+			(Some(0), Some(0))
+		);
+		config.trust_own_splice_inputs_0conf = true;
+		let own = super::zero_conf_splice_depths(&config, false);
+		assert_eq!((own.inbound_splice_min_depth, own.outbound_splice_min_depth), (None, Some(0)));
+		let user_config = default_user_config(&config);
+		assert_eq!(user_config.channel_config.outbound_splice_min_depth, 0);
+		assert_eq!(user_config.channel_config.inbound_splice_min_depth, 6);
+	}
 
 	#[test]
 	fn channel_config_keeps_the_splice_depths_both_ways() {
