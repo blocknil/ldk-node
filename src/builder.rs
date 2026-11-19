@@ -1624,7 +1624,6 @@ impl ArcedNodeBuilder {
 	}
 }
 
-/// Builds a [`Node`] instance according to the options previously configured.
 /// Blocknil patch: a network graph for the bLIP-32 resolver of [`HRNResolverConfig::Blip32Via`],
 /// in which the only nodes that offer name resolution are `resolver_nodes`.
 ///
@@ -1634,6 +1633,11 @@ impl ArcedNodeBuilder {
 /// resolver node, joined to our own node by a placeholder channel (a graph only knows nodes that
 /// have channels), with an unsigned announcement of those two features. It is used for nothing
 /// else: never routed over, persisted or gossiped.
+///
+/// For now (Esra, 2026-11-19) this graph is preferred over a third fork. A small fork of
+/// `bitcoin-payment-instructions` with an explicit resolver-nodes option on LDK 0.3 may be the
+/// cleaner design later, especially if upstream doesn't add one; with such an option, this function
+/// goes away. (patch-notes/ldk-0.3-patch-inventory.md, decision 8.)
 #[cfg(feature = "unified-payments")]
 fn blip32_resolver_graph(
 	network: Network, our_node_id: PublicKey, resolver_nodes: &[PublicKey], logger: Arc<Logger>,
@@ -1675,6 +1679,7 @@ fn blip32_resolver_graph(
 	graph
 }
 
+/// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
