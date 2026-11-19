@@ -117,3 +117,35 @@ async fn resolve_name_returns_the_records_uri() {
 	node.stop().unwrap();
 	assert_eq!(node.resolve_name(BIP353_NAME), Err(NameResolutionError::NotRunning));
 }
+
+/// Blocknil: a wallet with an empty graph resolves a name through its provider alone
+/// (`HRNResolverConfig::Blip32Via`). The provider answers from DNS as a resolution service; the
+/// wallet validates the proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn resolve_name_via_the_provider_with_an_empty_graph() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	// The provider: announceable (alias and listening addresses), so it may offer the service.
+	let mut provider_config = random_config();
+	provider_config.node_config.hrn_config = dns_resolution(true);
+	let provider = setup_node(&chain_source, provider_config);
+
+	let mut wallet_config = random_config();
+	wallet_config.node_config.listening_addresses = None;
+	wallet_config.node_config.node_alias = None;
+	wallet_config.node_config.hrn_config = HumanReadableNamesConfig {
+		resolution_config: HRNResolverConfig::Blip32Via { resolver_nodes: vec![provider.node_id()] },
+	};
+	let wallet = setup_node(&chain_source, wallet_config);
+	let provider_address = provider.listening_addresses().unwrap().first().unwrap().clone();
+	wallet.connect(provider.node_id(), provider_address, false).unwrap();
+	assert!(wallet.network_graph().list_nodes().is_empty());
+
+	let uri = wallet.resolve_name(BIP353_NAME).unwrap();
+	assert!(uri.starts_with("bitcoin:"), "{uri}");
+	assert!(uri.contains("lno="), "{uri}");
+
+	wallet.stop().unwrap();
+	provider.stop().unwrap();
+}

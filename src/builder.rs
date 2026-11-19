@@ -1625,6 +1625,56 @@ impl ArcedNodeBuilder {
 }
 
 /// Builds a [`Node`] instance according to the options previously configured.
+/// Blocknil patch: a network graph for the bLIP-32 resolver of [`HRNResolverConfig::Blip32Via`],
+/// in which the only nodes that offer name resolution are `resolver_nodes`.
+///
+/// The resolver we use (`bitcoin-payment-instructions` at the revision upstream pins) picks the
+/// nodes it queries from its graph: any node announcing onion messages and DNS resolution. Its
+/// later versions take the nodes directly, but they are built on LDK 0.2. This graph holds each
+/// resolver node, joined to our own node by a placeholder channel (a graph only knows nodes that
+/// have channels), with an unsigned announcement of those two features. It is used for nothing
+/// else: never routed over, persisted or gossiped.
+#[cfg(feature = "unified-payments")]
+fn blip32_resolver_graph(
+	network: Network, our_node_id: PublicKey, resolver_nodes: &[PublicKey], logger: Arc<Logger>,
+) -> Graph {
+	use lightning::ln::msgs::UnsignedNodeAnnouncement;
+	use lightning::routing::gossip::NodeId;
+	use lightning::types::features::{ChannelFeatures, NodeFeatures};
+
+	let graph = Graph::new(network, Arc::clone(&logger));
+	let mut features = NodeFeatures::empty();
+	features.set_onion_messages_optional();
+	features.set_dns_resolution_optional();
+	for (short_channel_id, resolver) in resolver_nodes.iter().enumerate() {
+		let resolver_id = NodeId::from_pubkey(resolver);
+		let channel = graph.add_channel_from_partial_announcement(
+			short_channel_id as u64,
+			None,
+			0,
+			ChannelFeatures::empty(),
+			NodeId::from_pubkey(&our_node_id),
+			resolver_id,
+		);
+		let announcement = UnsignedNodeAnnouncement {
+			features: features.clone(),
+			timestamp: 1,
+			node_id: resolver_id,
+			rgb: [0; 3],
+			alias: NodeAlias([0; 32]),
+			addresses: Vec::new(),
+			excess_address_data: Vec::new(),
+			excess_data: Vec::new(),
+		};
+		if let Err(e) =
+			channel.and_then(|()| graph.update_node_from_unsigned_announcement(&announcement))
+		{
+			log_error!(logger, "Failed to set up {} as a bLIP-32 resolver: {}", resolver, e.err);
+		}
+	}
+	graph
+}
+
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
@@ -2378,9 +2428,21 @@ fn build_with_store_internal(
 			.hrn_config
 			.resolution_config
 		{
-			HRNResolverConfig::Blip32 => {
-				let hrn_res =
-					Arc::new(LDKOnionMessageDNSSECHrnResolver::new(Arc::clone(&network_graph)));
+			HRNResolverConfig::Blip32 | HRNResolverConfig::Blip32Via { .. } => {
+				// Blocknil patch: the resolver finds the nodes to ask in the graph it's given. For
+				// `Blip32Via`, that is a graph of its own holding only the given resolver nodes.
+				let resolver_graph = match &config.hrn_config.resolution_config {
+					HRNResolverConfig::Blip32Via { resolver_nodes } => {
+						Arc::new(blip32_resolver_graph(
+							config.network,
+							channel_manager.get_our_node_id(),
+							resolver_nodes,
+							Arc::clone(&logger),
+						))
+					},
+					_ => Arc::clone(&network_graph),
+				};
+				let hrn_res = Arc::new(LDKOnionMessageDNSSECHrnResolver::new(resolver_graph));
 				hrn_resolver = HRNResolver::Onion(Arc::clone(&hrn_res));
 				blip32_resolver = Some(Arc::clone(&hrn_res));
 
