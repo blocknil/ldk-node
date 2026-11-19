@@ -137,9 +137,9 @@ use bitcoin::{Address, Amount, BlockHash, Network};
 pub use builder::{BuildError, Builder};
 use chain::ChainSource;
 use config::{
-	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
-	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
-	RGS_SYNC_INTERVAL,
+	default_user_config, may_announce_channel, zero_conf_splice_depths, AsyncPaymentsRole,
+	ChannelConfig, Config, LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL,
+	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -442,6 +442,11 @@ impl Node {
 		self.runtime.block_on(self.wallet.unlock_unreferenced_outpoints(|outpoint| {
 			has_untracked_funding || referenced.contains(outpoint)
 		}))?;
+
+		// Blocknil patch: channels opened before our zero-conf splice depths were set (by an older
+		// version, or before a peer was trusted) keep the depths they were stored with, 6 by
+		// default. Set them before any peer connects, so no splice is negotiated with the old ones.
+		self.apply_zero_conf_splice_depths(&channels);
 
 		// Synchronize Lightning chain state before peers or event processing can act on stale
 		// confirmations. Each restored ChannelMonitor may have been persisted at a different tip.
@@ -1651,6 +1656,11 @@ impl Node {
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
 		user_config.channel_config = (channel_config.unwrap_or_default()).clone().into();
+		// Blocknil patch: the config just replaced carried our zero-conf splice depths (see
+		// `config::zero_conf_splice_depths`).
+		user_config
+			.channel_config
+			.apply(&zero_conf_splice_depths(&self.config, self.trusts_peer_0conf(&node_id)));
 
 		// Unannounced channels rely on LDK's default of 100% inbound HTLC value-in-flight
 		// to support large initial payments via LSPS2.
@@ -3573,6 +3583,53 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 		0
 	} else {
 		config.anchor_channels_config.per_channel_reserve_sats
+	}
+}
+
+/// Blocknil patch: zero-conf splice depths per channel (see `config::zero_conf_splice_depths`).
+impl Node {
+	/// Whether we accept zero-confirmation channels from `peer`, as the `OpenChannelRequest`
+	/// handler decides it: listed in [`Config::trusted_peers_0conf`], or an LSP added as trusted.
+	fn trusts_peer_0conf(&self, peer: &PublicKey) -> bool {
+		self.config.trusted_peers_0conf.contains(peer)
+			|| self.liquidity_source.get_lsp_trust_0conf(peer) == Some(true)
+	}
+
+	/// Lowers the splice depths of `channels` to what [`zero_conf_splice_depths`] asks for, where
+	/// they are higher. A depth is fixed when a splice is negotiated, so this must run before any
+	/// peer connects.
+	fn apply_zero_conf_splice_depths(&self, channels: &[LdkChannelDetails]) {
+		for channel in channels {
+			let peer = channel.counterparty.node_id;
+			let wanted = zero_conf_splice_depths(&self.config, self.trusts_peer_0conf(&peer));
+			let Some(config) = channel.config else { continue };
+			let lowers = |want: Option<u32>, have: u32| want.is_some_and(|want| want < have);
+			if !lowers(wanted.inbound_splice_min_depth, config.inbound_splice_min_depth)
+				&& !lowers(wanted.outbound_splice_min_depth, config.outbound_splice_min_depth)
+			{
+				continue;
+			}
+			match self.channel_manager.update_partial_channel_config(
+				&peer,
+				&[channel.channel_id],
+				&wanted,
+			) {
+				Ok(()) => log_info!(
+					self.logger,
+					"Set the splice depths of channel {} with {} to {:?}/{:?} (inbound/outbound)",
+					channel.channel_id,
+					peer,
+					wanted.inbound_splice_min_depth,
+					wanted.outbound_splice_min_depth,
+				),
+				Err(e) => log_error!(
+					self.logger,
+					"Failed to set the splice depths of channel {}: {:?}",
+					channel.channel_id,
+					e
+				),
+			}
+		}
 	}
 }
 
