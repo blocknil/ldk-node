@@ -242,6 +242,12 @@ async fn claim_only_start_claims_without_the_chain() {
 	let claim_time = claim_started_at.elapsed();
 	expect_payment_successful_event!(payer, payment_id, None);
 
+	// It learned no gossip from the provider, whose graph has the payer's channel.
+	assert!(!provider.network_graph().list_channels().is_empty());
+	tokio::time::sleep(Duration::from_secs(1)).await;
+	assert!(wallet.network_graph().list_channels().is_empty());
+	assert!(wallet.network_graph().list_nodes().is_empty());
+
 	println!(
 		"Claim-only start: {:?}; claim: {:?}; process threads and resident bytes before/after start: {:?} / {:?}; dropped graph/scorer writes so far: {}",
 		start_time,
@@ -253,6 +259,10 @@ async fn claim_only_start_claims_without_the_chain() {
 
 	wallet.stop().unwrap();
 	drop(wallet);
+	println!(
+		"Graph/scorer writes the store wrapper dropped: {}",
+		claim_store.dropped_writes.load(Ordering::Relaxed)
+	);
 
 	// The same over an Electrum server that doesn't answer: its client isn't even started.
 	let wallet = {
