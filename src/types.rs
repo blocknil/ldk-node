@@ -315,11 +315,76 @@ pub(crate) type OnionMessenger = lightning::onion_message::messenger::OnionMesse
 	IgnoringMessageHandler,
 >;
 
-pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
+pub(crate) type DefaultMessageRouter = lightning::onion_message::messenger::DefaultMessageRouter<
 	Arc<Graph>,
 	Arc<Logger>,
 	Arc<KeysManager>,
 >;
+
+/// Blocknil patch: LDK's [`DefaultMessageRouter`], except on a node that routes its onion messages
+/// via its LSP ([`Config::route_messages_via_lsp`]).
+///
+/// LDK sends a message straight to the first node of its path: a connected peer, or a node whose
+/// addresses are in the network graph. A wallet's graph has none (a claim-only node has no graph,
+/// a rapid-gossip graph carries no addresses), so LDK waits for a connection to, say, a BOLT 12
+/// payer's LSP that never opens. Such a node instead hands every message it cannot give a
+/// connected peer to its LSP, one hop, and the LSP forwards it. The phone dials no third party.
+///
+/// [`Config::route_messages_via_lsp`]: crate::config::Config::route_messages_via_lsp
+pub(crate) struct MessageRouter {
+	inner: DefaultMessageRouter,
+	/// The LSP every message goes through that no connected peer can take.
+	via: Option<PublicKey>,
+}
+
+impl MessageRouter {
+	pub(crate) fn new(
+		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, via: Option<PublicKey>,
+	) -> Self {
+		Self { inner: DefaultMessageRouter::new(network_graph, entropy_source), via }
+	}
+}
+
+impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
+	fn find_path(
+		&self, sender: PublicKey, peers: Vec<PublicKey>,
+		destination: lightning::onion_message::messenger::Destination,
+	) -> Result<lightning::onion_message::messenger::OnionMessagePath, ()> {
+		use lightning::blinded_path::IntroductionNode;
+		use lightning::onion_message::messenger::{Destination, OnionMessagePath};
+
+		if let Some(via) = self.via {
+			// The node the message goes to first. A short-channel-id introduction can't be told
+			// without the graph, which this node may not have: the LSP resolves it.
+			let first_node = match &destination {
+				Destination::Node(node_id) => Some(*node_id),
+				Destination::BlindedPath(path) => match path.introduction_node() {
+					IntroductionNode::NodeId(node_id) => Some(*node_id),
+					IntroductionNode::DirectedShortChannelId(..) => None,
+				},
+			};
+			let direct = first_node
+				.map_or(false, |first| first == sender || first == via || peers.contains(&first));
+			if !direct {
+				return Ok(OnionMessagePath {
+					intermediate_nodes: vec![via],
+					destination,
+					first_node_addresses: vec![],
+				});
+			}
+		}
+		self.inner.find_path(sender, peers, destination)
+	}
+
+	fn create_blinded_paths<T: bitcoin::secp256k1::Signing + bitcoin::secp256k1::Verification>(
+		&self, recipient: PublicKey, local_node_receive_key: lightning::sign::ReceiveAuthKey,
+		context: lightning::blinded_path::message::MessageContext,
+		peers: Vec<lightning::blinded_path::message::MessageForwardNode>,
+		secp_ctx: &bitcoin::secp256k1::Secp256k1<T>,
+	) -> Result<Vec<lightning::blinded_path::message::BlindedMessagePath>, ()> {
+		self.inner.create_blinded_paths(recipient, local_node_receive_key, context, peers, secp_ctx)
+	}
+}
 
 pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,

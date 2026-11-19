@@ -760,6 +760,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Blocknil patch: sends the onion messages this node cannot hand to a connected peer through
+	/// its LSP. See [`Config::route_messages_via_lsp`].
+	pub fn set_route_messages_via_lsp(&mut self, route_messages_via_lsp: bool) -> &mut Self {
+		self.config.route_messages_via_lsp = route_messages_via_lsp;
+		self
+	}
+
 	/// Sets background probing config.
 	///
 	/// Use [`ProbingConfigBuilder`] to build the configuration:
@@ -2271,8 +2278,17 @@ fn build_with_store_internal(
 		}
 	}
 
-	let message_router =
-		Arc::new(MessageRouter::new(Arc::clone(&network_graph), Arc::clone(&keys_manager)));
+	// Blocknil patch: see `Config::route_messages_via_lsp`.
+	let route_messages_via = if config.route_messages_via_lsp {
+		liquidity_source_config.and_then(|lsc| lsc.lsp_nodes.first()).map(|lsp| lsp.node_id)
+	} else {
+		None
+	};
+	let message_router = Arc::new(MessageRouter::new(
+		Arc::clone(&network_graph),
+		Arc::clone(&keys_manager),
+		route_messages_via,
+	));
 
 	// Initialize the ChannelManager
 	let channel_manager = {
