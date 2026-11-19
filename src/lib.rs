@@ -429,6 +429,16 @@ impl Node {
 		// default. Set them before any peer connects, so no splice is negotiated with the old ones.
 		self.apply_zero_conf_splice_depths(&channels);
 
+		// Blocknil patch: rust-lightning doesn't persist a channel's `accept_underpaying_htlcs`
+		// (`LegacyChannelConfig` leaves it out), so after a restart a just-in-time channel from
+		// our LSP refuses the payment it was opened for: the LSP skims its opening fee. It is set
+		// at accept (`Event::OpenChannelRequest`); set it again on every channel with an LSP. The
+		// skimmed fee is still checked before claiming. The fee provider's channels get it when
+		// the wallet sets the provider, as it does after each start (`Node::set_fee_provider`).
+		for lsp in self.liquidity_source.lsp_node_ids() {
+			self.provider_fees.allow_underpaying(&lsp);
+		}
+
 		// Synchronize Lightning chain state before peers or event processing can act on stale
 		// confirmations. Each restored ChannelMonitor may have been persisted at a different tip.
 		self.runtime.block_on(self.chain_source.initialize_wallets(

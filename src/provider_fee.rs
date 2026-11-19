@@ -127,13 +127,18 @@ impl ProviderFees {
 		}
 	}
 
-	/// Sets `accept_underpaying_htlcs` on our channels with `peer` when it is our provider: a
+	/// Sets `accept_underpaying_htlcs` on our channels with `peer` when it is our provider: when it
+	/// is set, and whenever a channel becomes ready (rust-lightning doesn't persist the flag). A
 	/// payment it kept a fee out of carries less than the payer sent, and LDK refuses that HTLC
 	/// otherwise. The fee is still checked against the allowance before claiming.
 	pub(crate) fn allow_underpaying_from(&self, peer: &PublicKey) {
-		if self.fee_provider().as_ref() != Some(peer) {
-			return;
+		if self.fee_provider().as_ref() == Some(peer) {
+			self.allow_underpaying(peer);
 		}
+	}
+
+	/// Sets `accept_underpaying_htlcs` on our channels with `peer`.
+	pub(crate) fn allow_underpaying(&self, peer: &PublicKey) {
 		let channel_ids: Vec<_> = self
 			.channel_manager
 			.list_channels_with_counterparty(peer)

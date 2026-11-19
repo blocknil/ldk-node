@@ -2460,6 +2460,8 @@ where
 				// Blocknil patch: a payment held for this client goes out now that their channel
 				// is ready, or bigger: a splice that locked is re-signalled as `ChannelReady`.
 				self.held_payments.release_for(counterparty_node_id);
+				// Blocknil patch: a new channel with our fee provider can carry its fee too.
+				self.provider_fees.allow_underpaying_from(&counterparty_node_id);
 
 				let event = Event::ChannelReady {
 					channel_id,
