@@ -847,6 +847,16 @@ pub struct ChannelConfig {
 	///
 	/// Please refer to [`LdkChannelConfig`] for further details.
 	pub accept_underpaying_htlcs: bool,
+	/// The minimum number of confirmations before we lock a splice we put no inputs or outputs
+	/// into. Zero locks it before it confirms, and such a splice can then no longer be fee-bumped.
+	///
+	/// Please refer to [`LdkChannelConfig`] for further details.
+	pub inbound_splice_min_depth: u32,
+	/// The minimum number of confirmations before we lock a splice we put inputs or outputs into.
+	/// Zero locks it before it confirms, and such a splice can then no longer be fee-bumped.
+	///
+	/// Please refer to [`LdkChannelConfig`] for further details.
+	pub outbound_splice_min_depth: u32,
 }
 
 impl From<LdkChannelConfig> for ChannelConfig {
@@ -858,6 +868,8 @@ impl From<LdkChannelConfig> for ChannelConfig {
 			max_dust_htlc_exposure: value.max_dust_htlc_exposure.into(),
 			force_close_avoidance_max_fee_satoshis: value.force_close_avoidance_max_fee_satoshis,
 			accept_underpaying_htlcs: value.accept_underpaying_htlcs,
+			inbound_splice_min_depth: value.inbound_splice_min_depth,
+			outbound_splice_min_depth: value.outbound_splice_min_depth,
 		}
 	}
 }
@@ -871,6 +883,8 @@ impl From<ChannelConfig> for LdkChannelConfig {
 			max_dust_htlc_exposure: value.max_dust_htlc_exposure.into(),
 			force_close_avoidance_max_fee_satoshis: value.force_close_avoidance_max_fee_satoshis,
 			accept_underpaying_htlcs: value.accept_underpaying_htlcs,
+			inbound_splice_min_depth: value.inbound_splice_min_depth,
+			outbound_splice_min_depth: value.outbound_splice_min_depth,
 		}
 	}
 }
@@ -948,6 +962,19 @@ mod tests {
 		ElectrumSyncConfig, EsploraSyncConfig, NodeAlias, SocketAddress,
 		DEFAULT_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
 	};
+
+	#[test]
+	fn channel_config_keeps_the_splice_depths_both_ways() {
+		// Blocknil: a per-channel update goes through this conversion. Dropping the splice depths
+		// here would silently reset them to rust-lightning's default of 6 confirmations.
+		let mut ldk = super::LdkChannelConfig::default();
+		ldk.inbound_splice_min_depth = 0;
+		ldk.outbound_splice_min_depth = 3;
+		let ours = super::ChannelConfig::from(ldk);
+		assert_eq!(ours.inbound_splice_min_depth, 0);
+		assert_eq!(ours.outbound_splice_min_depth, 3);
+		assert_eq!(super::LdkChannelConfig::from(ours), ldk);
+	}
 
 	#[test]
 	fn node_announce_channel() {
