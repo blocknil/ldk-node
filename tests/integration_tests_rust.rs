@@ -8566,15 +8566,17 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 		service_funds_sat,
 		client_trusts_0conf,
 		max_client_to_self_delay,
+		false,
 	)
 	.await;
 	(service_node, client_node, payer_node)
 }
 
 /// Also returns the service's test config and LSPS2 config, to build it again over its store.
+/// With `lsps5`, the service and the client also take their LSPS5 roles.
 async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
-	client_trusts_0conf: bool, max_client_to_self_delay: u32,
+	client_trusts_0conf: bool, max_client_to_self_delay: u32, lsps5: bool,
 ) -> (TestConfig, LSPS2ServiceConfig, TestNode, TestNode, TestNode) {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
@@ -8600,6 +8602,9 @@ async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
 	setup_builder!(service_builder, service_config.node_config);
 	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
 	service_builder.enable_liquidity_provider(lsps2_service_config.clone());
+	if lsps5 {
+		service_builder.set_liquidity_provider_lsps5(Default::default());
+	}
 	let service_node = service_builder
 		.build_with_store(service_config.node_entropy.clone().into(), service_store)
 		.unwrap();
@@ -8615,6 +8620,9 @@ async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
 		None,
 		client_trusts_0conf,
 	);
+	if lsps5 {
+		client_builder.set_liquidity_client_lsps5();
+	}
 	let client_node = client_builder.build(client_config.node_entropy.into()).unwrap();
 	client_node.start().unwrap();
 
@@ -9106,6 +9114,7 @@ async fn lsps2_payment_stuck_by_a_restart_mid_open_is_failed_back() {
 			10_000_000,
 			true,
 			1024,
+			false,
 		)
 		.await;
 	service_node.set_hold_duration(Duration::from_secs(120));
@@ -9191,6 +9200,108 @@ async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 	assert!(offer.valid_until_unix >= before + lifetime - 5);
 	assert!(offer.valid_until_unix <= before + lifetime + 60);
 	assert!(client_node.list_channels().is_empty(), "nothing was bought");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
+	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook; a first
+	// payment then waits for the client while it is offline, the service is told to wake it
+	// (`set_payment_held_handler`, as the provider does), and the signed notification reaches the
+	// service's webhook sender.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (_, _, service_node, client_node, payer_node) =
+		setup_lsps2_nodes_inner(&bitcoind, &electrsd, service_store, 10_000_000, true, 1024, true)
+			.await;
+	let service_id = service_node.node_id();
+	let client_id = client_node.node_id();
+
+	let posts = Arc::new(std::sync::Mutex::new(Vec::<ldk_node::liquidity::WebhookPost>::new()));
+	let sent = Arc::clone(&posts);
+	service_node.set_webhook_sender(Arc::new(move |post| sent.lock().unwrap().push(post)));
+	let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let wake = Arc::clone(&woken);
+	service_node
+		.set_payment_held_handler(Arc::new(move |client| wake.lock().unwrap().push(client)));
+	let posts_with = |method: &str| -> Vec<ldk_node::liquidity::WebhookPost> {
+		posts.lock().unwrap().iter().filter(|p| p.body.contains(method)).cloned().collect()
+	};
+	async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+		tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+			while !done() {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		})
+		.await
+		.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+	}
+
+	// A first JIT payment, so the client has a channel with the service (LSPS5 registration needs
+	// one).
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("lsps5")).unwrap());
+	let invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(50_000_000, &description.clone().into(), 3600)
+		.unwrap();
+	let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
+	expect_channel_pending_event!(service_node, client_id);
+	expect_channel_ready_event!(service_node, client_id);
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_id);
+	expect_channel_ready_event!(client_node, service_id);
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	expect_payment_received_event!(client_node, 50_000_000 * 99 / 100);
+	// The service funds the next JIT channel from the change of this one's funding.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	service_node.sync_wallets().unwrap();
+
+	// Register: the service confirms it to the webhook itself.
+	let url = "https://push.example.org/wake/abc";
+	client_node.set_webhook(service_id, "blocknil".to_string(), url.to_string()).unwrap();
+	wait_until("the registration notification", || {
+		!posts_with("lsps5.webhook_registered").is_empty()
+	})
+	.await;
+	assert_eq!(posts_with("lsps5.webhook_registered")[0].url, url);
+
+	// A second first payment, larger than the channel, waits for the client, which is offline.
+	let amount_msat = 200_000_000;
+	let invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(amount_msat, &description.into(), 3600)
+		.unwrap();
+	client_node.stop().unwrap();
+	wait_until("the client to disconnect", || {
+		!service_node.list_peers().iter().any(|p| p.node_id == client_id && p.is_connected)
+	})
+	.await;
+	let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
+	wait_until("the wake-up", || !woken.lock().unwrap().is_empty()).await;
+	assert_eq!(*woken.lock().unwrap(), vec![client_id]);
+
+	// The provider's handler notifies the client's webhook.
+	assert!(service_node.notify_payment_incoming(client_id));
+	wait_until("the payment notification", || !posts_with("lsps5.payment_incoming").is_empty())
+		.await;
+	let post = posts_with("lsps5.payment_incoming").remove(0);
+	assert_eq!(post.url, url);
+	assert!(post.headers.iter().any(|(name, _)| name == "x-lsps5-signature"));
+	assert!(post.headers.iter().any(|(name, _)| name == "x-lsps5-timestamp"));
+	// Within the ten-second cooldown, a second one isn't sent.
+	assert!(!service_node.notify_payment_incoming(client_id));
+
+	// The woken client comes back and the payment goes through.
+	client_node.start().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	client_node.connect(service_id, service_addr, false).unwrap();
+	expect_channel_pending_event!(service_node, client_id);
+	expect_channel_ready_event!(service_node, client_id);
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_id);
+	expect_channel_ready_event!(client_node, service_id);
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

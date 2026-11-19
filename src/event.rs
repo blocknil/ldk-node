@@ -2962,6 +2962,25 @@ where
 				if let NextMessageHop::NodeId(peer_node_id) = next_hop {
 					if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 						om_mailbox.onion_message_intercepted(peer_node_id, message);
+						// Blocknil patch: the message waits for an offline peer. If it is a client
+						// of ours (a channel with us), that is a phone with its app closed: wake it
+						// now (LSPS5), or the payer's invoice request times out.
+						let lsps5_service = self.liquidity_source.lsps5_service();
+						let is_client = || {
+							self.channel_manager
+								.list_channels_with_counterparty(&peer_node_id)
+								.iter()
+								.any(|channel| channel.is_channel_ready)
+						};
+						if lsps5_service.is_enabled() && is_client() {
+							let woken = lsps5_service.notify_onion_message_incoming(peer_node_id);
+							log_debug!(
+								self.logger,
+								"Onion message held for {}; webhook sent: {}",
+								peer_node_id,
+								woken
+							);
+						}
 					} else {
 						log_trace!(
 							self.logger,

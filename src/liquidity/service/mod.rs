@@ -7,3 +7,4 @@
 
 pub(crate) mod jit_wait;
 pub(crate) mod lsps2;
+pub(crate) mod lsps5;

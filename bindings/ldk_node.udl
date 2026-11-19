@@ -177,6 +177,7 @@ enum NodeError {
 	"GossipUpdateFailed",
 	"GossipUpdateTimeout",
 	"LiquidityRequestFailed",
+	"WebhookRegistrationFailed",
 	"UriParameterParsingFailed",
 	"InvalidAddress",
 	"InvalidSocketAddress",

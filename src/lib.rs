@@ -3247,6 +3247,41 @@ impl Node {
 			.block_on(async move { lsps2_client.opening_fee_terms(&connection_manager).await })
 	}
 
+	/// Where LSPS5 notifications go (see [`liquidity::OnWebhook`]): the provider POSTs them. It is
+	/// called on a thread of its own, so it may block; a failure drops the notification, as the
+	/// payment it announces waits only for the hold duration. Blocknil patch.
+	pub fn set_webhook_sender(&self, sender: liquidity::OnWebhook) {
+		self.liquidity_source.lsps5_service().set_webhook_sender(sender);
+	}
+
+	/// Tells `client`'s registered webhooks that a payment is waiting for it ([LSPS5]), which
+	/// wakes its phone. `false` when LDK refused: no LSPS5 service
+	/// ([`Builder::set_liquidity_provider_lsps5`]), or the client was notified less than ten
+	/// seconds ago. A client without a webhook gets nothing. Blocknil patch.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/blob/master/blip-0055.md
+	pub fn notify_payment_incoming(&self, client: PublicKey) -> bool {
+		self.liquidity_source.lsps5_service().notify_payment_incoming(client)
+	}
+
+	/// Tells `client`'s registered webhooks that an onion message (a BOLT12 invoice request,
+	/// typically) is waiting for it. As [`Node::notify_payment_incoming`]. The node also does this
+	/// itself when it holds an onion message for an offline client of its own. Blocknil patch.
+	pub fn notify_onion_message_incoming(&self, client: PublicKey) -> bool {
+		self.liquidity_source.lsps5_service().notify_onion_message_incoming(client)
+	}
+
+	/// Registers `url` as `app_name`'s webhook with the LSP `lsp` ([LSPS5]), so it can wake this
+	/// phone when a payment waits for it while the app is closed. Needs
+	/// [`Builder::set_liquidity_client_lsps5`]; the URL must be HTTPS. The LSP answers later, and
+	/// registering again replaces the URL for the same `app_name`, so a wallet can repeat the call
+	/// when it starts. Blocknil patch.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/blob/master/blip-0055.md
+	pub fn set_webhook(&self, lsp: PublicKey, app_name: String, url: String) -> Result<(), Error> {
+		self.liquidity_source.lsps5_client().set_webhook(lsp, app_name, url)
+	}
+
 	/// First payments waiting for their offline client to connect so their just-in-time channel
 	/// can open: `(client, amount to forward in msat)`. Blocknil patch.
 	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
