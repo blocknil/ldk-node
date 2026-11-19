@@ -770,3 +770,25 @@ async fn accept_underpaying_is_set_again_at_start_and_on_channel_ready() {
 	provider.stop().unwrap();
 	customer.stop().unwrap();
 }
+
+/// LDK builds a BOLT 12 invoice's paths only through channels with the room for the amount, so a
+/// customer short of room couldn't even answer an offer payment. With its provider set, its
+/// invoice carries a path through the provider: the payment reaches it, is reported short of
+/// room, and arrives once room is spliced in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_payment_larger_than_the_room_reaches_the_provider() {
+	let s = setup(&[1_500_000], 300_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	s.customer.set_fee_provider(Some(s.provider.node_id()));
+	let offer = s.customer.bolt12_payment().receive_variable_amount("room", None).unwrap();
+
+	s.payer.bolt12_payment().send_using_amount(&offer, 400_000_000, None, None, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reached the provider");
+	assert_eq!(short.customer, s.customer.node_id());
+	assert_eq!(short.amount_msat, 400_000_000);
+	s.provider.splice_in(&s.customer_channel(), s.customer.node_id(), 300_000, None).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, 0).unwrap();
+	wait_for(&s.customer, "the offer payment", is_received(400_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	s.stop();
+}

@@ -86,8 +86,9 @@ fn lapsed(allowance: &ProviderFeeAllowance, now: u64) -> bool {
 }
 
 pub(crate) struct ProviderFees {
-	/// The only peer that may keep a fee outside an LSPS2 just-in-time channel open.
-	fee_provider: RwLock<Option<PublicKey>>,
+	/// The only peer that may keep a fee outside an LSPS2 just-in-time channel open. Shared with
+	/// the router, which gives our BOLT 12 invoices a path through it.
+	fee_provider: Arc<RwLock<Option<PublicKey>>>,
 	allowances: Mutex<Vec<ProviderFeeAllowance>>,
 	kv_store: Arc<DynStore>,
 	channel_manager: Arc<ChannelManager>,
@@ -97,7 +98,8 @@ pub(crate) struct ProviderFees {
 impl ProviderFees {
 	/// Reads the allowances r8 or an earlier run saved.
 	pub(crate) async fn load(
-		kv_store: Arc<DynStore>, channel_manager: Arc<ChannelManager>, logger: Arc<Logger>,
+		fee_provider: Arc<RwLock<Option<PublicKey>>>, kv_store: Arc<DynStore>,
+		channel_manager: Arc<ChannelManager>, logger: Arc<Logger>,
 	) -> Result<Self, Error> {
 		let allowances = match KVStore::read(&*kv_store, NAMESPACE, "", ALLOWANCES_KEY).await {
 			Ok(bytes) => decode_allowances(&bytes),
@@ -108,7 +110,7 @@ impl ProviderFees {
 			},
 		};
 		Ok(Self {
-			fee_provider: RwLock::new(None),
+			fee_provider,
 			allowances: Mutex::new(allowances),
 			kv_store,
 			channel_manager,

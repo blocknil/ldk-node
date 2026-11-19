@@ -2302,17 +2302,23 @@ fn build_with_store_internal(
 	}
 
 	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
-	let router = Arc::new(LSPS2Router::new(
-		DefaultRouter::new(
+	// Blocknil patch: our provider (`Node::set_fee_provider`), shared by the router (its BOLT 12
+	// path) and the fee allowances.
+	let fee_provider = Arc::new(RwLock::new(None));
+	let router = Arc::new(
+		LSPS2Router::new(
+			DefaultRouter::new(
+				Arc::clone(&network_graph),
+				Arc::clone(&logger),
+				Arc::clone(&keys_manager),
+				Arc::clone(&scorer),
+				scoring_fee_params,
+			),
 			Arc::clone(&network_graph),
-			Arc::clone(&logger),
 			Arc::clone(&keys_manager),
-			Arc::clone(&scorer),
-			scoring_fee_params,
-		),
-		Arc::clone(&network_graph),
-		Arc::clone(&keys_manager),
-	));
+		)
+		.with_provider_path(Arc::clone(&fee_provider)),
+	);
 
 	let mut user_config = default_user_config(&config);
 
@@ -2577,6 +2583,7 @@ fn build_with_store_internal(
 	let provider_fees = Arc::new(
 		runtime
 			.block_on(ProviderFees::load(
+				fee_provider,
 				Arc::clone(&kv_store),
 				Arc::clone(&channel_manager),
 				Arc::clone(&logger),
