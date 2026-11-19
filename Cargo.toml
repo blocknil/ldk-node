@@ -147,6 +147,11 @@ regex = "1.5.6"
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 ldk-node-062 = { package = "ldk-node", version = "=0.6.2" }
 ldk-node-070 = { package = "ldk-node", version = "=0.7.0" }
+# Blocknil: our fork at blocknil-0.7.1-r8, for tests/upgrade_r8_tests.rs. Its rust-lightning fork
+# comes from the [patch.crates-io] below. A git dependency, not a path one: Cargo names a path
+# dependency's cdylib-capable lib without a hash, and both crates' libs are `ldk_node`, so the r8
+# lib would overwrite this one's.
+ldk-node-r8 = { package = "ldk-node", git = "https://github.com/blocknil/ldk-node", rev = "62af5f0b0d4d875702494e1b9f11525f612da62f" }
 
 # Test binaries are provided via scripts/download_bitcoind_electrs.sh.
 # Keep automatic downloads disabled to avoid the yanked zip dependency.
@@ -259,3 +264,19 @@ lightning-transaction-sync = { path = "../spike-rl-rc4/lightning-transaction-syn
 lightning-liquidity = { path = "../spike-rl-rc4/lightning-liquidity" }
 lightning-macros = { path = "../spike-rl-rc4/lightning-macros" }
 lightning-dns-resolver = { path = "../spike-rl-rc4/lightning-dns-resolver" }
+
+# Blocknil: ldk-node-r8 (above) runs on our rust-lightning fork at the r8 rev, as it does in the
+# wallet and the provider. The fork's own [patch.crates-io] doesn't apply to it as a dependency, so
+# it is repeated here. It replaces crates.io's lightning 0.2.8 for ldk-node-070 too: the fork is
+# 0.2.8 plus patches that keep upstream's API.
+[patch.crates-io]
+lightning = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-types = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-invoice = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-net-tokio = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-persister = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-background-processor = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-rapid-gossip-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-block-sync = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-liquidity = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
+lightning-macros = { git = "https://github.com/blocknil/rust-lightning", rev = "1739171663a050cb6754362db30b5b7d202e39f3" }
