@@ -421,6 +421,18 @@ pub enum HRNResolverConfig {
 	///
 	/// [bLIP-32]: https://github.com/lightning/blips/blob/master/blip-0032.md
 	Blip32,
+	/// Blocknil patch: use [bLIP-32] to ask exactly the given nodes (a wallet's provider, say) to
+	/// resolve names for us.
+	///
+	/// [`Self::Blip32`] asks nodes the network graph shows offering the service: a wallet with an
+	/// empty or rapid-gossip graph finds none, and one with a full graph sends the name to nodes
+	/// it doesn't know.
+	///
+	/// [bLIP-32]: https://github.com/lightning/blips/blob/master/blip-0032.md
+	Blip32Via {
+		/// The nodes to send resolution queries to.
+		resolver_nodes: Vec<PublicKey>,
+	},
 	/// Resolve names locally using a specific DNS server.
 	Dns {
 		/// The IP and port of the DNS server.
