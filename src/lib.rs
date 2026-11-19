@@ -222,7 +222,7 @@ use crate::config::{LIQUIDITY_DISCOVERY_RETRY_INITIAL_DELAY, LIQUIDITY_DISCOVERY
 use crate::ffi::{maybe_deref, maybe_map_fee_rate_opt, maybe_wrap, FfiFeeRate};
 use crate::liquidity::Liquidity;
 use crate::scoring::setup_background_pathfinding_scores_sync;
-use crate::wallet::{FundingAmount, DUST_LIMIT_SATS};
+use crate::wallet::{ChangeKeepingWallet, FundingAmount, DUST_LIMIT_SATS};
 
 #[cfg(not(feature = "uniffi"))]
 type NodeFeatures = LdkNodeFeatures;
@@ -2179,6 +2179,7 @@ impl Node {
 	fn splice_in_inner(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		splice_amount_sats: FundingAmount, min_fee_rate: Option<bitcoin::FeeRate>,
+		keep_change: bool,
 	) -> Result<(), Error> {
 		let open_channels =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
@@ -2221,6 +2222,27 @@ impl Node {
 			};
 
 			let contribution = match splice_amount_sats {
+				// Blocknil patch: `splice_in_with_change` selects only coins that leave change.
+				FundingAmount::Exact { amount_sats } if keep_change => self
+					.runtime
+					.block_on(funding_template.splice_in(
+						Amount::from_sat(amount_sats),
+						feerate,
+						max_feerate,
+						ChangeKeepingWallet(Arc::clone(&self.wallet)),
+					))
+					.map_err(|e| {
+						log_error!(
+							self.logger,
+							"Failed to splice channel: {}: no selection of the wallet's coins leaves a change output worth spending at {} sat/kw",
+							e,
+							feerate.to_sat_per_kwu(),
+						);
+						match e {
+							FundingContributionError::CoinSelectionFailed => Error::InsufficientFunds,
+							_ => Error::ChannelSplicingFailed,
+						}
+					})?,
 				FundingAmount::Exact { amount_sats } => self
 					.runtime
 					.block_on(funding_template.splice_in(
@@ -2429,6 +2451,7 @@ impl Node {
 			counterparty_node_id,
 			FundingAmount::Exact { amount_sats: splice_amount_sats },
 			maybe_map_fee_rate_opt(min_fee_rate),
+			false,
 		)
 	}
 
@@ -2468,6 +2491,36 @@ impl Node {
 			counterparty_node_id,
 			FundingAmount::Max,
 			maybe_map_fee_rate_opt(min_fee_rate),
+			false,
+		)
+	}
+
+	/// Adds `splice_amount_sats` to an existing channel from the on-chain wallet, as
+	/// [`Node::splice_in`] does, but only with coins that leave a change output worth spending on
+	/// its own at the splice's feerate: above dust, and above the fee for spending it. If no
+	/// selection of the confirmed coins does, nothing is contributed and
+	/// [`NodeError::InsufficientFunds`] is returned.
+	///
+	/// A splice with a change output can be pushed by a child spending that output (CPFP), which
+	/// is all that is left for a zero-conf splice: rust-lightning doesn't replace those by fee.
+	/// [`Node::splice_in`] can return a splice without one, as the coin selection prefers coins
+	/// that need no change. A later [`Node::bump_channel_funding_fee`] is not held to this.
+	///
+	/// Blocknil patch: for a provider's splice on arrival.
+	pub fn splice_in_with_change(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		splice_amount_sats: u64, min_fee_rate: Option<FfiFeeRate>,
+	) -> Result<(), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		self.splice_in_inner(
+			user_channel_id,
+			counterparty_node_id,
+			FundingAmount::Exact { amount_sats: splice_amount_sats },
+			maybe_map_fee_rate_opt(min_fee_rate),
+			true,
 		)
 	}
 

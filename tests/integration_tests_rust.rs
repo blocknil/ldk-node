@@ -6103,6 +6103,116 @@ async fn pending_splice_is_listed_until_it_locks_also_after_a_restart() {
 	node_b.stop().unwrap();
 }
 
+/// `splice_in_with_change` splices in only with coins that leave a change output worth spending at
+/// the splice's feerate, which a child can spend to push a stuck splice (CPFP). Node A holds a coin
+/// of 300,000 sats and one of 2,000,000. Asked for all of them less a fee a changeless splice of
+/// both covers, but not with such change on top, it is refused before anything is contributed.
+/// Asked for an amount the smaller coin pays with nothing to spare, which the default selection
+/// takes without change, it takes the larger coin and keeps the change.
+///
+/// Blocknil patch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_in_with_change_keeps_a_change_output_or_is_refused() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node_b = setup_node(&chain_source, random_config());
+	let mut config_a = random_config();
+	// No anchor reserve, so that every coin counts as spendable.
+	config_a.node_config.anchor_channels_config.trusted_peers_no_reserve.push(node_b.node_id());
+	let node_a = setup_node(&chain_source, config_a);
+
+	premine_blocks(&bitcoind.client, &electrsd.client).await;
+	let address_b = node_b.onchain_payment().new_address().unwrap();
+	distribute_funds_unconfirmed(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_b],
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	for sats in [300_000, 2_000_000] {
+		let address_a = node_a.onchain_payment().new_address().unwrap();
+		distribute_funds_unconfirmed(
+			&bitcoind.client,
+			&electrsd.client,
+			vec![address_a],
+			Amount::from_sat(sats),
+		)
+		.await;
+	}
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	open_channel(&node_b, &node_a, 1_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	let user_channel_id = expect_channel_ready_event!(node_a, node_b.node_id());
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 2_300_000);
+
+	// 50 sat/vB. A splice of both coins without change pays about 14,300 sats; with change about
+	// 15,800, and the change must hold more than the 3,400 sats spending it costs.
+	let fee_rate = FeeRate::from_sat_per_kwu(12_500);
+	let min_change_sats = 68 * 50 + 1;
+	assert_eq!(
+		node_a.splice_in_with_change(
+			&user_channel_id,
+			node_b.node_id(),
+			2_300_000 - 15_000,
+			Some(fee_rate)
+		),
+		Err(NodeError::InsufficientFunds)
+	);
+	assert!(node_a.next_event().is_none(), "nothing was contributed");
+
+	// The splice of the smaller coin alone without change pays about 10,900 sats, so this amount
+	// leaves about 1,100 over: within what the default selection gives the miner rather than make
+	// change of.
+	let amount_sats = 300_000 - 12_000;
+	node_a
+		.splice_in_with_change(&user_channel_id, node_b.node_id(), amount_sats, Some(fee_rate))
+		.unwrap();
+	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
+	wait_for_tx(&electrsd.client, txo.txid).await;
+	let splice_tx = electrsd.client.transaction_get(&txo.txid).unwrap();
+	let change: Vec<&bitcoin::TxOut> =
+		splice_tx.output.iter().filter(|output| !output.script_pubkey.is_p2wsh()).collect();
+	assert_eq!(change.len(), 1, "one change output: {:?}", splice_tx.output);
+	assert!(change[0].value.to_sat() >= min_change_sats, "change {}", change[0].value);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	// What the change and LDK's fee leave goes to the channel: the amount, give or take the
+	// rounding between BDK's fee estimate and LDK's.
+	let added_sats = node_a.list_channels()[0].channel_value_sats - 1_000_000;
+	assert!(added_sats >= amount_sats && added_sats < amount_sats + 100, "added {added_sats}");
+	assert_eq!(
+		node_a.list_balances().total_onchain_balance_sats,
+		2_300_000 - added_sats - splice_fee_sats(&electrsd.client, &splice_tx)
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+/// The fee `tx` paid, from its inputs' previous outputs.
+fn splice_fee_sats<E: ElectrumApi>(electrsd: &E, tx: &bitcoin::Transaction) -> u64 {
+	let input_sats: u64 = tx
+		.input
+		.iter()
+		.map(|txin| {
+			let prev = electrsd.transaction_get(&txin.previous_output.txid).unwrap();
+			prev.output[txin.previous_output.vout as usize].value.to_sat()
+		})
+		.sum();
+	input_sats - tx.output.iter().map(|output| output.value.to_sat()).sum::<u64>()
+}
+
 /// A splice LDK dropped without ever persisting it — initiated while disconnected, then the node
 /// restarts — is reported once, through the failure LDK itself persisted at shutdown and replays
 /// at startup: `PeerDisconnected`, with the output the splice-out would have paid. A further

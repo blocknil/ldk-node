@@ -2697,9 +2697,28 @@ impl Wallet {
 	pub(crate) async fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
 	) -> Result<CoinSelection, ()> {
+		self.select_confirmed_utxos_keeping_change(must_spend, must_pay_to, fee_rate, false).await
+	}
+
+	/// [`Self::select_confirmed_utxos`], which with `keep_change` selects only coins that leave a
+	/// change output worth spending on its own at `fee_rate` (see [`min_kept_change`]), and fails
+	/// rather than select coins that don't.
+	///
+	/// Blocknil patch: a provider's splice on arrival has to leave a change output, so that a stuck
+	/// zero-conf splice, which can't be replaced, can still be pushed by a child spending it
+	/// (CPFP). BDK's coin selection prefers sets that need no change (branch and bound), so asking
+	/// it for the amount alone can return one with none. With `keep_change`, the selection pays
+	/// the smallest such change to the change address as if it were one more recipient, with
+	/// whatever else is left over drained to the same address, and the two make the change output.
+	pub(crate) async fn select_confirmed_utxos_keeping_change(
+		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate, keep_change: bool,
+	) -> Result<CoinSelection, ()> {
 		let mut locked_persister = self.persister.lock().await;
 		let (coin_selection, change_set) = {
 			let mut locked_wallet = self.inner.lock().expect("lock");
+			let kept_change_script = keep_change.then(|| {
+				locked_wallet.next_unused_address(KeychainKind::Internal).address.script_pubkey()
+			});
 
 			debug_assert!(matches!(
 				locked_wallet.public_descriptor(KeychainKind::External),
@@ -2739,6 +2758,11 @@ impl Wallet {
 			for output in must_pay_to {
 				tx_builder.add_recipient(output.script_pubkey.clone(), output.value);
 			}
+			// Blocknil patch: see `select_confirmed_utxos_keeping_change`.
+			if let Some(script) = &kept_change_script {
+				tx_builder.add_recipient(script.clone(), min_kept_change(script, fee_rate));
+				tx_builder.drain_to(script.clone());
+			}
 
 			tx_builder.fee_rate(fee_rate);
 			tx_builder.exclude_unconfirmed();
@@ -2764,7 +2788,8 @@ impl Wallet {
 				})
 				.collect::<Result<Vec<_>, ()>>()?;
 
-			if unsigned_tx.output.len() > must_pay_to.len() + 1 {
+			// Blocknil patch: a kept change may come as two outputs, merged below.
+			if unsigned_tx.output.len() > must_pay_to.len() + 1 + usize::from(keep_change) {
 				log_error!(
 					self.logger,
 					"Unexpected number of change outputs during coin selection: {}",
@@ -2780,10 +2805,31 @@ impl Wallet {
 				locked_wallet.lock_outpoint(utxo.outpoint());
 			}
 
-			let change_output = unsigned_tx
-				.output
-				.into_iter()
-				.find(|txout| must_pay_to.iter().all(|output| output != txout));
+			let change_output = match &kept_change_script {
+				// Blocknil patch: the kept change and anything drained on top of it, as one output,
+				// which also gets back the fee BDK set aside for the second: the contribution's fee
+				// is LDK's, for one change output, and the amount added to the channel is what the
+				// change and that fee leave.
+				Some(script) => {
+					let outputs: Vec<&TxOut> = unsigned_tx
+						.output
+						.iter()
+						.filter(|txout| txout.script_pubkey == *script)
+						.collect();
+					let merged_output_fee = if outputs.len() > 1 {
+						fee_rate.fee_wu(outputs[1].weight()).ok_or(())?
+					} else {
+						Amount::ZERO
+					};
+					let value =
+						outputs.iter().map(|txout| txout.value).sum::<Amount>() + merged_output_fee;
+					Some(TxOut { value, script_pubkey: script.clone() })
+				},
+				None => unsigned_tx
+					.output
+					.into_iter()
+					.find(|txout| must_pay_to.iter().all(|output| output != txout)),
+			};
 
 			(
 				CoinSelection { confirmed_utxos, change_output },
@@ -4702,6 +4748,47 @@ impl WalletSource for Wallet {
 
 // Anchor bumping uses LdkWallet for coin selection, which wraps a WalletSource to implement
 // CoinSelectionSource. Splicing uses this implementation of coin selection instead.
+/// The smallest change output [`Wallet::select_confirmed_utxos_keeping_change`] keeps: above dust,
+/// and worth more than the fee for spending it at `fee_rate`, which is what a child bumping its
+/// transaction spends it at.
+///
+/// Blocknil patch.
+pub(crate) fn min_kept_change(script: &ScriptBuf, fee_rate: FeeRate) -> Amount {
+	// A P2WPKH input: outpoint, sequence and empty script_sig (41 bytes), and a witness of a
+	// signature and a key (108 bytes).
+	const P2WPKH_INPUT_WEIGHT: Weight = Weight::from_wu(41 * 4 + 108);
+	let spending_fee = fee_rate.fee_wu(P2WPKH_INPUT_WEIGHT).unwrap_or(Amount::MAX_MONEY);
+	script.minimal_non_dust().max(spending_fee + Amount::ONE_SAT)
+}
+
+/// [`Wallet`] as the coin selection of a splice-in that must leave a change output (see
+/// [`Wallet::select_confirmed_utxos_keeping_change`]).
+///
+/// Blocknil patch.
+pub(crate) struct ChangeKeepingWallet(pub(crate) Arc<Wallet>);
+
+impl CoinSelectionSource for ChangeKeepingWallet {
+	fn select_confirmed_utxos<'a>(
+		&'a self, claim_id: Option<ClaimId>, must_spend: Vec<Input>, must_pay_to: &'a [TxOut],
+		target_feerate_sat_per_1000_weight: u32, _max_tx_weight: u64,
+	) -> impl Future<Output = Result<CoinSelection, ()>> + Send + 'a {
+		debug_assert!(claim_id.is_none());
+		let fee_rate = FeeRate::from_sat_per_kwu(target_feerate_sat_per_1000_weight as u64);
+		async move {
+			self.0
+				.select_confirmed_utxos_keeping_change(must_spend, must_pay_to, fee_rate, true)
+				.await
+		}
+	}
+
+	fn sign_psbt<'a>(
+		&'a self, psbt: Psbt,
+	) -> impl Future<Output = Result<Transaction, ()>> + Send + 'a {
+		debug_assert!(false);
+		async move { self.0.sign_psbt_inner(psbt) }
+	}
+}
+
 impl CoinSelectionSource for Wallet {
 	fn select_confirmed_utxos<'a>(
 		&'a self, claim_id: Option<ClaimId>, must_spend: Vec<Input>, must_pay_to: &'a [TxOut],
