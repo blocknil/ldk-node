@@ -947,6 +947,96 @@ async fn a_close_is_classified_for_a_channel_whose_facts_were_never_recorded() {
 	node_b.stop().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn close_channel_to_pays_our_side_straight_to_a_script() {
+	// Blocknil patch: `close_channel_to` closes cooperatively with our side paid straight to a
+	// script outside this wallet, which works because channels no longer commit to a close script
+	// when they open.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
+	let node_c = setup_node(&chain_source, random_config());
+
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(1_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	let funding_txo =
+		open_channel_push_amt(&node_a, &node_b, 200_000, Some(50_000_000), false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	let onchain_a = node_a.list_balances().total_onchain_balance_sats;
+	let channel_a = node_a.list_channels().pop().unwrap();
+
+	// A script BOLT 2 doesn't allow a close to pay is refused, and the channel stays open.
+	let op_true = ScriptBuf::from_bytes(vec![0x51]);
+	assert_eq!(
+		node_a.close_channel_to(&channel_a.user_channel_id, node_b.node_id(), op_true),
+		Err(NodeError::InvalidScriptPubKey)
+	);
+	assert!(node_a.list_channels()[0].is_usable);
+
+	// Our side goes straight to C's address.
+	let script = node_c.onchain_payment().new_address().unwrap().script_pubkey();
+	node_a.close_channel_to(&channel_a.user_channel_id, node_b.node_id(), script).unwrap();
+	expect_event!(node_a, ChannelClosed);
+	expect_event!(node_b, ChannelClosed);
+	wait_for_outpoint_spend(&electrsd.client, funding_txo).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	for node in [&node_a, &node_b, &node_c] {
+		node.sync_wallets().unwrap();
+	}
+
+	// C received A's side less the closing fee, which A pays as the funder; to C's wallet, it is
+	// an ordinary on-chain receive.
+	let received_c = node_c.list_all_payments();
+	assert_eq!(received_c.len(), 1);
+	let close_txid = match received_c[0].kind {
+		PaymentKind::Onchain { txid, tx_type: None, .. } => txid,
+		ref kind => panic!("unexpected payment kind {kind:?}"),
+	};
+	assert_eq!(received_c[0].direction, PaymentDirection::Inbound);
+	let amount_c = received_c[0].amount_msat.unwrap() / 1000;
+	assert!(amount_c > 148_000 && amount_c < 150_000, "{amount_c}");
+	assert_eq!(node_c.list_balances().total_onchain_balance_sats, amount_c);
+
+	// B's side went to B's wallet, recorded as the cooperative close it is.
+	let closes_b = node_b.list_payments_matching(|payment| {
+		matches!(
+			payment.kind,
+			PaymentKind::Onchain { tx_type: Some(TransactionType::CooperativeClose { .. }), .. }
+		)
+	});
+	assert_eq!(closes_b.len(), 1);
+	assert_eq!(closes_b[0].amount_msat, Some(50_000_000));
+
+	// A's view: its on-chain wallet is untouched, nothing is left in Lightning, and it records
+	// no payment for the close, since its wallet has no part in that transaction. The money that
+	// left shows only as the channel's balance going away.
+	assert_eq!(node_a.list_balances().total_onchain_balance_sats, onchain_a);
+	assert_eq!(node_a.list_balances().total_lightning_balance_sats, 0);
+	assert!(node_a.list_balances().lightning_balances.is_empty());
+	assert!(node_a.list_all_payments().iter().all(|payment| match payment.kind {
+		PaymentKind::Onchain { txid, .. } => txid != close_txid,
+		_ => true,
+	}));
+	// The peer store forgets B on `ChannelClosed`, as after `close_channel`.
+	assert!(!node_a.list_peers().iter().any(|p| p.node_id == node_b.node_id() && p.is_persisted));
+
+	for node in [node_a, node_b, node_c] {
+		node.stop().unwrap();
+	}
+}
+
 // Polling Bitcoin Core connects the blocks a node missed while it was down to its wallet as part
 // of starting, before any background task runs. A sweep that confirmed in those blocks is
 // classified then, so the node's channel outputs must be on record by then.
