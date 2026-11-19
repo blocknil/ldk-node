@@ -583,6 +583,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Accept at most one channel from each peer. Blocknil patch; see
+	/// [`Config::one_channel_per_peer`].
+	pub fn set_one_channel_per_peer(&mut self, one: bool) -> &mut Self {
+		self.config.one_channel_per_peer = one;
+		self
+	}
+
 	/// Configures the [`Node`] instance to write logs to the filesystem.
 	///
 	/// The `log_file_path` defaults to [`DEFAULT_LOG_FILENAME`] in the configured
@@ -1240,6 +1247,12 @@ impl Builder {
 	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
 	pub fn set_inbound_channel_minimum_depth(&self, depth: u32) {
 		self.inner.write().expect("lock").set_inbound_channel_minimum_depth(depth);
+	}
+
+	/// Accept at most one channel from each peer. Blocknil patch; see
+	/// [`Config::one_channel_per_peer`].
+	pub fn set_one_channel_per_peer(&self, one: bool) {
+		self.inner.write().expect("lock").set_one_channel_per_peer(one);
 	}
 
 	/// Configures the [`Node`] instance to write logs to the filesystem.
