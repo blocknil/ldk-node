@@ -1048,6 +1048,42 @@ where
 		}
 	}
 
+	/// Blocknil patch: connects to `node_id` from the addresses the network graph has for it, so
+	/// an onion message intercepted for it can be forwarded. See `OnionMessageIntercepted`.
+	fn connect_to_forward_onion_message(&self, node_id: PublicKey) {
+		let addresses: Vec<lightning::ln::msgs::SocketAddress> = self
+			.network_graph
+			.read_only()
+			.node(&NodeId::from_pubkey(&node_id))
+			.and_then(|node| node.announcement_info.as_ref())
+			.map(|info| info.addresses().to_vec())
+			.unwrap_or_default();
+		if addresses.is_empty() {
+			log_debug!(
+				self.logger,
+				"Onion message for {} held: no address for it in the network graph",
+				node_id
+			);
+			return;
+		}
+		let logger = self.logger.clone();
+		let connection_manager = Arc::clone(&self.connection_manager);
+		self.runtime.spawn_cancellable_background_task(async move {
+			for address in addresses {
+				match connection_manager.connect_peer_if_necessary(node_id, address.clone()).await {
+					Ok(()) => return,
+					Err(e) => log_debug!(
+						logger,
+						"Failed to connect to {}@{} to forward an onion message: {}",
+						node_id,
+						address,
+						e
+					),
+				}
+			}
+		});
+	}
+
 	pub async fn handle_event(&self, event: LdkEvent) -> Result<(), ReplayEvent> {
 		match event {
 			LdkEvent::FundingGenerationReady {
@@ -2777,6 +2813,19 @@ where
 				if let NextMessageHop::NodeId(peer_node_id) = next_hop {
 					if let Some(om_mailbox) = self.om_mailbox.as_ref() {
 						om_mailbox.onion_message_intercepted(peer_node_id, message);
+						// Blocknil patch: a message for a node we share no channel with isn't one
+						// waiting for a customer's phone to come back: it is a customer's message
+						// on its way out (sent via its LSP, `Config::route_messages_via_lsp`), to a
+						// payer's LSP, say. Nothing else would ever connect us to that node, so
+						// connect now, from the addresses in our graph; once connected, the mailbox
+						// releases the message (`OnionMessagePeerConnected`, below).
+						if self
+							.channel_manager
+							.list_channels_with_counterparty(&peer_node_id)
+							.is_empty()
+						{
+							self.connect_to_forward_onion_message(peer_node_id);
+						}
 					} else {
 						log_trace!(
 							self.logger,
