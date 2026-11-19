@@ -276,6 +276,7 @@ impl Default for ForwardedPaymentTrackingMode {
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
 /// | `inbound_channel_minimum_depth`        | None                                 |
 /// | `one_channel_per_peer`                 | false                                |
+/// | `forwarding_fees`                      | None                                 |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -376,6 +377,21 @@ pub struct Config {
 	/// Blocknil patch: our provider gives each customer exactly one channel. Channels we open
 	/// ourselves are not limited.
 	pub one_channel_per_peer: bool,
+	/// Forwarding fee for channels peers open to us; `None` keeps LDK's default (1,000 msat + 0).
+	///
+	/// Blocknil patch: our provider forwards between its customers for nothing. Channels we open
+	/// take the [`ChannelConfig`] passed to the open, and LSPS2 JIT channels forward at 0 anyway.
+	pub forwarding_fees: Option<ForwardingFees>,
+}
+
+/// Blocknil patch: the forwarding fee of [`Config::forwarding_fees`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ForwardingFees {
+	/// The base fee, in millisatoshis, charged for each payment forwarded.
+	pub base_msat: u32,
+	/// The fee charged per million millisatoshis forwarded.
+	pub proportional_millionths: u32,
 }
 
 impl Default for Config {
@@ -398,6 +414,7 @@ impl Default for Config {
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
 			inbound_channel_minimum_depth: None,
 			one_channel_per_peer: false,
+			forwarding_fees: None,
 		}
 	}
 }
@@ -602,6 +619,12 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// Blocknil patch: the confirmations we ask of an inbound channel's funding.
 	if let Some(depth) = config.inbound_channel_minimum_depth {
 		user_config.channel_handshake_config.minimum_depth = depth.max(1);
+	}
+	// Blocknil patch: the forwarding fee of channels peers open to us.
+	if let Some(fees) = config.forwarding_fees {
+		user_config.channel_config.forwarding_fee_base_msat = fees.base_msat;
+		user_config.channel_config.forwarding_fee_proportional_millionths =
+			fees.proportional_millionths;
 	}
 
 	let may_announce = may_announce_channel(config).is_ok();
@@ -1089,6 +1112,28 @@ mod tests {
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP), MAX_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(0), MIN_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP + 1), MAX_FULL_SCAN_STOP_GAP);
+	}
+
+	#[test]
+	fn forwarding_fees_set_the_fee_of_channels_peers_open_to_us() {
+		// Blocknil patch: unset keeps LDK's default; set, both parts are used.
+		let ldk_default = super::UserConfig::default().channel_config;
+		let unset = default_user_config(&Config::default()).channel_config;
+		assert_eq!(unset.forwarding_fee_base_msat, ldk_default.forwarding_fee_base_msat);
+		assert_eq!(
+			unset.forwarding_fee_proportional_millionths,
+			ldk_default.forwarding_fee_proportional_millionths
+		);
+		for (base_msat, proportional_millionths) in [(0, 0), (7, 300)] {
+			let fees = super::ForwardingFees { base_msat, proportional_millionths };
+			let config = Config { forwarding_fees: Some(fees), ..Config::default() };
+			let channel_config = default_user_config(&config).channel_config;
+			assert_eq!(channel_config.forwarding_fee_base_msat, base_msat);
+			assert_eq!(
+				channel_config.forwarding_fee_proportional_millionths,
+				proportional_millionths
+			);
+		}
 	}
 
 	#[test]
