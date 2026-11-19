@@ -652,6 +652,23 @@ impl Node {
 			}
 		});
 
+		// Blocknil patch: as an LSPS2 service, open the JIT channels whose first payment waited for
+		// a client that is now connected, and fail back those whose client didn't come in time.
+		if self.liquidity_source.lsps2_service().lsps2_service.is_some() {
+			let lsps2_service = self.liquidity_source.lsps2_service();
+			let mut stop_jit_waits = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(1));
+				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				loop {
+					tokio::select! {
+						_ = stop_jit_waits.changed() => return,
+						_ = interval.tick() => lsps2_service.process_jit_waits().await,
+					}
+				}
+			});
+		}
+
 		// Regularly broadcast node announcements.
 		let bcast_cm = Arc::clone(&self.channel_manager);
 		let bcast_pm = Arc::clone(&self.peer_manager);
@@ -2910,6 +2927,34 @@ impl Node {
 			| self.onion_messenger.provided_node_features()
 			| gossip_features
 			| self.liquidity_source.liquidity_manager().provided_node_features()
+	}
+}
+
+/// Blocknil patch: our LSPS2 provider's controls.
+impl Node {
+	/// How long a payment for an offline client waits before it is failed back (50 s by default).
+	/// It applies to a first payment, whose just-in-time channel can't open until the client
+	/// connects: the client is woken (see [`Node::set_payment_held_handler`]) and the channel
+	/// opens once it does. Zero fails such a payment back at once, as upstream does.
+	///
+	/// Blocknil patch: r8's API. Held payments (another patch) honour the same duration.
+	pub fn set_hold_duration(&self, hold_for: Duration) {
+		self.liquidity_source.lsps2_service().jit_waits.set_wait(hold_for);
+	}
+
+	/// Called with the client each time a payment starts waiting for it, to wake its phone: a
+	/// first payment waiting for its just-in-time channel (see [`Node::set_hold_duration`]). It is
+	/// called on the node's event handling, so it must not block.
+	///
+	/// Blocknil patch: r8's API. Held payments (another patch) call the same handler.
+	pub fn set_payment_held_handler(&self, on_held: liquidity::OnJitWaiting) {
+		self.liquidity_source.lsps2_service().jit_waits.set_on_waiting(on_held);
+	}
+
+	/// First payments waiting for their offline client to connect so their just-in-time channel
+	/// can open: `(client, amount to forward in msat)`. Blocknil patch.
+	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
+		self.liquidity_source.lsps2_service().jit_waits.waiting()
 	}
 }
 

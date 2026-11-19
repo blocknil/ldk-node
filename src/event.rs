@@ -2532,6 +2532,11 @@ where
 					None
 				};
 
+				// Blocknil patch: what the LSPS2 service needs to tell a JIT client that dropped
+				// mid-open (waited for again) from any other failed open.
+				let disconnected = matches!(reason, ClosureReason::DisconnectedPeer);
+				let funding_generated = channel_funding_txo.is_some();
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2551,7 +2556,13 @@ where
 				// would otherwise fail the HTLCs of a payment retried in the meantime.
 				self.liquidity_source
 					.lsps2_service()
-					.handle_channel_closed(user_channel_id, channel_id, &counterparty_node_id)
+					.handle_channel_closed(
+						user_channel_id,
+						channel_id,
+						&counterparty_node_id,
+						disconnected,
+						funding_generated,
+					)
 					.await;
 
 				if let Some(peer_info) = peer_to_reconnect {
@@ -2643,6 +2654,8 @@ where
 						return Err(ReplayEvent());
 					}
 				}
+				// Blocknil patch: the coins are back; a JIT open that waited for them may restart.
+				self.liquidity_source.lsps2_service().handle_funding_discarded(channel_id);
 			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,

@@ -7,7 +7,7 @@
 
 use std::ops::Deref;
 use std::sync::{Arc, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Transaction;
@@ -22,8 +22,9 @@ use lightning_liquidity::lsps2::msgs::LSPS2RawOpeningFeeParams;
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_types::payment::PaymentHash;
 
+use super::jit_wait::JitWaits;
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
-use crate::logger::{log_error, log_trace, LdkLogger};
+use crate::logger::{log_error, log_info, log_trace, LdkLogger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
 use crate::{total_anchor_channels_reserve_sats, Config};
 
@@ -53,6 +54,8 @@ where
 	pub(crate) liquidity_manager: Arc<LiquidityManager>,
 	pub(crate) config: Arc<Config>,
 	pub(crate) logger: L,
+	/// First payments waiting for their offline client. Blocknil patch: see `jit_wait`.
+	pub(crate) jit_waits: JitWaits,
 }
 
 /// Represents the configuration of the LSPS2 service.
@@ -226,6 +229,8 @@ where
 	pub(crate) async fn handle_channel_ready(
 		&self, user_channel_id: u128, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) {
+		// Blocknil patch: the open is done; a later close is an ordinary one.
+		self.jit_waits.remove(user_channel_id);
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			if let Err(e) = lsps2_service_handler
 				.channel_ready(user_channel_id, channel_id, counterparty_node_id)
@@ -296,14 +301,36 @@ where
 
 	pub(crate) async fn handle_channel_closed(
 		&self, user_channel_id: u128, channel_id: ChannelId, counterparty_node_id: &PublicKey,
+		disconnected: bool, funding_generated: bool,
 	) {
+		// Blocknil patch: a client that dropped mid-open (a phone whose app went to the
+		// background) is waited for again rather than its payment failed back; see `jit_wait`.
+		let rewait = self.jit_waits.channel_closed(
+			user_channel_id,
+			channel_id,
+			disconnected,
+			funding_generated,
+			Instant::now(),
+		);
+		if rewait {
+			log_info!(
+				self.logger,
+				"LSPS2 channel to {} closed mid-open as the client disconnected; its first payment waits for the client again.",
+				counterparty_node_id,
+			);
+		}
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			// A JIT channel closing before it became ready is a failed channel open. This errors
 			// for any channel that isn't such a JIT channel, which is the common case.
-			if let Err(e) = lsps2_service_handler
-				.channel_open_failed(counterparty_node_id, user_channel_id)
-				.await
-			{
+			// Blocknil patch: unless its payment waits for the client again.
+			let failed = if rewait {
+				Ok(())
+			} else {
+				lsps2_service_handler
+					.channel_open_failed(counterparty_node_id, user_channel_id)
+					.await
+			};
+			if let Err(e) = failed {
 				log_trace!(
 					self.logger,
 					"LSPS2 service did not treat the closure of channel {} as a failed channel open: {:?}",
@@ -324,6 +351,8 @@ where
 
 	/// Fails the HTLCs held for the given JIT channel back, allowing the payer to retry.
 	async fn fail_channel_open(&self, counterparty_node_id: &PublicKey, user_channel_id: u128) {
+		// Blocknil patch: the payment no longer waits.
+		self.jit_waits.remove(user_channel_id);
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
 			if let Err(e) = lsps2_service_handler
 				.channel_open_failed(counterparty_node_id, user_channel_id)
@@ -336,6 +365,34 @@ where
 				);
 			}
 		}
+	}
+
+	/// Blocknil patch: retries the opens whose client is now connected and fails back the first
+	/// payments whose client didn't come in time. Called every second while the node runs.
+	pub(crate) async fn process_jit_waits(&self) {
+		let peer_manager =
+			self.peer_manager.read().expect("lock").as_ref().and_then(|weak| weak.upgrade());
+		let Some(peer_manager) = peer_manager else { return };
+		let (retry, expired) = self
+			.jit_waits
+			.take_due(Instant::now(), |client| peer_manager.peer_by_node_id(client).is_some());
+		for (client, user_channel_id) in expired {
+			log_info!(
+				self.logger,
+				"Gave up on the first payment for {}: the client didn't connect in time.",
+				client,
+			);
+			self.fail_channel_open(&client, user_channel_id).await;
+		}
+		for open_channel in retry {
+			self.handle_event(open_channel).await;
+		}
+	}
+
+	/// Blocknil patch: LDK released the coins of a discarded channel funding; an open that waited
+	/// on it may restart.
+	pub(crate) fn handle_funding_discarded(&self, channel_id: ChannelId) {
+		self.jit_waits.funding_discarded(channel_id);
 	}
 
 	pub(crate) async fn handle_event(&self, event: LSPS2ServiceEvent) {
@@ -484,15 +541,27 @@ where
 			LSPS2ServiceEvent::OpenChannel {
 				their_network_key,
 				amt_to_forward_msat,
-				opening_fee_msat: _,
+				opening_fee_msat,
 				user_channel_id,
-				intercept_scid: _,
+				intercept_scid,
 				max_client_to_self_delay,
 			} => {
 				if self.liquidity_manager.lsps2_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
 					return;
 				};
+
+				// Blocknil patch: remember the open, so it can wait for the client and be retried
+				// (`process_jit_waits` hands this event back).
+				let open_channel = LSPS2ServiceEvent::OpenChannel {
+					their_network_key,
+					amt_to_forward_msat,
+					opening_fee_msat,
+					user_channel_id,
+					intercept_scid,
+					max_client_to_self_delay,
+				};
+				let first_attempt = self.jit_waits.opening(open_channel, Instant::now());
 
 				let service_config = if let Some(service_config) =
 					self.lsps2_service.as_ref().map(|s| s.service_config.clone())
@@ -517,6 +586,19 @@ where
 
 				// Fail if we're not connected to the prospective channel partner.
 				let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) else {
+					// Blocknil patch: wait for the client (and wake it) instead, while the wait
+					// lasts; upstream's TODO below.
+					if self.jit_waits.wait_for_client(user_channel_id, Instant::now()) {
+						log_info!(
+							self.logger,
+							"LSPS2 channel to {} waits for the client to connect.",
+							their_network_key,
+						);
+						if first_attempt {
+							self.jit_waits.wake(their_network_key);
+						}
+						return;
+					}
 					log_error!(
 						self.logger,
 						"Failed to open LSPS2 channel to {} due to peer not being connected.",
