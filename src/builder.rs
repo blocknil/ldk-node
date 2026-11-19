@@ -590,6 +590,16 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets the forwarding fee for channels peers open to us. Blocknil patch; see
+	/// [`Config::forwarding_fees`].
+	pub fn set_forwarding_fees(
+		&mut self, base_msat: u32, proportional_millionths: u32,
+	) -> &mut Self {
+		self.config.forwarding_fees =
+			Some(crate::config::ForwardingFees { base_msat, proportional_millionths });
+		self
+	}
+
 	/// Configures the [`Node`] instance to write logs to the filesystem.
 	///
 	/// The `log_file_path` defaults to [`DEFAULT_LOG_FILENAME`] in the configured
@@ -1253,6 +1263,12 @@ impl Builder {
 	/// [`Config::one_channel_per_peer`].
 	pub fn set_one_channel_per_peer(&self, one: bool) {
 		self.inner.write().expect("lock").set_one_channel_per_peer(one);
+	}
+
+	/// Sets the forwarding fee for channels peers open to us. Blocknil patch; see
+	/// [`Config::forwarding_fees`].
+	pub fn set_forwarding_fees(&self, base_msat: u32, proportional_millionths: u32) {
+		self.inner.write().expect("lock").set_forwarding_fees(base_msat, proportional_millionths);
 	}
 
 	/// Configures the [`Node`] instance to write logs to the filesystem.

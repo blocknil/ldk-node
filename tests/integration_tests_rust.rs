@@ -1602,6 +1602,70 @@ async fn forwarding_to_unannounced_channels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn forwarding_fees_apply_to_channels_peers_open_to_us() {
+	// Blocknil patch: B's `forwarding_fees` set the fee of the channels its peers open to it, so a
+	// payment from A to C, both of whom opened their channel to B, passes B for nothing.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node_a = setup_node(&chain_source, random_config());
+	let mut config_b = random_config();
+	config_b.node_config.forwarding_fees =
+		Some(ldk_node::config::ForwardingFees { base_msat: 0, proportional_millionths: 0 });
+	let node_b = setup_node(&chain_source, config_b);
+	let node_c = setup_node(&chain_source, random_config());
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			node_a.onchain_payment().new_address().unwrap(),
+			node_c.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(5_000_000),
+	)
+	.await;
+	for node in [&node_a, &node_b, &node_c] {
+		node.sync_wallets().unwrap();
+	}
+
+	// C pushes half of its channel to B, so B can forward to C.
+	open_channel(&node_a, &node_b, 1_000_000, false, &electrsd).await;
+	open_channel_push_amt(&node_c, &node_b, 1_000_000, Some(500_000_000), false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	for node in [&node_a, &node_b, &node_c] {
+		node.sync_wallets().unwrap();
+	}
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_events!(node_b, node_a.node_id(), node_c.node_id());
+	expect_channel_ready_event!(node_c, node_b.node_id());
+	for channel in node_b.list_channels() {
+		let config = channel.config;
+		assert_eq!(config.forwarding_fee_base_msat, 0);
+		assert_eq!(config.forwarding_fee_proportional_millionths, 0);
+	}
+
+	let amount_msat = 2_500_000;
+	let description = Bolt11InvoiceDescription::Direct(
+		Description::new("Forwarded for nothing".to_string()).unwrap(),
+	);
+	let invoice = node_c.bolt11_payment().receive(amount_msat, &description.into(), 3600).unwrap();
+	let payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
+	match tokio::time::timeout(Duration::from_secs(60), node_b.next_event_async()).await.unwrap() {
+		Event::PaymentForwarded { total_fee_earned_msat, .. } => {
+			assert_eq!(total_fee_earned_msat, Some(0))
+		},
+		e => panic!("expected PaymentForwarded, got {e:?}"),
+	}
+	node_b.event_handled().unwrap();
+	expect_payment_received_event!(node_c, amount_msat);
+	expect_payment_successful_event!(node_a, payment_id, Some(Some(0)));
+
+	for node in [node_a, node_b, node_c] {
+		node.stop().unwrap();
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn detailed_forwarded_payment_tracking() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
