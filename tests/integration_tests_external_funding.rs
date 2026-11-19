@@ -15,15 +15,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::key::{Keypair, TapTweak};
 use bitcoin::secp256k1::{All, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{
-	Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Transaction, TxOut, Witness,
+	Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+	Witness,
 };
 use common::{
-	configure_chain_source, distribute_funds_unconfirmed, expect_channel_ready_event,
+	configure_chain_source, distribute_funds_unconfirmed, expect_channel_pending_event,
+	expect_channel_ready_event, expect_payment_received_event, expect_payment_successful_event,
 	expect_splice_negotiated_event, generate_blocks_and_wait, open_channel, open_channel_push_amt,
 	premine_and_distribute_funds, random_chain_source, random_config, setup_bitcoind_and_electrsd,
 	setup_builder, setup_node, setup_two_nodes, wait_for_channel_ready_to_send, wait_for_tx,
@@ -50,6 +53,10 @@ struct TaprootWallet {
 	calls: Mutex<Vec<SignerCall>>,
 	/// Refuse to sign, as a wallet does that finds something wrong with the transaction.
 	refuse: AtomicBool,
+	/// The coins `build_funding_transaction` spends.
+	funding_coins: Mutex<Vec<(OutPoint, TxOut)>>,
+	/// Every funding transaction built, with the fee rate it was asked to pay.
+	built: Mutex<Vec<(FeeRate, Transaction)>>,
 }
 
 impl TaprootWallet {
@@ -57,7 +64,14 @@ impl TaprootWallet {
 		let secp = Secp256k1::new();
 		let secret_key = SecretKey::from_slice(&rand::random::<[u8; 32]>()).unwrap();
 		let keypair = Keypair::from_secret_key(&secp, &secret_key);
-		Self { secp, keypair, calls: Mutex::new(Vec::new()), refuse: AtomicBool::new(false) }
+		Self {
+			secp,
+			keypair,
+			calls: Mutex::new(Vec::new()),
+			refuse: AtomicBool::new(false),
+			funding_coins: Mutex::new(Vec::new()),
+			built: Mutex::new(Vec::new()),
+		}
 	}
 
 	fn script_pubkey(&self) -> ScriptBuf {
@@ -113,6 +127,37 @@ impl FundingInputSigner for TaprootWallet {
 			.filter(|&index| prevouts[index].script_pubkey == script_pubkey)
 			.collect();
 		self.sign(&mut tx, &prevouts, &ours);
+		Ok(tx)
+	}
+
+	fn build_funding_transaction(
+		&self, output_script: ScriptBuf, value_sats: u64, fee_rate: FeeRate, locktime: LockTime,
+	) -> Result<Transaction, ()> {
+		let coins = self.funding_coins.lock().unwrap().clone();
+		let input_value: u64 = coins.iter().map(|(_, txout)| txout.value.to_sat()).sum();
+		let mut tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: locktime,
+			input: coins
+				.iter()
+				.map(|(outpoint, _)| TxIn {
+					previous_output: *outpoint,
+					sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+					// A key-spend signature with its sighash byte, for the weight.
+					witness: Witness::from_slice(&[[0u8; 65]]),
+					..Default::default()
+				})
+				.collect(),
+			output: vec![
+				TxOut { value: Amount::from_sat(value_sats), script_pubkey: output_script },
+				TxOut { value: Amount::ZERO, script_pubkey: self.script_pubkey() },
+			],
+		};
+		let fee = fee_rate.fee_vb(tx.vsize() as u64).unwrap().to_sat();
+		tx.output[1].value = Amount::from_sat(input_value - value_sats - fee);
+		let prevouts: Vec<TxOut> = coins.iter().map(|(_, txout)| txout.clone()).collect();
+		self.sign(&mut tx, &prevouts, &(0..coins.len()).collect::<Vec<_>>());
+		self.built.lock().unwrap().push((fee_rate, tx.clone()));
 		Ok(tx)
 	}
 }
@@ -670,6 +715,90 @@ async fn external_splice_fee_bump_is_paid_from_its_change() {
 	assert_eq!(node_a.list_channels()[0].funding_txo.unwrap().txid, second.txid);
 	assert_eq!(channel_value_sats(&node_a), value_before + 400_000);
 	assert_eq!(node_a.list_balances().total_onchain_balance_sats, onchain_before);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+/// A channel whose funding transaction a wallet outside the node builds and signs, at the fee rate
+/// the caller asked for: the funding transaction pays exactly the channel's value at that rate,
+/// confirms, and the channel carries a payment. The node's own wallet, which only holds the anchor
+/// reserve, pays nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn channel_funded_by_a_wallet_outside_the_node_at_a_given_fee_rate() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
+	let wallet = Arc::new(TaprootWallet::new());
+
+	// Node A's own wallet holds little more than the anchor reserve.
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(100_000),
+	)
+	.await;
+	let (coin_tx, vout) =
+		fund_wallet(&bitcoind.client, &electrsd, &wallet, Amount::from_sat(1_000_000)).await;
+	wallet
+		.funding_coins
+		.lock()
+		.unwrap()
+		.push((OutPoint::new(coin_tx.compute_txid(), vout), coin_tx.output[vout as usize].clone()));
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	let onchain_before = node_a.list_balances().total_onchain_balance_sats;
+
+	// Without a signer there is nobody to build the funding transaction.
+	let node_b_address = node_b.listening_addresses().unwrap().first().unwrap().clone();
+	assert!(node_a
+		.open_channel_with_external_funding(node_b.node_id(), node_b_address.clone(), 500_000, None)
+		.is_err());
+	node_a.set_funding_input_signer(Arc::clone(&wallet) as Arc<dyn FundingInputSigner>);
+
+	// A rate unlike the node's own estimate, so that the test tells them apart.
+	let fee_rate = FeeRate::from_sat_per_kwu(3_250);
+	assert_ne!(node_a.channel_funding_fee_rate(), fee_rate);
+	node_a
+		.open_channel_with_external_funding(
+			node_b.node_id(),
+			node_b_address,
+			500_000,
+			Some(fee_rate),
+		)
+		.unwrap();
+	let funding_txo = expect_channel_pending_event!(node_a, node_b.node_id());
+	expect_channel_pending_event!(node_b, node_a.node_id());
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+
+	let funding_tx = electrsd.client.transaction_get(&funding_txo.txid).unwrap();
+	{
+		let built = wallet.built.lock().unwrap();
+		assert_eq!(built.len(), 1);
+		assert_eq!(built[0].0, fee_rate);
+		assert_eq!(built[0].1.compute_txid(), funding_txo.txid);
+	}
+	assert_eq!(funding_tx.output[funding_txo.vout as usize].value.to_sat(), 500_000);
+	let fee = 1_000_000 - funding_tx.output.iter().map(|output| output.value.to_sat()).sum::<u64>();
+	assert_eq!(fee, fee_rate.fee_vb(funding_tx.vsize() as u64).unwrap().to_sat());
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	assert_eq!(channel_value_sats(&node_a), 500_000);
+	assert_eq!(node_a.list_balances().total_onchain_balance_sats, onchain_before);
+
+	// The channel is usable.
+	wait_for_channel_ready_to_send(&node_a, &node_b, 100_000_000).await;
+	let payment_id =
+		node_a.spontaneous_payment().send(100_000_000, node_b.node_id(), None).unwrap();
+	expect_payment_successful_event!(node_a, payment_id, None);
+	expect_payment_received_event!(node_b, 100_000_000);
 
 	node_a.stop().unwrap();
 	node_b.stop().unwrap();

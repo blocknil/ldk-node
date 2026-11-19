@@ -1457,7 +1457,7 @@ impl Node {
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: FundingAmount,
 		push_to_counterparty_msat: Option<u64>, fee_rate: Option<bitcoin::FeeRate>,
 		channel_config: Option<ChannelConfig>, announce_for_forwarding: bool,
-		disable_counterparty_reserve: bool,
+		disable_counterparty_reserve: bool, external_funding: bool,
 	) -> Result<UserChannelId, Error> {
 		let peer_info = PeerInfo { node_id, address };
 
@@ -1476,6 +1476,26 @@ impl Node {
 		});
 
 		let channel_amount_sats = match channel_amount_sats {
+			// Blocknil patch: funded from outside the node, the node's own wallet only has to hold
+			// the new channel's anchor reserve.
+			FundingAmount::Exact { amount_sats } if external_funding => {
+				let cur_anchor_reserve_sats =
+					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+				let spendable_amount_sats =
+					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+				let new_channel_reserve =
+					self.new_channel_anchor_reserve_sats(&peer_info.node_id)?;
+				if spendable_amount_sats < new_channel_reserve {
+					log_error!(
+						self.logger,
+						"Unable to create channel funded from outside the node: its anchor reserve is not available. Available: {}sats, Required: {}sats",
+						spendable_amount_sats,
+						new_channel_reserve
+					);
+					return Err(Error::InsufficientFunds);
+				}
+				amount_sats
+			},
 			FundingAmount::Exact { amount_sats } => {
 				// Check funds availability after connection (includes anchor reserve and
 				// funding fee calculation).
@@ -1535,8 +1555,14 @@ impl Node {
 
 		// Register the fee-rate override before creating the channel, as the
 		// `FundingGenerationReady` event may be handled before `create_channel` returns.
+		// Blocknil patch: a funding built outside the node is always given its rate, and is
+		// registered as such.
+		let fee_rate = if external_funding { Some(funding_fee_rate) } else { fee_rate };
 		if let Some(fee_rate) = fee_rate {
 			self.pending_funding_fee_rates.lock().expect("lock").insert(user_channel_id, fee_rate);
+		}
+		if external_funding {
+			self.external_funding.opens.lock().expect("lock").insert(user_channel_id);
 		}
 
 		let result = if disable_counterparty_reserve {
@@ -1580,6 +1606,7 @@ impl Node {
 					e
 				);
 				self.pending_funding_fee_rates.lock().expect("lock").remove(&user_channel_id);
+				self.external_funding.opens.lock().expect("lock").remove(&user_channel_id);
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1695,6 +1722,47 @@ impl Node {
 			channel_config,
 			false,
 			false,
+			false,
+		)
+	}
+
+	/// Connect to a node and open a new unannounced channel whose funding transaction the
+	/// [`FundingInputSigner`] registered with [`Node::set_funding_input_signer`] builds, from a
+	/// wallet outside ldk-node, instead of ldk-node's own wallet. Nothing is pushed to the
+	/// counterparty, and the channel takes the default [`ChannelConfig`].
+	///
+	/// If `fee_rate` is set the funding transaction pays it. Otherwise it pays ldk-node's
+	/// estimate (see [`Node::channel_funding_fee_rate`]).
+	///
+	/// If Anchor channels are enabled, ldk-node's own wallet must still hold the configured
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`] for the channel.
+	///
+	/// Blocknil patch.
+	///
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
+	pub fn open_channel_with_external_funding(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		fee_rate: Option<FfiFeeRate>,
+	) -> Result<UserChannelId, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		if self.external_funding.signer.read().expect("lock").is_none() {
+			log_error!(self.logger, "Failed to open channel: no funding input signer registered");
+			return Err(Error::ChannelCreationFailed);
+		}
+
+		let fee_rate_opt = maybe_map_fee_rate_opt(fee_rate);
+		self.open_channel_inner(
+			node_id,
+			address,
+			FundingAmount::Exact { amount_sats: channel_amount_sats },
+			None,
+			fee_rate_opt,
+			None,
+			false,
+			false,
+			true,
 		)
 	}
 
@@ -1748,6 +1816,7 @@ impl Node {
 			channel_config,
 			true,
 			false,
+			false,
 		)
 	}
 
@@ -1784,6 +1853,7 @@ impl Node {
 			push_to_counterparty_msat,
 			fee_rate_opt,
 			channel_config,
+			false,
 			false,
 			false,
 		)
@@ -1833,6 +1903,7 @@ impl Node {
 			channel_config,
 			true,
 			false,
+			false,
 		)
 	}
 
@@ -1879,6 +1950,7 @@ impl Node {
 			channel_config,
 			false,
 			true,
+			false,
 		)
 	}
 
@@ -1917,6 +1989,7 @@ impl Node {
 			channel_config,
 			false,
 			true,
+			false,
 		)
 	}
 

@@ -1151,22 +1151,45 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				let funding_transaction = self
-					.wallet
-					.create_funding_transaction(
-						output_script.clone(),
-						channel_amount,
-						confirmation_target,
-						locktime,
-						fee_rate_override,
-					)
-					.await;
+				// Blocknil patch: a channel opened with `open_channel_with_external_funding` is
+				// paid for by the registered signer's wallet, at the rate the open registered, and
+				// none of the node's own coins are locked for it or released after it.
+				let external_funding =
+					self.external_funding.opens.lock().expect("lock").remove(&user_channel_id);
+				let funding_transaction = if external_funding {
+					let signer = self.external_funding.signer.read().expect("lock").clone();
+					match (signer, fee_rate_override) {
+						(Some(signer), Some(fee_rate)) => signer
+							.build_funding_transaction(
+								output_script.clone(),
+								channel_value_satoshis,
+								fee_rate,
+								locktime,
+							)
+							.map_err(|()| Error::OnchainTxCreationFailed),
+						_ => Err(Error::OnchainTxCreationFailed),
+					}
+				} else {
+					self.wallet
+						.create_funding_transaction(
+							output_script.clone(),
+							channel_amount,
+							confirmation_target,
+							locktime,
+							fee_rate_override,
+						)
+						.await
+				};
 				match funding_transaction {
 					Ok(final_tx) => {
 						// LDK reports a transaction it took and then lets go, but not one it
 						// never took. For the latter the wallet state held for the transaction
 						// is returned here.
 						let release_unused_funding = |tx: bitcoin::Transaction| async move {
+							// Blocknil patch: none of an external funding's inputs are ours.
+							if external_funding {
+								return;
+							}
 							let inputs =
 								tx.input.into_iter().map(|txin| txin.previous_output).collect();
 							if let Err(e) =
@@ -1207,8 +1230,13 @@ where
 									ChannelOutputRole::Funding,
 									[vout as u32],
 								)
+								// Blocknil patch: none of an external funding's inputs are ours.
 								.with_locked_inputs(
-									final_tx.input.iter().map(|txin| txin.previous_output),
+									final_tx
+										.input
+										.iter()
+										.map(|txin| txin.previous_output)
+										.filter(|_| !external_funding),
 								);
 							match self.wallet.record_own_funding_tx_facts(facts).await {
 								Ok(FactsRecordOutcome::Recorded) => {},
@@ -2537,6 +2565,8 @@ where
 				// Clean up any funding fee-rate override still pending if the channel went
 				// away before the funding transaction was generated.
 				self.pending_funding_fee_rates.lock().expect("lock").remove(&user_channel_id);
+				// Blocknil patch: and the open's registration as an external funding.
+				self.external_funding.opens.lock().expect("lock").remove(&user_channel_id);
 
 				// A splice round this node signed dies with the channel unless LDK had already
 				// handed it to the broadcaster. Whatever the channel manager reports for a round
