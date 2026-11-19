@@ -5,28 +5,36 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-// Blocknil patch: splice coins from a wallet outside ldk-node into a channel.
+// Blocknil patch: fund channels from a wallet outside ldk-node.
 //
-// Upstream ldk-node only splices in coins from its own wallet: `Node::splice_in` has them chosen by
-// that wallet, and the `FundingTransactionReadyForSigning` handler signs only the inputs that wallet
-// owns. LDK itself takes any confirmed coins, so the patch adds two things:
+// Upstream ldk-node pays for every channel open and splice-in out of its own wallet: `Node::splice_in`
+// has the coins chosen by that wallet, the `FundingTransactionReadyForSigning` handler signs only
+// the inputs that wallet owns, and the `FundingGenerationReady` handler builds an opening channel's
+// funding transaction from it. LDK itself doesn't care where the money comes from, so the patch
+// adds:
 //
-// - `Node::splice_in_with_inputs`, which hands LDK coins chosen by the caller, and
-// - a `FundingInputSigner` the caller registers, which the event handler asks to sign the inputs
-//   of this node's contribution that its own wallet does not own.
+// - `Node::splice_in_with_inputs`, which hands LDK coins chosen by the caller;
+// - `Node::open_channel_with_external_funding`, which opens a channel whose funding transaction the
+//   caller builds when LDK asks for it;
+// - a `FundingInputSigner` the caller registers, which the event handlers ask to sign the inputs
+//   of this node's splice contribution that its own wallet does not own, and to build those
+//   funding transactions.
 //
-// With it, a spending wallet outside the node (a taproot one, say) pays for a splice directly, and
-// the node's on-chain wallet can stay empty.
+// With it, a spending wallet outside the node (a taproot one, say) pays for channels directly,
+// and the node's on-chain wallet can stay empty.
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, RwLock};
 
+use bitcoin::absolute::LockTime;
 use bitcoin::psbt::Psbt;
 use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use lightning::chain::ClaimId;
 use lightning::ln::funding::{FundingContribution, FundingContributionError, FundingTemplate};
 use lightning::util::wallet_utils::{CoinSelection, CoinSelectionSourceSync, ConfirmedUtxo, Input};
 
-/// Signs the inputs a wallet outside ldk-node contributed to a channel's funding transaction.
+/// Pays for channels from a wallet outside ldk-node: signs the inputs it contributed to a splice,
+/// and builds the funding transaction of a channel it opens.
 ///
 /// Blocknil patch. Register one with [`crate::Node::set_funding_input_signer`] before
 /// [`crate::Node::start`]: LDK asks again, when the node starts, for the signatures of a splice
@@ -49,13 +57,28 @@ pub trait FundingInputSigner: Send + Sync {
 	fn sign_funding_inputs(
 		&self, tx: Transaction, known_prevouts: Vec<(OutPoint, TxOut)>,
 	) -> Result<Transaction, ()>;
+
+	/// Builds and signs a transaction that pays exactly `value_sats` to `output_script` (the
+	/// funding output of a channel opened with [`crate::Node::open_channel_with_external_funding`])
+	/// at `fee_rate`, with `locktime`. Anything else it pays goes back to this wallet. LDK
+	/// broadcasts it once the counterparty has signed the first commitment transaction. An error
+	/// closes the channel before it is funded.
+	#[allow(clippy::result_unit_err)]
+	fn build_funding_transaction(
+		&self, output_script: ScriptBuf, value_sats: u64, fee_rate: FeeRate, locktime: LockTime,
+	) -> Result<Transaction, ()> {
+		let _ = (output_script, value_sats, fee_rate, locktime);
+		Err(())
+	}
 }
 
 /// What the node and its event handler share about funding from outside the node: the registered
-/// signer.
+/// signer, and the channels being opened with it, by `user_channel_id` (their fee rate waits in
+/// the node's `pending_funding_fee_rates`, as any open's does).
 #[derive(Default)]
 pub(crate) struct ExternalFunding {
 	pub(crate) signer: RwLock<Option<Arc<dyn FundingInputSigner>>>,
+	pub(crate) opens: Mutex<HashSet<u128>>,
 }
 
 /// Builds a contribution adding `value_added` to a channel from `inputs`, which a wallet outside
