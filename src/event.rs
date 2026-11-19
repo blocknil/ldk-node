@@ -51,6 +51,7 @@ use crate::data_store::{DataStoreUpdateResult, UpdatableObject};
 use crate::fee_estimator::ConfirmationTarget;
 #[cfg(feature = "uniffi")]
 use crate::ffi::PaidBolt12Invoice;
+use crate::held_payments::HeldPayments;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -770,6 +771,7 @@ where
 	logger: L,
 	config: Arc<Config>,
 	pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+	held_payments: Arc<HeldPayments>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -788,6 +790,7 @@ where
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 		pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+		held_payments: Arc<HeldPayments>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -811,6 +814,7 @@ where
 			logger,
 			config,
 			pending_funding_fee_rates,
+			held_payments,
 		}
 	}
 
@@ -2441,6 +2445,10 @@ where
 					.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
 					.await;
 
+				// Blocknil patch: a payment held for this client goes out now that their channel
+				// is ready, or bigger: a splice that locked is re-signalled as `ChannelReady`.
+				self.held_payments.release_for(counterparty_node_id);
+
 				let event = Event::ChannelReady {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2663,6 +2671,17 @@ where
 				payment_hash,
 				..
 			} => {
+				// Blocknil patch: an HTLC to one of our clients' channels (not an LSPS2 intercept
+				// SCID) is a held payment (see `held_payments`).
+				if let Some(customer) = self.held_payments.customer_for(requested_next_hop_scid) {
+					self.held_payments.intercepted(
+						intercept_id,
+						payment_hash,
+						customer,
+						expected_outbound_amount_msat,
+					);
+					return Ok(());
+				}
 				self.liquidity_source
 					.lsps2_service()
 					.handle_htlc_intercepted(
@@ -3380,6 +3399,7 @@ mod tests {
 			Arc::clone(&node.logger),
 			Arc::clone(&node.config),
 			Arc::clone(&node.pending_funding_fee_rates),
+			Arc::clone(&node.held_payments),
 		);
 		(node, event_handler)
 	}

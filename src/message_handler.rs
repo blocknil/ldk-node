@@ -16,6 +16,7 @@ use lightning::util::ser::LengthLimitedRead;
 use lightning_liquidity::lsps0::ser::RawLSPSMessage;
 use lightning_types::features::{InitFeatures, NodeFeatures};
 
+use crate::held_payments::HeldPayments;
 use crate::liquidity::LiquiditySource;
 
 pub(crate) struct NodeCustomMessageHandler<L: Deref>
@@ -23,14 +24,18 @@ where
 	L::Target: Logger,
 {
 	liquidity_source: Arc<LiquiditySource<L>>,
+	/// Blocknil patch: told when a peer connects, to release what is held for it.
+	held_payments: Arc<HeldPayments>,
 }
 
 impl<L: Deref> NodeCustomMessageHandler<L>
 where
 	L::Target: Logger,
 {
-	pub(crate) fn new(liquidity_source: Arc<LiquiditySource<L>>) -> Self {
-		Self { liquidity_source }
+	pub(crate) fn new(
+		liquidity_source: Arc<LiquiditySource<L>>, held_payments: Arc<HeldPayments>,
+	) -> Self {
+		Self { liquidity_source, held_payments }
 	}
 }
 
@@ -72,6 +77,9 @@ where
 	fn peer_connected(
 		&self, their_node_id: PublicKey, msg: &lightning::ln::msgs::Init, inbound: bool,
 	) -> Result<(), ()> {
+		// Blocknil patch: a client is back; what is held for it goes out once its channel is
+		// reestablished. Every node runs this handler, whatever its async payments role.
+		self.held_payments.peer_connected(their_node_id);
 		self.liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound)
 	}
 

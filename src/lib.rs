@@ -101,6 +101,7 @@ mod fee_estimator;
 mod ffi;
 mod gossip;
 pub mod graph;
+mod held_payments;
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -149,6 +150,7 @@ use fee_estimator::{
 use ffi::*;
 use gossip::GossipSource;
 use graph::NetworkGraph;
+pub use held_payments::{HoldRecord, OnHeld, OnShortOfRoom, ShortOfRoom};
 use io::utils::update_and_persist_node_metrics;
 pub use lightning;
 use lightning::chain::BlockLocator;
@@ -158,7 +160,7 @@ pub use lightning::ln::channel_state::{
 	ChannelShutdownState, InboundHTLCDetails, InboundHTLCStateDetails, OutboundHTLCDetails,
 	OutboundHTLCStateDetails,
 };
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{InterceptId, PaymentId};
 use lightning::ln::funding::{
 	FundingBuilder, FundingContribution, FundingContributionError, FundingTemplate,
 };
@@ -289,6 +291,8 @@ pub struct Node {
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	pending_funding_fee_rates: Arc<Mutex<std::collections::HashMap<u128, bitcoin::FeeRate>>>,
+	/// Blocknil patch: payments held for our clients (see `held_payments`).
+	held_payments: Arc<held_payments::HeldPayments>,
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
@@ -793,12 +797,47 @@ impl Node {
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 			Arc::clone(&self.pending_funding_fee_rates),
+			Arc::clone(&self.held_payments),
 		));
 
 		if let Some(prober) = self.prober.clone() {
 			let stop_rx = self.stop_sender.subscribe();
 			self.runtime.spawn_cancellable_background_task(async move {
 				run_prober(prober, stop_rx).await;
+			});
+		}
+
+		if self.config.hold_private_forwards {
+			// Blocknil patch: held payments go out as soon as their client is back (a reconnect,
+			// then retries while the channel is reestablished, which LDK signals with no event) or
+			// their channel is ready or bigger (`ChannelReady`, also for a splice that locked). The
+			// timer is only the fallback: the deadline, and a channel usable without an event.
+			let held_payments = Arc::clone(&self.held_payments);
+			let runtime = Arc::clone(&self.runtime);
+			let mut stop_held = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(held_payments::FALLBACK_TICK);
+				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+				loop {
+					tokio::select! {
+						_ = stop_held.changed() => return,
+						_ = interval.tick() => held_payments.process(),
+						peers = held_payments.next_reconnected() => {
+							for peer in peers {
+								let held_payments = Arc::clone(&held_payments);
+								runtime.spawn_cancellable_background_task(async move {
+									for _ in 0..held_payments::RELEASE_RETRIES {
+										held_payments.release_for(peer);
+										if !held_payments.has_held(&peer) {
+											return;
+										}
+										tokio::time::sleep(held_payments::RELEASE_RETRY_EVERY).await;
+									}
+								});
+							}
+						},
+					}
+				}
 			});
 		}
 
@@ -3106,6 +3145,64 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 		0
 	} else {
 		config.anchor_channels_config.per_channel_reserve_sats
+	}
+}
+
+/// Blocknil patch: held payments and splice on arrival (see `held_payments`). r8's names.
+impl Node {
+	/// How long a payment for an offline client is held before it is failed back (50 s by
+	/// default). Needs [`Config::hold_private_forwards`].
+	pub fn set_hold_duration(&self, hold_for: Duration) {
+		self.held_payments.set_hold_for(hold_for);
+	}
+
+	/// Called with the client each time a payment starts being held for them because they are
+	/// offline, to wake their phone. It must not block (see [`OnHeld`]).
+	pub fn set_payment_held_handler(&self, on_held: OnHeld) {
+		self.held_payments.set_on_held(on_held);
+	}
+
+	/// Splice on arrival: called once for each held payment whose client is online but whose
+	/// channel is too small for it. Answer with [`Node::set_held_payment_fee`] or
+	/// [`Node::refuse_held_payment`]; until then it stays held, under its usual deadline. The
+	/// handler must not block (see [`OnShortOfRoom`]).
+	pub fn set_short_of_room_handler(&self, handler: OnShortOfRoom) {
+		self.held_payments.set_on_short_of_room(handler);
+	}
+
+	/// Splice on arrival: room is being added for this held payment (a splice of our own funds
+	/// into the client's channel): forward it, less `fee_msat`, as soon as it fits. The client's
+	/// node has to accept the withheld fee ([`Node::allow_provider_fee`] on ours).
+	pub fn set_held_payment_fee(
+		&self, intercept_id: InterceptId, fee_msat: u64,
+	) -> Result<(), Error> {
+		let customer =
+			self.held_payments.set_fee(intercept_id, fee_msat).ok_or(Error::InvalidPaymentId)?;
+		self.held_payments.release_for(customer);
+		Ok(())
+	}
+
+	/// Splice on arrival: no room will be added for this held payment: fail it back now, with
+	/// `reason` in the log and in [`Node::recent_held_payments`].
+	pub fn refuse_held_payment(
+		&self, intercept_id: InterceptId, reason: &str,
+	) -> Result<(), Error> {
+		if self.held_payments.refuse(intercept_id, reason) {
+			Ok(())
+		} else {
+			Err(Error::InvalidPaymentId)
+		}
+	}
+
+	/// Payments held right now, as `(customer, amount_msat, seconds left)`.
+	pub fn held_payments(&self) -> Vec<(PublicKey, u64, u64)> {
+		self.held_payments.held()
+	}
+
+	/// The last payments that were held and have since ended (forwarded or failed back), newest
+	/// first.
+	pub fn recent_held_payments(&self) -> Vec<HoldRecord> {
+		self.held_payments.recent()
 	}
 }
 

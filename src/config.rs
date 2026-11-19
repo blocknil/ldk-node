@@ -276,6 +276,7 @@ impl Default for ForwardedPaymentTrackingMode {
 /// | `manually_handle_unknown_bolt11_payments` | false                              |
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
 /// | `trust_own_splice_inputs_0conf`        | false                               |
+/// | `hold_private_forwards`                | false                               |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -379,6 +380,14 @@ pub struct Config {
 	/// **Note:** a channel with a zero splice depth can't fee-bump its splices with RBF: a stuck
 	/// splice has to be bumped with a child spending its change (CPFP).
 	pub trust_own_splice_inputs_0conf: bool,
+	/// Blocknil patch: as an LSP, intercept every payment we forward to a private channel (our
+	/// clients'), so it can be held for a client who is offline, or one whose channel is too small
+	/// for it (splice on arrival). See [`Node::set_payment_held_handler`] and
+	/// [`Node::set_short_of_room_handler`].
+	///
+	/// [`Node::set_payment_held_handler`]: crate::Node::set_payment_held_handler
+	/// [`Node::set_short_of_room_handler`]: crate::Node::set_short_of_room_handler
+	pub hold_private_forwards: bool,
 }
 
 impl Default for Config {
@@ -400,6 +409,7 @@ impl Default for Config {
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
 			trust_own_splice_inputs_0conf: false,
+			hold_private_forwards: false,
 		}
 	}
 }
