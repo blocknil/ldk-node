@@ -135,7 +135,9 @@ async fn resolve_name_via_the_provider_with_an_empty_graph() {
 	wallet_config.node_config.listening_addresses = None;
 	wallet_config.node_config.node_alias = None;
 	wallet_config.node_config.hrn_config = HumanReadableNamesConfig {
-		resolution_config: HRNResolverConfig::Blip32Via { resolver_nodes: vec![provider.node_id()] },
+		resolution_config: HRNResolverConfig::Blip32Via {
+			resolver_nodes: vec![provider.node_id()],
+		},
 	};
 	let wallet = setup_node(&chain_source, wallet_config);
 	let provider_address = provider.listening_addresses().unwrap().first().unwrap().clone();

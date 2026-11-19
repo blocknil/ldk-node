@@ -8680,6 +8680,8 @@ async fn setup_zero_client_reserve_service(
 		max_client_to_self_delay: 1024,
 		client_trusts_lsp: false,
 		disable_client_reserve: true,
+		opening_fee_params_lifetime_secs:
+			ldk_node::liquidity::DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
 	};
 	let client_node = setup_node(&TestChainSource::Esplora(electrsd), random_config());
 
