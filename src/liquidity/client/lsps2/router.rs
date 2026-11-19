@@ -22,12 +22,13 @@ use lightning::routing::router::{InFlightHtlcs, Route, RouteParameters, Router};
 use lightning::sign::{EntropySource, ReceiveAuthKey};
 use lightning::types::features::BlindedHopFeatures;
 use lightning::types::payment::PaymentHash;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::payment::PaymentMetadata;
 use crate::types::Graph;
 
 use super::LSPS2_MIN_FINAL_CLTV_EXPIRY_DELTA;
+use lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA;
 
 /// Parameters needed to construct an LSPS2 blinded payment path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,12 +55,67 @@ pub struct LSPS2Router<R: Router, ES: EntropySource> {
 	inner_router: R,
 	network_graph: Arc<Graph>,
 	entropy_source: ES,
+	/// Blocknil patch: our provider, when set (see `provider_path`).
+	provider: Option<Arc<RwLock<Option<PublicKey>>>>,
 }
 
 impl<R: Router, ES: EntropySource> LSPS2Router<R, ES> {
 	/// Constructs an LSPS2-aware wrapper around `inner_router`.
 	pub fn new(inner_router: R, network_graph: Arc<Graph>, entropy_source: ES) -> Self {
-		Self { inner_router, network_graph, entropy_source }
+		Self { inner_router, network_graph, entropy_source, provider: None }
+	}
+
+	/// Blocknil patch: offer a path through our channel with `provider` (when it is set) to a
+	/// payment no channel has the room for (see `provider_path`).
+	pub(crate) fn with_provider_path(mut self, provider: Arc<RwLock<Option<PublicKey>>>) -> Self {
+		self.provider = Some(provider);
+		self
+	}
+
+	/// Blocknil patch: a blinded path through our channel with our provider, with no HTLC
+	/// maximum. LDK only builds paths through channels whose inbound capacity covers the amount,
+	/// so a BOLT 12 payment larger than our room got no invoice at all; through this one it
+	/// reaches the provider, which can splice room in for it, or hold it while we're offline, as
+	/// it does for `Bolt11Payment::receive_via_provider`'s invoices.
+	fn provider_path<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
+		first_hops: &[ChannelDetails], tlvs: &ReceiveTlvs, secp_ctx: &Secp256k1<T>,
+	) -> Option<BlindedPaymentPath> {
+		let provider = (*self.provider.as_ref()?.read().expect("lock"))?;
+		let channel = first_hops
+			.iter()
+			.filter(|c| c.counterparty.node_id == provider && c.is_channel_ready)
+			.max_by_key(|c| c.channel_value_satoshis)?;
+		let payment_relay: PaymentRelay =
+			channel.counterparty.forwarding_info.clone()?.try_into().ok()?;
+		let forward_node = PaymentForwardNode {
+			tlvs: ForwardTlvs {
+				short_channel_id: channel.get_inbound_payment_scid()?,
+				payment_constraints: PaymentConstraints {
+					max_cltv_expiry: tlvs
+						.payment_constraints
+						.max_cltv_expiry
+						.saturating_add(payment_relay.cltv_expiry_delta as u32),
+					htlc_minimum_msat: channel.inbound_htlc_minimum_msat.unwrap_or(0),
+				},
+				payment_relay,
+				features: BlindedHopFeatures::empty(),
+				next_blinding_override: None,
+			},
+			node_id: provider,
+			htlc_maximum_msat: u64::MAX,
+		};
+		BlindedPaymentPath::new(
+			&[forward_node],
+			recipient,
+			local_node_receive_key,
+			tlvs.clone(),
+			u64::MAX,
+			MIN_FINAL_CLTV_EXPIRY_DELTA,
+			&self.entropy_source,
+			secp_ctx,
+		)
+		.ok()
 	}
 
 	fn payment_parameters(&self, payment_context: &PaymentContext) -> Option<LSPS2LeaseParameters> {
@@ -128,6 +184,8 @@ impl<R: Router, ES: EntropySource> Router for LSPS2Router<R, ES> {
 				})
 			}
 		});
+		// Blocknil patch: kept for `provider_path`.
+		let provider_first_hops = parameters.is_none().then(|| first_hops.clone());
 		let inner_paths = self.inner_router.create_blinded_payment_paths(
 			recipient,
 			local_node_receive_key,
@@ -158,6 +216,16 @@ impl<R: Router, ES: EntropySource> Router for LSPS2Router<R, ES> {
 			&& (!is_direct_recipient_path || direct_path_has_sufficient_liquidity)
 		{
 			return inner_paths;
+		}
+
+		// Blocknil patch: no ordinary path can take the payment, and it isn't a JIT payment: a path
+		// through our provider, which can add room for it when it arrives.
+		if let Some(first_hops) = provider_first_hops {
+			if let Some(path) =
+				self.provider_path(recipient, local_node_receive_key, &first_hops, &tlvs, secp_ctx)
+			{
+				return Ok(vec![path]);
+			}
 		}
 
 		let Some(params) = parameters else {
