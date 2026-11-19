@@ -244,3 +244,18 @@ harness = false
 #lightning-liquidity = { path = "../rust-lightning/lightning-liquidity" }
 #lightning-macros = { path = "../rust-lightning/lightning-macros" }
 #lightning-dns-resolver = { path = "../rust-lightning/lightning-dns-resolver" }
+
+# Spike: build against rust-lightning v0.3-rc4 (local worktree) instead of the rc3 pin.
+[patch."https://github.com/lightningdevkit/rust-lightning"]
+lightning = { path = "../spike-rl-rc4/lightning" }
+lightning-types = { path = "../spike-rl-rc4/lightning-types" }
+lightning-invoice = { path = "../spike-rl-rc4/lightning-invoice" }
+lightning-net-tokio = { path = "../spike-rl-rc4/lightning-net-tokio" }
+lightning-persister = { path = "../spike-rl-rc4/lightning-persister" }
+lightning-background-processor = { path = "../spike-rl-rc4/lightning-background-processor" }
+lightning-rapid-gossip-sync = { path = "../spike-rl-rc4/lightning-rapid-gossip-sync" }
+lightning-block-sync = { path = "../spike-rl-rc4/lightning-block-sync" }
+lightning-transaction-sync = { path = "../spike-rl-rc4/lightning-transaction-sync" }
+lightning-liquidity = { path = "../spike-rl-rc4/lightning-liquidity" }
+lightning-macros = { path = "../spike-rl-rc4/lightning-macros" }
+lightning-dns-resolver = { path = "../spike-rl-rc4/lightning-dns-resolver" }

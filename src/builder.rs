@@ -70,6 +70,7 @@ use crate::entropy::NodeEntropy;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
+use crate::held_payments::HeldPayments;
 #[cfg(feature = "storage-filesystem")]
 use crate::io::fs_store::open_or_migrate_fs_store;
 #[cfg(feature = "storage-sqlite")]
@@ -2159,10 +2160,18 @@ fn build_with_store_internal(
 
 	let mut user_config = default_user_config(&config);
 
+	if config.hold_private_forwards {
+		// Blocknil spike: every forward to a client's private channel is intercepted, so it can be
+		// held (offline client) or wait for a splice (client short of room).
+		user_config.htlc_interception_flags |= HTLCInterceptionFlags::ToOnlinePrivateChannels as u8
+			| HTLCInterceptionFlags::ToOfflinePrivateChannels as u8;
+		user_config.accept_forwards_to_priv_channels = true;
+	}
+
 	if liquidity_source_config.and_then(|lsc| lsc.lsps2_service.as_ref()).is_some() {
 		// If we act as an LSPS2 service, we need to be able to intercept HTLCs and forward the
 		// information to the service handler.
-		user_config.htlc_interception_flags = HTLCInterceptionFlags::ToInterceptSCIDs.into();
+		user_config.htlc_interception_flags |= HTLCInterceptionFlags::ToInterceptSCIDs as u8;
 
 		// If we act as an LSPS2 service, we allow forwarding to unannounced channels.
 		user_config.accept_forwards_to_priv_channels = true;
@@ -2614,6 +2623,9 @@ fn build_with_store_internal(
 		crate::config::ForwardedPaymentTrackingMode::Stats => 0,
 	};
 
+	let held_payments =
+		Arc::new(HeldPayments::new(Arc::clone(&channel_manager), Arc::clone(&logger)));
+
 	Ok(Node {
 		runtime,
 		stop_sender,
@@ -2650,6 +2662,7 @@ fn build_with_store_internal(
 		om_mailbox,
 		async_payments_role,
 		pending_funding_fee_rates: Arc::new(Mutex::new(std::collections::HashMap::new())),
+		held_payments,
 		#[cfg(feature = "unified-payments")]
 		hrn_resolver,
 		prober,

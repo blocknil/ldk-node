@@ -101,6 +101,7 @@ mod fee_estimator;
 mod ffi;
 mod gossip;
 pub mod graph;
+pub mod held_payments;
 mod hex_utils;
 pub mod io;
 pub mod liquidity;
@@ -289,6 +290,7 @@ pub struct Node {
 	om_mailbox: Option<Arc<OnionMessageMailbox>>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	pending_funding_fee_rates: Arc<Mutex<std::collections::HashMap<u128, bitcoin::FeeRate>>>,
+	held_payments: Arc<held_payments::HeldPayments>,
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
@@ -788,7 +790,25 @@ impl Node {
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 			Arc::clone(&self.pending_funding_fee_rates),
+			Arc::clone(&self.held_payments),
 		));
+
+		if self.config.hold_private_forwards {
+			// Blocknil spike: a held payment goes out once its client is back or its room is
+			// there; a timer is enough for the spike (production would react to reconnects and
+			// `ChannelReady`).
+			let held_payments = Arc::clone(&self.held_payments);
+			let mut stop_rx = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(Duration::from_millis(200));
+				loop {
+					tokio::select! {
+						_ = stop_rx.changed() => return,
+						_ = interval.tick() => held_payments.process(),
+					}
+				}
+			});
+		}
 
 		if let Some(prober) = self.prober.clone() {
 			let stop_rx = self.stop_sender.subscribe();
@@ -1507,7 +1527,11 @@ impl Node {
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
-		user_config.channel_config = (channel_config.unwrap_or_default()).clone().into();
+		// Blocknil spike: without a per-channel config, keep the node's (it carries the splice
+		// depths).
+		if let Some(channel_config) = channel_config {
+			user_config.channel_config = channel_config.into();
+		}
 
 		// Unannounced channels rely on LDK's default of 100% inbound HTLC value-in-flight
 		// to support large initial payments via LSPS2.
@@ -3115,6 +3139,98 @@ async fn connect_and_discover_lsp(
 		Err(e) => {
 			log_debug!(logger, "Protocol discovery failed for LSP {}: {:?}", node_id, e);
 		},
+	}
+}
+
+/// Blocknil spike: held payments on rust-lightning 0.3's interception flags.
+impl Node {
+	/// Called once per HTLC whose online client's channel is too small for it.
+	pub fn set_short_of_room_handler(&self, handler: held_payments::OnShortOfRoom) {
+		self.held_payments.set_on_short_of_room(handler);
+	}
+
+	/// Called once per HTLC held for an offline client (to wake them).
+	pub fn set_on_held(&self, handler: held_payments::OnHeld) {
+		self.held_payments.set_on_held(handler);
+	}
+
+	/// How long an HTLC is held before it is failed back.
+	pub fn set_hold_for(&self, hold_for: Duration) {
+		self.held_payments.set_hold_for(hold_for);
+	}
+
+	/// Forward the held HTLC less `fee_msat` once it fits. False when it is no longer held.
+	pub fn set_held_payment_fee(
+		&self, intercept_id: lightning::ln::channelmanager::InterceptId, fee_msat: u64,
+	) -> bool {
+		self.held_payments.set_fee(intercept_id, fee_msat)
+	}
+
+	/// Fail the held HTLC back now. False when it is no longer held.
+	pub fn refuse_held_payment(
+		&self, intercept_id: lightning::ln::channelmanager::InterceptId,
+	) -> bool {
+		self.held_payments.refuse(intercept_id)
+	}
+
+	/// Client side: an invoice whose only route hint is our channel with `provider`, with no HTLC
+	/// maximum, so a payer sends amounts larger than the channel can take today and the provider
+	/// gets the chance to add room. LDK's own hints cap HTLCs at the channel's current maximum.
+	pub fn receive_via_provider(
+		&self, amount_msat: u64, description: &str, expiry_secs: u32, provider: PublicKey,
+	) -> Result<lightning_invoice::Bolt11Invoice, Error> {
+		use lightning::routing::router::{RouteHint, RouteHintHop};
+		use lightning_invoice::{InvoiceBuilder, RoutingFees};
+		let channel = self
+			.channel_manager
+			.list_channels_with_counterparty(&provider)
+			.into_iter()
+			.filter(|c| c.is_channel_ready)
+			.max_by_key(|c| c.channel_value_satoshis)
+			.ok_or(Error::InvoiceCreationFailed)?;
+		let scid = channel.get_inbound_payment_scid().ok_or(Error::InvoiceCreationFailed)?;
+		let forwarding =
+			channel.counterparty.forwarding_info.ok_or(Error::InvoiceCreationFailed)?;
+		let (payment_hash, payment_secret) = self
+			.channel_manager
+			.create_inbound_payment(Some(amount_msat), expiry_secs, None, None)
+			.map(|(hash, secret, _)| (hash, secret))
+			.map_err(|_| Error::InvoiceCreationFailed)?;
+		let route_hint = RouteHint(vec![RouteHintHop {
+			src_node_id: provider,
+			short_channel_id: scid,
+			fees: RoutingFees {
+				base_msat: forwarding.fee_base_msat,
+				proportional_millionths: forwarding.fee_proportional_millionths,
+			},
+			cltv_expiry_delta: forwarding.cltv_expiry_delta,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}]);
+		let description = lightning_invoice::Description::new(description.to_string())
+			.map_err(|_| Error::InvoiceCreationFailed)?;
+		InvoiceBuilder::new(self.config.network.into())
+			.description(description.into_inner().0)
+			.payment_hash(payment_hash)
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(
+				lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA.into(),
+			)
+			.expiry_time(Duration::from_secs(expiry_secs.into()))
+			.amount_milli_satoshis(amount_msat)
+			.basic_mpp()
+			.private_route(route_hint)
+			.build_signed(|hash| {
+				bitcoin::secp256k1::Secp256k1::new()
+					.sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
+			})
+			.map_err(|_| Error::InvoiceCreationFailed)
+	}
+
+	/// HTLCs held right now: `(client, payment_hash, amount_msat)`.
+	pub fn held_payments(&self) -> Vec<(PublicKey, lightning::types::payment::PaymentHash, u64)> {
+		self.held_payments.held()
 	}
 }
 

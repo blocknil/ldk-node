@@ -362,6 +362,15 @@ pub struct Config {
 	pub manually_handle_unknown_bolt11_payments: bool,
 	/// The mode used for tracking forwarded payments.
 	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	/// Blocknil spike: intercept every HTLC forwarded to a private channel, so a payment can be
+	/// held for an offline client or one short of room (see `Node::set_short_of_room_handler`).
+	pub hold_private_forwards: bool,
+	/// Blocknil spike: confirmations before locking a splice the counterparty put funds into
+	/// (rust-lightning 0.3 `inbound_splice_min_depth`, default 6).
+	pub inbound_splice_min_depth: Option<u32>,
+	/// Blocknil spike: confirmations before locking a splice we put funds into
+	/// (rust-lightning 0.3 `outbound_splice_min_depth`, default 6).
+	pub outbound_splice_min_depth: Option<u32>,
 }
 
 impl Default for Config {
@@ -382,6 +391,9 @@ impl Default for Config {
 			hrn_config: HumanReadableNamesConfig::default(),
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			hold_private_forwards: false,
+			inbound_splice_min_depth: None,
+			outbound_splice_min_depth: None,
 		}
 	}
 }
@@ -583,6 +595,12 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
 		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	if let Some(depth) = config.inbound_splice_min_depth {
+		user_config.channel_config.inbound_splice_min_depth = depth;
+	}
+	if let Some(depth) = config.outbound_splice_min_depth {
+		user_config.channel_config.outbound_splice_min_depth = depth;
+	}
 
 	let may_announce = may_announce_channel(config).is_ok();
 	user_config.accept_forwards_to_priv_channels = may_announce;
@@ -847,6 +865,10 @@ pub struct ChannelConfig {
 	///
 	/// Please refer to [`LdkChannelConfig`] for further details.
 	pub accept_underpaying_htlcs: bool,
+	/// Confirmations before locking a splice we put nothing into (spike: rust-lightning 0.3).
+	pub inbound_splice_min_depth: u32,
+	/// Confirmations before locking a splice we put inputs or outputs into (spike: 0.3).
+	pub outbound_splice_min_depth: u32,
 }
 
 impl From<LdkChannelConfig> for ChannelConfig {
@@ -858,6 +880,8 @@ impl From<LdkChannelConfig> for ChannelConfig {
 			max_dust_htlc_exposure: value.max_dust_htlc_exposure.into(),
 			force_close_avoidance_max_fee_satoshis: value.force_close_avoidance_max_fee_satoshis,
 			accept_underpaying_htlcs: value.accept_underpaying_htlcs,
+			inbound_splice_min_depth: value.inbound_splice_min_depth,
+			outbound_splice_min_depth: value.outbound_splice_min_depth,
 		}
 	}
 }
@@ -871,6 +895,8 @@ impl From<ChannelConfig> for LdkChannelConfig {
 			max_dust_htlc_exposure: value.max_dust_htlc_exposure.into(),
 			force_close_avoidance_max_fee_satoshis: value.force_close_avoidance_max_fee_satoshis,
 			accept_underpaying_htlcs: value.accept_underpaying_htlcs,
+			inbound_splice_min_depth: value.inbound_splice_min_depth,
+			outbound_splice_min_depth: value.outbound_splice_min_depth,
 		}
 	}
 }

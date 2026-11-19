@@ -452,6 +452,7 @@ where
 				opening_fee_msat: _,
 				user_channel_id,
 				intercept_scid: _,
+				max_client_to_self_delay: _,
 			} => {
 				if self.liquidity_manager.lsps2_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
