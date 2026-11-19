@@ -452,7 +452,7 @@ where
 				opening_fee_msat: _,
 				user_channel_id,
 				intercept_scid: _,
-				max_client_to_self_delay: _,
+				max_client_to_self_delay,
 			} => {
 				if self.liquidity_manager.lsps2_service_handler().is_none() {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
@@ -557,6 +557,14 @@ where
 				}
 
 				let mut config = self.channel_manager.get_current_config().clone();
+
+				// The client's `to_self_delay` must not exceed the maximum promised in the opening fee
+				// parameters it selected. Events persisted before rust-lightning 0.3 carry no bound.
+				if let Some(max_client_to_self_delay) = max_client_to_self_delay {
+					let ours = config.channel_handshake_limits.their_to_self_delay;
+					config.channel_handshake_limits.their_to_self_delay =
+						u32::from(ours).min(max_client_to_self_delay) as u16;
+				}
 
 				// If we act as an LSPS2 service, the HTLC-value-in-flight must be 100% of the
 				// channel value to ensure we can forward the initial payment. That cap only

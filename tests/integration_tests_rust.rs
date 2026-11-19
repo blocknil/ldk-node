@@ -8227,6 +8227,23 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
 	client_trusts_0conf: bool,
 ) -> (TestNode, TestNode, TestNode) {
+	setup_lsps2_nodes_with_max_client_to_self_delay(
+		bitcoind,
+		electrsd,
+		service_store,
+		service_funds_sat,
+		client_trusts_0conf,
+		1024,
+	)
+	.await
+}
+
+async fn setup_lsps2_nodes_with_max_client_to_self_delay<
+	S: PaginatedKVStore + Send + Sync + 'static,
+>(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
+	client_trusts_0conf: bool, max_client_to_self_delay: u32,
+) -> (TestNode, TestNode, TestNode) {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let mut sync_config = EsploraSyncConfig::default();
@@ -8241,7 +8258,7 @@ async fn setup_lsps2_nodes<S: PaginatedKVStore + Send + Sync + 'static>(
 		min_payment_size_msat: 0,
 		min_channel_lifetime: 100,
 		min_channel_opening_fee_msat: 0,
-		max_client_to_self_delay: 1024,
+		max_client_to_self_delay,
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 	};
@@ -8386,6 +8403,41 @@ async fn lsps2_service_fails_payment_if_it_cannot_open_channel() {
 	expect_channel_ready_event!(client_node, service_node.node_id());
 	expect_payment_successful_event!(payer_node, payer_payment_id, None);
 	expect_payment_received_event!(client_node, jit_amount_msat * 99 / 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_holds_client_to_the_offered_max_to_self_delay() {
+	// Blocknil: the opening fee parameters the client selected promise a maximum `to_self_delay`
+	// (here 100 blocks). A client asking for more (LDK's default is 144) gets no channel, and the
+	// payment fails back, rather than the service locking its funds for longer than it offered.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) = setup_lsps2_nodes_with_max_client_to_self_delay(
+		&bitcoind,
+		&electrsd,
+		service_store,
+		10_000_000,
+		true,
+		100,
+	)
+	.await;
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("asdf")).unwrap());
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(100_000_000, &invoice_description.into(), 1024)
+		.unwrap();
+
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_event!(payer_node, PaymentFailed);
+	assert!(
+		service_node
+			.list_channels()
+			.iter()
+			.all(|c| c.counterparty.node_id != client_node.node_id()),
+		"no channel to the client"
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
