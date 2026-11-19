@@ -2976,6 +2976,21 @@ impl Node {
 		self.liquidity_source.lsps2_service().jit_waits.set_on_waiting(on_held);
 	}
 
+	/// The current opening-fee terms of every LSPS2 LSP this node knows, one entry per offer, each
+	/// naming its LSP: the minimum and proportional fee, the smallest and largest first payment it
+	/// opens a channel for, and when the offer lapses. Fetched on the spot (a network round trip
+	/// to each LSP), so a screen that shows them never shows stale numbers. LSPs that don't answer
+	/// are left out; it fails only when none answers.
+	///
+	/// Blocknil patch: r8 asked its one LSP; upstream supports several, so each entry now carries
+	/// `lsp_node_id`.
+	pub fn lsps2_opening_fee_params(&self) -> Result<Vec<liquidity::Lsps2FeeTerms>, Error> {
+		let lsps2_client = self.liquidity_source.lsps2_client();
+		let connection_manager = Arc::clone(&self.connection_manager);
+		self.runtime
+			.block_on(async move { lsps2_client.opening_fee_terms(&connection_manager).await })
+	}
+
 	/// First payments waiting for their offline client to connect so their just-in-time channel
 	/// can open: `(client, amount to forward in msat)`. Blocknil patch.
 	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {

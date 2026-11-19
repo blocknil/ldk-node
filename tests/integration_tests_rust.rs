@@ -8701,6 +8701,32 @@ async fn lsps2_payment_stuck_by_a_restart_mid_open_is_failed_back() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
+	// Blocknil patch: the client reads its LSP's current offer, as `setup_lsps2_nodes` configures
+	// it, without negotiating anything.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, _payer_node) =
+		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+
+	let before =
+		std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+			as i64;
+	let terms = client_node.lsps2_opening_fee_params().unwrap();
+	assert_eq!(terms.len(), 1);
+	let offer = &terms[0];
+	assert_eq!(offer.lsp_node_id, service_node.node_id());
+	assert_eq!(offer.min_fee_msat, 0);
+	assert_eq!(offer.proportional_ppm, 10_000);
+	assert_eq!(offer.min_payment_size_msat, 0);
+	assert_eq!(offer.max_payment_size_msat, 1_000_000_000);
+	let lifetime = DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS as i64;
+	assert!(offer.valid_until_unix >= before + lifetime - 5);
+	assert!(offer.valid_until_unix <= before + lifetime + 60);
+	assert!(client_node.list_channels().is_empty(), "nothing was bought");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_opens_jit_channels_of_at_least_25k_sats() {
 	// Blocknil patch: a first payment of 5,000 sats would otherwise get a channel sized to it
 	// (4,950 sats after the 1% fee, plus 10% over-provisioning: 5,445 sats). The service opens

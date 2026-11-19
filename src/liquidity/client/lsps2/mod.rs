@@ -817,6 +817,28 @@ where
 		Ok(())
 	}
 
+	/// Blocknil patch: every LSPS2 LSP's opening-fee terms, fetched now, for the app's provider
+	/// screen; otherwise they are only read while negotiating a lease. An LSP that doesn't answer
+	/// is left out, and it is an error only when none answers.
+	pub(crate) async fn opening_fee_terms(
+		self: &Arc<Self>, connection_manager: &Arc<ConnectionManager<L>>,
+	) -> Result<Vec<Lsps2FeeTerms>, Error> {
+		let offers = self.gather_lsps2_offers(connection_manager).await.map_err(Error::from)?;
+		Ok(offers
+			.into_iter()
+			.flat_map(|(lsp, response)| {
+				response.opening_fee_params_menu.into_iter().map(move |params| Lsps2FeeTerms {
+					lsp_node_id: lsp.node_id,
+					min_fee_msat: params.min_fee_msat,
+					proportional_ppm: params.proportional,
+					valid_until_unix: params.valid_until.0.timestamp(),
+					min_payment_size_msat: params.min_payment_size_msat,
+					max_payment_size_msat: params.max_payment_size_msat,
+				})
+			})
+			.collect())
+	}
+
 	async fn gather_lsps2_offers(
 		self: &Arc<Self>, connection_manager: &Arc<ConnectionManager<L>>,
 	) -> Result<Vec<(LspConfig, LSPS2FeeResponse)>, LeaseNegotiationError> {
@@ -1322,6 +1344,24 @@ where
 		};
 		Ok(lsps2_nodes)
 	}
+}
+
+/// One opening-fee offer of an LSPS2 LSP, as the app's provider screen shows it; see
+/// [`crate::Node::lsps2_opening_fee_params`]. Blocknil patch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lsps2FeeTerms {
+	/// The LSP making the offer: an LSP may make several, and a node may have several LSPs.
+	pub lsp_node_id: PublicKey,
+	/// The smallest fee it charges for opening the channel, in msat.
+	pub min_fee_msat: u64,
+	/// The part of the fee proportional to the first payment, in parts per million of it.
+	pub proportional_ppm: u32,
+	/// When the offer stops being valid, in seconds since the Unix epoch.
+	pub valid_until_unix: i64,
+	/// The smallest first payment it will open a channel for, in msat.
+	pub min_payment_size_msat: u64,
+	/// The largest first payment it will open a channel for, in msat.
+	pub max_payment_size_msat: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -19,6 +19,8 @@ use std::time::Duration;
 use bitcoin::secp256k1::PublicKey;
 pub use client::lsps1::LSPS1Liquidity;
 pub use client::LSPS1OrderStatus;
+// Blocknil patch: `Node::lsps2_opening_fee_params`.
+pub use client::lsps2::Lsps2FeeTerms;
 use lightning::ln::msgs::SocketAddress;
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::event::LSPS0ClientEvent;
