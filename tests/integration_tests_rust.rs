@@ -1113,6 +1113,64 @@ async fn channel_full_cycle_0conf_0reserve() {
 	.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn one_channel_per_peer_refuses_a_second_inbound_channel() {
+	// Blocknil patch: a node with `one_channel_per_peer` refuses a channel from a peer that
+	// already has one with it; that peer grows its channel by splicing instead.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node_a = setup_node(&chain_source, random_config());
+	let mut config_b = random_config();
+	config_b.node_config.one_channel_per_peer = true;
+	let node_b = setup_node(&chain_source, config_b);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(1_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// The first channel is accepted.
+	open_channel(&node_a, &node_b, 200_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// A second one is refused, with our reason, and B never gets a pending channel.
+	node_a
+		.open_channel(
+			node_b.node_id(),
+			node_b.listening_addresses().unwrap().first().unwrap().clone(),
+			100_000,
+			None,
+			None,
+			None,
+		)
+		.unwrap();
+	match tokio::time::timeout(Duration::from_secs(30), node_a.next_event_async()).await.unwrap() {
+		Event::ChannelClosed {
+			reason: Some(lightning::events::ClosureReason::CounterpartyForceClosed { peer_msg }),
+			..
+		} => assert!(peer_msg.0.contains("one channel per peer"), "{peer_msg}"),
+		e => panic!("expected the second channel to be refused, got {e:?}"),
+	}
+	node_a.event_handled().unwrap();
+	assert_eq!(node_a.list_channels().len(), 1);
+	assert_eq!(node_b.list_channels().len(), 1);
+	assert_eq!(node_b.next_event(), None);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
 // The handler answers a failed write of a channel's facts two ways. The funding this node
 // generates is withheld from LDK until its facts are on record, since nothing may broadcast a
 // transaction this node could not classify: the event is replayed. Every other report accompanies
