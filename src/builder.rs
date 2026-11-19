@@ -576,6 +576,13 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Sets how many confirmations an inbound channel's funding transaction needs before the
+	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
+	pub fn set_inbound_channel_minimum_depth(&mut self, depth: u32) -> &mut Self {
+		self.config.inbound_channel_minimum_depth = Some(depth);
+		self
+	}
+
 	/// Configures the [`Node`] instance to write logs to the filesystem.
 	///
 	/// The `log_file_path` defaults to [`DEFAULT_LOG_FILENAME`] in the configured
@@ -1227,6 +1234,12 @@ impl Builder {
 	/// Sets the used storage directory path.
 	pub fn set_storage_dir_path(&self, storage_dir_path: String) {
 		self.inner.write().expect("lock").set_storage_dir_path(storage_dir_path);
+	}
+
+	/// Sets how many confirmations an inbound channel's funding transaction needs before the
+	/// channel can be used. Blocknil patch; see [`Config::inbound_channel_minimum_depth`].
+	pub fn set_inbound_channel_minimum_depth(&self, depth: u32) {
+		self.inner.write().expect("lock").set_inbound_channel_minimum_depth(depth);
 	}
 
 	/// Configures the [`Node`] instance to write logs to the filesystem.

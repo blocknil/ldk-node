@@ -274,6 +274,7 @@ impl Default for ForwardedPaymentTrackingMode {
 )]
 /// | `manually_handle_unknown_bolt11_payments` | false                              |
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
+/// | `inbound_channel_minimum_depth`        | None                                 |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -362,6 +363,12 @@ pub struct Config {
 	pub manually_handle_unknown_bolt11_payments: bool,
 	/// The mode used for tracking forwarded payments.
 	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	/// Confirmations an inbound channel's funding transaction needs before the channel is used.
+	///
+	/// Blocknil patch: LDK's `ChannelHandshakeConfig::minimum_depth`, which ldk-node does not
+	/// expose (our provider asks 1). If unset, LDK's default (6) applies. Values below 1 are raised
+	/// to 1; zero-confirmation channels remain governed by [`Config::trusted_peers_0conf`].
+	pub inbound_channel_minimum_depth: Option<u32>,
 }
 
 impl Default for Config {
@@ -382,6 +389,7 @@ impl Default for Config {
 			hrn_config: HumanReadableNamesConfig::default(),
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			inbound_channel_minimum_depth: None,
 		}
 	}
 }
@@ -583,6 +591,10 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
 		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	// Blocknil patch: the confirmations we ask of an inbound channel's funding.
+	if let Some(depth) = config.inbound_channel_minimum_depth {
+		user_config.channel_handshake_config.minimum_depth = depth.max(1);
+	}
 
 	let may_announce = may_announce_channel(config).is_ok();
 	user_config.accept_forwards_to_priv_channels = may_announce;
@@ -1069,5 +1081,19 @@ mod tests {
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP), MAX_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(0), MIN_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP + 1), MAX_FULL_SCAN_STOP_GAP);
+	}
+
+	#[test]
+	fn inbound_channel_minimum_depth_sets_the_depth_we_ask_of_inbound_channels() {
+		// Blocknil patch: unset keeps LDK's default; a set value is used, and 0 becomes 1.
+		let ldk_default = super::UserConfig::default().channel_handshake_config.minimum_depth;
+		let depth_for = |depth: Option<u32>| {
+			let config = Config { inbound_channel_minimum_depth: depth, ..Config::default() };
+			default_user_config(&config).channel_handshake_config.minimum_depth
+		};
+		assert_eq!(depth_for(None), ldk_default);
+		assert_eq!(depth_for(Some(1)), 1);
+		assert_eq!(depth_for(Some(3)), 3);
+		assert_eq!(depth_for(Some(0)), 1);
 	}
 }
