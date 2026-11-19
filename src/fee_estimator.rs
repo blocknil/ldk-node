@@ -153,8 +153,13 @@ pub(crate) fn apply_post_estimation_adjustments(
 	target: ConfirmationTarget, estimated_rate: FeeRate,
 ) -> FeeRate {
 	match target {
+		// Blocknil patch: anchor channels get the same slack. LDK accepts nothing below this
+		// estimate from an anchor-channel peer and force-closes instead, so two nodes whose
+		// estimates differ by one sat/kW force-close ("peer provided a feerate (258 sat/kw) which
+		// was below our lower bound (259 sat/kw)"). The relay floor still applies.
 		ConfirmationTarget::Lightning(
-			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee
+			| LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
 		) => {
 			let slightly_less_than_background = estimated_rate
 				.to_sat_per_kwu()
@@ -214,5 +219,22 @@ mod tests {
 		assert_eq!(rbf_splice_feerates(kwu(500), kwu(278)), Some((kwu(500), kwu(500 * 3 / 2))));
 		// RBF minimum above our max (1.5x a fallen estimate): we can't RBF within our ceiling.
 		assert_eq!(rbf_splice_feerates(kwu(100), kwu(278)), None);
+	}
+
+	#[test]
+	fn remote_fee_floors_have_the_same_slack_with_and_without_anchors() {
+		// Blocknil patch: 250 sat/kW below our estimate, never below the relay floor.
+		let kwu = FeeRate::from_sat_per_kwu;
+		for ldk_target in [
+			LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+		] {
+			let target = ConfirmationTarget::Lightning(ldk_target);
+			assert_eq!(apply_post_estimation_adjustments(target, kwu(1_000)), kwu(750));
+			assert_eq!(
+				apply_post_estimation_adjustments(target, kwu(300)),
+				kwu(FEERATE_FLOOR_SATS_PER_KW as u64)
+			);
+		}
 	}
 }
