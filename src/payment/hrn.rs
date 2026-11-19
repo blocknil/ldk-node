@@ -51,3 +51,28 @@ impl HrnResolver for HRNResolver {
 		}
 	}
 }
+
+/// Blocknil patch: why [`crate::Node::resolve_name`] could not resolve a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameResolutionError {
+	/// The node isn't running, so no query can be sent.
+	NotRunning,
+	/// No answer came within the resolution timeout (5 seconds). Onion messages are best-effort:
+	/// the resolver may be offline or its DNS slow.
+	TimedOut,
+	/// The lookup failed, with the resolver's reason: not a name, no DNSSEC record, a proof that
+	/// didn't validate, no resolver to ask.
+	Failed(String),
+}
+
+impl std::fmt::Display for NameResolutionError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		match self {
+			Self::NotRunning => write!(f, "The node is not running."),
+			Self::TimedOut => write!(f, "Looking the name up timed out."),
+			Self::Failed(reason) => write!(f, "{}", reason),
+		}
+	}
+}
+
+impl std::error::Error for NameResolutionError {}

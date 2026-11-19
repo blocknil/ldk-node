@@ -9,15 +9,19 @@
 
 mod common;
 
+use std::str::FromStr;
+
 use bitcoin::Amount;
 use common::{
 	expect_channel_ready_event, expect_payment_successful_event, generate_blocks_and_wait,
-	open_channel, premine_and_distribute_funds, random_chain_source, setup_bitcoind_and_electrsd,
-	setup_two_nodes,
+	open_channel, premine_and_distribute_funds, random_chain_source, random_config,
+	setup_bitcoind_and_electrsd, setup_node, setup_two_nodes, TestChainSource,
 };
+use ldk_node::config::{HRNResolverConfig, HumanReadableNamesConfig};
 use ldk_node::payment::UnifiedPaymentResult;
-use ldk_node::Event;
+use ldk_node::{Event, NameResolutionError};
 use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::msgs::SocketAddress;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn unified_send_to_hrn() {
@@ -80,4 +84,36 @@ async fn unified_send_to_hrn() {
 		};
 
 	expect_payment_successful_event!(node_a, offer_payment_id, None);
+}
+
+/// Blocknil: a name that has a BIP 353 record. Like the test above, these tests look it up on the
+/// internet, through Google Public DNS.
+const BIP353_NAME: &str = "matt@mattcorallo.com";
+
+fn dns_resolution(enable_hrn_resolution_service: bool) -> HumanReadableNamesConfig {
+	HumanReadableNamesConfig {
+		resolution_config: HRNResolverConfig::Dns {
+			dns_server_address: SocketAddress::from_str("8.8.8.8:53").unwrap(),
+			enable_hrn_resolution_service,
+		},
+	}
+}
+
+/// Blocknil: `Node::resolve_name` resolves a name on its own, without paying it, and hands back
+/// the record's URI for the wallet to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn resolve_name_returns_the_records_uri() {
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let mut config = random_config();
+	config.node_config.hrn_config = dns_resolution(false);
+	let node = setup_node(&chain_source, config);
+
+	let uri = node.resolve_name(BIP353_NAME).unwrap();
+	assert!(uri.starts_with("bitcoin:"), "{uri}");
+	assert!(uri.contains("lno="), "{uri}");
+	assert!(matches!(node.resolve_name("not a name"), Err(NameResolutionError::Failed(_))));
+
+	node.stop().unwrap();
+	assert_eq!(node.resolve_name(BIP353_NAME), Err(NameResolutionError::NotRunning));
 }
