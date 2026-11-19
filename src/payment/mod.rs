@@ -32,6 +32,8 @@ pub use forwarding::{
 };
 #[cfg(feature = "unified-payments")]
 pub(crate) use hrn::HRNResolver;
+#[cfg(feature = "unified-payments")]
+pub use hrn::NameResolutionError;
 pub(crate) use metadata::PaymentMetadata;
 pub use onchain::OnchainPayment;
 pub(crate) use pending_payment_store::{FundingTxCandidate, PendingPaymentDetails};

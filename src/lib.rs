@@ -183,6 +183,8 @@ use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 pub use payment::forwarding_store::aggregate_channel_pair_stats;
 use payment::forwarding_store::{run_forwarded_payment_aggregation, ForwardingStore};
+#[cfg(feature = "unified-payments")]
+pub use payment::NameResolutionError;
 use payment::{
 	Bolt11Payment, Bolt12Payment, ForwardingAnalytics, NodeOffersMessageHandler, OnchainPayment,
 	PaymentDetails, PaymentDetailsPage, SpontaneousPayment,
@@ -1310,6 +1312,47 @@ impl Node {
 			Arc::clone(&self.logger),
 			self.hrn_resolver.clone(),
 		)
+	}
+
+	/// Blocknil patch: resolves a [BIP 353] name (`user@domain`, without the leading `₿`) to the
+	/// payment instructions in its DNSSEC record, normally a BIP 321 `bitcoin:` URI, for the
+	/// caller to check and parse before paying.
+	///
+	/// The name is resolved as [`Config::hrn_config`] says, as [`UnifiedPayment::send`] does, and
+	/// a bLIP-32 answer's proof is validated here, not trusted from the node that sent it. Waits
+	/// at most 5 seconds: an unanswered onion message would otherwise wait forever.
+	///
+	/// [BIP 353]: https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki
+	#[cfg(feature = "unified-payments")]
+	pub fn resolve_name(&self, name: &str) -> Result<String, NameResolutionError> {
+		use bitcoin_payment_instructions::hrn_resolution::{
+			HrnResolution, HrnResolver, HumanReadableName,
+		};
+
+		if !*self.is_running.read().expect("lock") {
+			return Err(NameResolutionError::NotRunning);
+		}
+		let hrn = HumanReadableName::from_encoded(name).map_err(|()| {
+			NameResolutionError::Failed(format!("{} is not a name of the form user@domain", name))
+		})?;
+		let timeout = Duration::from_secs(config::HRN_RESOLUTION_TIMEOUT_SECS);
+		let result = self.runtime.block_on(async {
+			tokio::time::timeout(timeout, self.hrn_resolver.resolve_hrn(&hrn)).await
+		});
+		match result {
+			Ok(Ok(HrnResolution::DNSSEC { result, .. })) => Ok(result),
+			Ok(Ok(HrnResolution::LNURLPay { .. })) => Err(NameResolutionError::Failed(
+				"The name resolved to LNURL-pay, not to a BIP 353 record".to_string(),
+			)),
+			Ok(Err(reason)) => {
+				log_error!(self.logger, "Failed to resolve {}: {}", name, reason);
+				Err(NameResolutionError::Failed(reason.to_string()))
+			},
+			Err(_) => {
+				log_error!(self.logger, "Resolving {} timed out", name);
+				Err(NameResolutionError::TimedOut)
+			},
+		}
 	}
 }
 
