@@ -139,6 +139,12 @@ where
 		})
 	}
 
+	/// Blocknil patch: whether we, as an LSPS2 service, keep no reserve on our clients' side: for
+	/// channels we open to them, and (in the `OpenChannelRequest` handler) channels they open to us.
+	pub(crate) fn disables_client_reserve(&self) -> bool {
+		self.lsps2_service.as_ref().is_some_and(|s| s.service_config.disable_client_reserve)
+	}
+
 	pub(crate) fn lsps2_store_funding_transaction(
 		&self, user_channel_id: u128, counterparty_node_id: PublicKey, funding_tx: Transaction,
 	) {

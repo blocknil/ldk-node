@@ -2139,12 +2139,23 @@ where
 						100
 					);
 				}
-				let res = if allow_0conf {
+				// Blocknil patch: as an LSPS2 service with `disable_client_reserve`, a client that
+				// opens its own channel to us keeps no reserve either, as on the JIT channels we open
+				// to it. LDK allows zero reserve on anchor channels only.
+				let accept_0reserve = anchor_channel
+					&& self.liquidity_source.lsps2_service().disables_client_reserve();
+				let trusted_features = match (allow_0conf, accept_0reserve) {
+					(true, true) => Some(TrustedChannelFeatures::ZeroConfZeroReserve),
+					(true, false) => Some(TrustedChannelFeatures::ZeroConf),
+					(false, true) => Some(TrustedChannelFeatures::ZeroReserve),
+					(false, false) => None,
+				};
+				let res = if let Some(trusted_features) = trusted_features {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer(
 						&temporary_channel_id,
 						&counterparty_node_id,
 						user_channel_id,
-						TrustedChannelFeatures::ZeroConf,
+						trusted_features,
 						channel_override_config,
 					)
 				} else {
@@ -2160,8 +2171,9 @@ where
 					Ok(()) => {
 						log_info!(
 							self.logger,
-							"Accepting inbound{}{} channel of {}sats from{} peer {}",
+							"Accepting inbound{}{}{} channel of {}sats from{} peer {}",
 							if allow_0conf { " 0conf" } else { "" },
+							if accept_0reserve { " 0reserve" } else { "" },
 							if anchor_channel { " Anchor" } else { "" },
 							funding_satoshis,
 							if allow_0conf { " trusted" } else { "" },

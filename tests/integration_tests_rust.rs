@@ -8441,6 +8441,124 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 	(service_node, client_node, payer_node)
 }
 
+/// Blocknil: an LSPS2 service with `disable_client_reserve`, holding `service_funds_sat` on-chain,
+/// and a plain node that opens its own channel to it, which the service may trust for zero-conf.
+async fn setup_zero_client_reserve_service(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_funds_sat: u64, trust_client_0conf: bool,
+) -> (TestNode, TestNode) {
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	let lsps2_service_config = LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm: 10_000,
+		channel_over_provisioning_ppm: 100_000,
+		max_payment_size_msat: 1_000_000_000,
+		min_payment_size_msat: 0,
+		min_channel_lifetime: 100,
+		min_channel_opening_fee_msat: 0,
+		max_client_to_self_delay: 1024,
+		client_trusts_lsp: false,
+		disable_client_reserve: true,
+	};
+	let client_node = setup_node(&TestChainSource::Esplora(electrsd), random_config());
+
+	let mut service_config = random_config();
+	if trust_client_0conf {
+		service_config.node_config.trusted_peers_0conf.push(client_node.node_id());
+	}
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	service_builder.enable_liquidity_provider(lsps2_service_config);
+	let service_node = service_builder.build(service_config.node_entropy.into()).unwrap();
+	service_node.start().unwrap();
+
+	premine_blocks(&bitcoind.client, &electrsd.client).await;
+	for (node, funds_sat) in [(&service_node, service_funds_sat), (&client_node, 1_000_000)] {
+		if funds_sat > 0 {
+			let addr = node.onchain_payment().new_address().unwrap();
+			distribute_funds_unconfirmed(
+				&bitcoind.client,
+				&electrsd.client,
+				vec![addr],
+				Amount::from_sat(funds_sat),
+			)
+			.await;
+		}
+	}
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	service_node.sync_wallets().unwrap();
+	client_node.sync_wallets().unwrap();
+	(service_node, client_node)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_without_client_reserve_accepts_zero_reserve_from_clients() {
+	do_lsps2_service_without_client_reserve_accepts_zero_reserve_from_clients(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_without_client_reserve_accepts_zero_reserve_from_0conf_clients() {
+	do_lsps2_service_without_client_reserve_accepts_zero_reserve_from_clients(true).await;
+}
+
+async fn do_lsps2_service_without_client_reserve_accepts_zero_reserve_from_clients(
+	trust_client_0conf: bool,
+) {
+	// Blocknil patch: an LSPS2 service with `disable_client_reserve` gives a client that opens its
+	// own (anchor) channel to it zero reserve too, as on the JIT channels it opens; with zero-conf
+	// as well when it trusts the client for that.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let (service_node, client_node) =
+		setup_zero_client_reserve_service(&bitcoind, &electrsd, 1_000_000, trust_client_0conf)
+			.await;
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	// rust-lightning's minimum channel value, 1,000 sats, holds for zero-reserve channels too: a
+	// smaller channel is refused before it reaches the service.
+	assert_eq!(
+		client_node.open_channel(service_node.node_id(), service_addr, 999, None, None, None),
+		Err(NodeError::ChannelCreationFailed)
+	);
+
+	open_channel(&client_node, &service_node, 100_000, false, &electrsd).await;
+	if !trust_client_0conf {
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+		service_node.sync_wallets().unwrap();
+		client_node.sync_wallets().unwrap();
+	}
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	assert_eq!(
+		client_node.list_channels()[0].confirmations,
+		Some(if trust_client_0conf { 0 } else { 6 })
+	);
+
+	let client_channel = &client_node.list_channels()[0];
+	assert!(client_channel.channel_type.as_ref().unwrap().requires_anchors_zero_fee_htlc_tx());
+	assert_eq!(client_channel.unspendable_punishment_reserve, Some(0));
+	let service_channel = &service_node.list_channels()[0];
+	assert_eq!(service_channel.counterparty.unspendable_punishment_reserve, 0);
+	// Our own reserve is the client's choice: it stays.
+	assert_eq!(service_channel.unspendable_punishment_reserve, Some(1_000));
+
+	// The client can send all but the commitment fee and anchors (about 1,031 sats here); a 1%
+	// reserve would hold back another 1,000.
+	let amount_msat = client_channel.next_outbound_htlc_limit_msat;
+	assert!(amount_msat > 98_000_000, "{client_channel:?}");
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("All of it".to_string()).unwrap());
+	let invoice =
+		service_node.bolt11_payment().receive(amount_msat, &description.into(), 3600).unwrap();
+	let payment_id = client_node.bolt11_payment().send(&invoice, None).unwrap();
+	expect_payment_received_event!(service_node, amount_msat);
+	expect_payment_successful_event!(client_node, payment_id, Some(Some(0)));
+
+	service_node.stop().unwrap();
+	client_node.stop().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_prunes_closed_channel_state() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
