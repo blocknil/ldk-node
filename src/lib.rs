@@ -111,6 +111,7 @@ mod message_handler;
 pub mod payment;
 mod peer_store;
 pub mod probing;
+mod provider_fee;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;
@@ -167,6 +168,7 @@ use lightning::ln::funding::{
 use lightning::ln::msgs::{BaseMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::routing::gossip::NodeAlias;
+pub use provider_fee::ProviderFeeAllowance;
 
 use lightning::sign::EntropySource;
 use lightning::util::persist::KVStore;
@@ -293,6 +295,8 @@ pub struct Node {
 	pending_funding_fee_rates: Arc<Mutex<std::collections::HashMap<u128, bitcoin::FeeRate>>>,
 	/// Blocknil patch: payments held for our clients (see `held_payments`).
 	held_payments: Arc<held_payments::HeldPayments>,
+	/// Blocknil patch: what our provider may keep out of payments (see `provider_fee`).
+	provider_fees: Arc<provider_fee::ProviderFees>,
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
@@ -798,6 +802,7 @@ impl Node {
 			Arc::clone(&self.config),
 			Arc::clone(&self.pending_funding_fee_rates),
 			Arc::clone(&self.held_payments),
+			Arc::clone(&self.provider_fees),
 		));
 
 		if let Some(prober) = self.prober.clone() {
@@ -3217,6 +3222,33 @@ impl Node {
 	/// first.
 	pub fn recent_held_payments(&self) -> Vec<HoldRecord> {
 		self.held_payments.recent()
+	}
+}
+
+/// Blocknil patch: splice on arrival, the client side (see `provider_fee`). r8's names.
+impl Node {
+	/// `provider` is the peer that may keep a fee out of a payment it forwards to us, for room it
+	/// added when the payment arrived, and only on a payment given an allowance with
+	/// [`Node::allow_provider_fee`]. Our channels with it are set to accept such payments (LDK's
+	/// `accept_underpaying_htlcs`). `None` refuses every such fee again (the default).
+	pub fn set_fee_provider(&self, provider: Option<PublicKey>) {
+		self.provider_fees.set_fee_provider(provider);
+	}
+
+	/// Our provider may keep up to `fee_msat` out of the payment `payment_hash` (all its parts
+	/// together), when it arrives over our channels with the provider set by
+	/// [`Node::set_fee_provider`]. A fee on any other payment is refused. The allowance is saved,
+	/// replaces an earlier one for the same payment, is spent when the payment is claimed, and
+	/// lapses after a day.
+	pub fn allow_provider_fee(
+		&self, payment_hash: lightning::types::payment::PaymentHash, fee_msat: u64,
+	) -> Result<(), Error> {
+		self.runtime.block_on(self.provider_fees.allow(payment_hash, fee_msat))
+	}
+
+	/// The fee allowances given with [`Node::allow_provider_fee`] and not yet spent or lapsed.
+	pub fn provider_fee_allowances(&self) -> Vec<ProviderFeeAllowance> {
+		self.provider_fees.allowances()
 	}
 }
 

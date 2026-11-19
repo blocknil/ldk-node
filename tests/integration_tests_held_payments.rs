@@ -646,3 +646,65 @@ async fn provider_invoice_lets_a_payment_larger_than_the_room_arrive() {
 	wait_for(&s.payer, "its success", is_successful).await;
 	s.stop();
 }
+
+/// The provider holds a payment of `amount_msat` to the customer, short of room, splices room in
+/// and keeps `fee_msat` out of it; the customer has allowed `allowance_msat` for it. Returns
+/// whether the customer claimed it (and checks what it got).
+async fn splice_on_arrival_with_fee(
+	s: &Setup, amount_msat: u64, allowance_msat: Option<u64>, fee_msat: u64,
+) -> bool {
+	let reports = short_of_room_reports(&s.provider);
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("fee".to_string()).unwrap());
+	let invoice = s
+		.customer
+		.bolt11_payment()
+		.receive_via_provider(Some(amount_msat), &description, 3600, s.provider.node_id())
+		.unwrap();
+	let payment_hash = lightning_types::payment::PaymentHash(invoice.payment_hash().0);
+	if let Some(allowance_msat) = allowance_msat {
+		s.customer.allow_provider_fee(payment_hash, allowance_msat).unwrap();
+	}
+	s.payer.bolt11_payment().send(&invoice, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reported");
+	s.provider.splice_in(&s.customer_channel(), s.customer.node_id(), 300_000, None).unwrap();
+	s.provider.set_held_payment_fee(short.intercept_id, fee_msat).unwrap();
+	let outcome =
+		wait_for(&s.payer, "the payment's outcome", |e| is_successful(e) || is_failed(e)).await;
+	if is_successful(&outcome) {
+		wait_for(&s.customer, "the payment less the fee", is_received(amount_msat - fee_msat))
+			.await;
+		true
+	} else {
+		false
+	}
+}
+
+/// The customer allowed its provider a fee for this payment: the provider keeps it, and the
+/// customer claims the rest. The allowance is spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_fee_within_the_allowance_is_claimed() {
+	let s = setup(&[1_500_000], 300_000).await;
+	s.customer.set_fee_provider(Some(s.provider.node_id()));
+	assert!(splice_on_arrival_with_fee(&s, 400_000_000, Some(1_000_000), 1_000_000).await);
+	assert!(s.customer.provider_fee_allowances().is_empty(), "spent");
+	assert_eq!(s.provider.recent_held_payments()[0].fee_msat, 1_000_000);
+	s.stop();
+}
+
+/// A fee larger than the allowance is refused, and so is one kept by a peer that isn't our fee
+/// provider, even for a payment we gave an allowance for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_fee_above_the_allowance_or_from_another_peer_is_refused() {
+	let s = setup(&[1_500_000], 300_000).await;
+	s.customer.set_fee_provider(Some(s.provider.node_id()));
+	assert!(!splice_on_arrival_with_fee(&s, 400_000_000, Some(500_000), 1_000_000).await);
+
+	// Our fee provider is someone else now; the provider's channel still takes underpaying
+	// HTLCs, so it is our check that refuses the fee.
+	s.customer.set_fee_provider(Some(s.payer.node_id()));
+	let channel = s.customer.list_channels().into_iter().next().unwrap();
+	assert!(channel.config.accept_underpaying_htlcs);
+	assert!(!splice_on_arrival_with_fee(&s, 700_000_000, Some(1_000_000), 1_000_000).await);
+	s.stop();
+}
