@@ -122,12 +122,16 @@ pub struct HoldRecord {
 	pub held_secs: u64,
 	/// When it ended, in seconds since the Unix epoch.
 	pub ended_at: u64,
-	/// Forwarded once the client was back (or the room was there), or failed back.
+	/// Forwarded once the client was back (or the room was there), or failed back. A forward the
+	/// client went offline for before it reached their channel ends up failed back: `false`.
 	pub forwarded: bool,
 	/// What we kept out of it: the fee for the room a splice on arrival added. Zero otherwise.
 	pub fee_msat: u64,
-	/// Why it was failed back before its deadline, when the LSP refused it.
+	/// Why it was failed back before its deadline: the LSP refused it, or the client went offline
+	/// right after it was forwarded.
 	pub refused: Option<String>,
+	/// The payment it was part of.
+	pub payment_hash: PaymentHash,
 }
 
 struct Held {
@@ -448,6 +452,7 @@ impl HeldPayments {
 			forwarded,
 			fee_msat: if forwarded { h.fee_msat } else { 0 },
 			refused,
+			payment_hash: h.payment_hash,
 		});
 		recent.truncate(RECENT);
 	}
@@ -491,6 +496,18 @@ impl HeldPayments {
 			lost.payment_hash,
 			count
 		);
+		// The admin console reads these records: a forward lost this way was failed back, not
+		// delivered, and we kept no fee.
+		let mut recent = self.recent.lock().expect("lock");
+		if let Some(record) = recent.iter_mut().find(|r| {
+			r.forwarded && r.customer == lost.customer && r.payment_hash == lost.payment_hash
+		}) {
+			record.forwarded = false;
+			record.fee_msat = 0;
+			record.refused = Some(
+				"failed back: the client went offline right after it was forwarded".to_string(),
+			);
+		}
 	}
 
 	/// Blocknil patch (decision 4): see `forward_failed`.

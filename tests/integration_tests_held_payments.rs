@@ -893,5 +893,18 @@ async fn forward_lost_to_a_customer_going_offline_is_counted() {
 		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 	assert_eq!(s.provider.forwards_failed_offline(), 1);
+	// The admin console's record of it says it was failed back, not delivered, and kept no fee.
+	let record = s
+		.provider
+		.recent_held_payments()
+		.into_iter()
+		.find(|r| r.payment_hash == large.payment_hash())
+		.expect("the lost payment's record");
+	assert!(!record.forwarded, "{record:?}");
+	assert_eq!(record.fee_msat, 0);
+	assert!(
+		record.refused.as_deref().is_some_and(|why| why.contains("went offline")),
+		"{record:?}"
+	);
 	s.stop();
 }
