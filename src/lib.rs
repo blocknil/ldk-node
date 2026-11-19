@@ -3034,6 +3034,15 @@ impl Node {
 		self.liquidity_source.lsps5_client().set_webhook(lsp, app_name, url)
 	}
 
+	/// Removes `app_name`'s webhook from the LSP `lsp` ([LSPS5]), so it stops waking this phone:
+	/// what turning "receive with the app closed" off has to do. The LSP answers later, through
+	/// [`Node::set_webhook_result_handler`] with `removed` set. Blocknil patch.
+	///
+	/// [LSPS5]: https://github.com/lightning/blips/blob/master/blip-0055.md
+	pub fn remove_webhook(&self, lsp: PublicKey, app_name: String) -> Result<(), Error> {
+		self.liquidity_source.lsps5_client().remove_webhook(lsp, app_name)
+	}
+
 	/// First payments waiting for their offline client to connect so their just-in-time channel
 	/// can open: `(client, amount to forward in msat)`. Blocknil patch.
 	pub fn waiting_first_payments(&self) -> Vec<(PublicKey, u64)> {
