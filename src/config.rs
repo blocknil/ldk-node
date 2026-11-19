@@ -390,6 +390,10 @@ pub struct Config {
 	/// [`crate::Node::start`] then does not touch the chain: it does not start the chain source,
 	/// fetch fee estimates, sync the Lightning wallet before starting, or keep syncing afterwards.
 	/// The next start without it syncs as usual.
+	///
+	/// Nor does it take gossip from its peers. A rapid-gossip source would still download
+	/// snapshots, so a claim-only node is built with the peer-to-peer gossip source, which then
+	/// learns nothing.
 	pub claim_only: bool,
 }
 

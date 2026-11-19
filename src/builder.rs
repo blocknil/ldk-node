@@ -748,7 +748,9 @@ impl NodeBuilder {
 	///
 	/// [`Node::start`] then does not touch the chain (no chain-source start, fee estimates or
 	/// Lightning-wallet sync), so a claim isn't held up by round trips to a chain server. The
-	/// node keeps the chain state it was persisted with. Off by default.
+	/// node keeps the chain state it was persisted with. Nor does it take gossip from its peers
+	/// (use [`Self::set_gossip_source_p2p`]: a rapid-gossip source would still download
+	/// snapshots). Off by default.
 	///
 	/// A claim-only caller also keeps the network graph and scorer out of memory and out of its
 	/// store by building with a store that answers `NotFound` for them and drops their writes
@@ -2512,7 +2514,7 @@ fn build_with_store_internal(
 	};
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
-		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
+		GossipSync::P2P(p2p_gossip_sync) if !config.claim_only => MessageHandler {
 			chan_handler: Arc::clone(&channel_manager),
 			route_handler: Arc::clone(&p2p_gossip_sync)
 				as Arc<dyn RoutingMessageHandler + Sync + Send>,
@@ -2520,7 +2522,10 @@ fn build_with_store_internal(
 			custom_message_handler,
 			send_only_message_handler: Arc::clone(&chain_monitor),
 		},
-		GossipSync::Rapid(_) => MessageHandler {
+		// Blocknil patch: a claim-only node (`Config::claim_only`) takes no gossip from its peers
+		// either. It doesn't route, and the full graph a peer sends on connecting is the largest
+		// thing it could hold in memory (~150 MB on mainnet).
+		GossipSync::P2P(_) | GossipSync::Rapid(_) => MessageHandler {
 			chan_handler: Arc::clone(&channel_manager),
 			route_handler: Arc::new(IgnoringMessageHandler {})
 				as Arc<dyn RoutingMessageHandler + Sync + Send>,
