@@ -8559,6 +8559,23 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
 	client_trusts_0conf: bool, max_client_to_self_delay: u32,
 ) -> (TestNode, TestNode, TestNode) {
+	let (_, _, service_node, client_node, payer_node) = setup_lsps2_nodes_inner(
+		bitcoind,
+		electrsd,
+		service_store,
+		service_funds_sat,
+		client_trusts_0conf,
+		max_client_to_self_delay,
+	)
+	.await;
+	(service_node, client_node, payer_node)
+}
+
+/// Also returns the service's test config and LSPS2 config, to build it again over its store.
+async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
+	bitcoind: &BitcoinD, electrsd: &ElectrsD, service_store: S, service_funds_sat: u64,
+	client_trusts_0conf: bool, max_client_to_self_delay: u32,
+) -> (TestConfig, LSPS2ServiceConfig, TestNode, TestNode, TestNode) {
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
 
 	let mut sync_config = EsploraSyncConfig::default();
@@ -8582,9 +8599,9 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 	let service_config = random_config();
 	setup_builder!(service_builder, service_config.node_config);
 	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-	service_builder.enable_liquidity_provider(lsps2_service_config);
+	service_builder.enable_liquidity_provider(lsps2_service_config.clone());
 	let service_node = service_builder
-		.build_with_store(service_config.node_entropy.into(), service_store)
+		.build_with_store(service_config.node_entropy.clone().into(), service_store)
 		.unwrap();
 	service_node.start().unwrap();
 	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
@@ -8632,7 +8649,7 @@ async fn setup_lsps2_nodes_with_max_client_to_self_delay<
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
-	(service_node, client_node, payer_node)
+	(service_config, lsps2_service_config, service_node, client_node, payer_node)
 }
 
 /// Blocknil: an LSPS2 service with `disable_client_reserve`, holding `service_funds_sat` on-chain,
@@ -9070,6 +9087,84 @@ async fn lsps2_first_payment_waits_for_its_offline_client() {
 	expect_payment_received_event!(client_node, amt_to_forward_msat);
 	assert!(service_node.waiting_first_payments().is_empty());
 	assert_eq!(woken.lock().unwrap().len(), 2, "woken once per payment");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_payment_stuck_by_a_restart_mid_open_is_failed_back() {
+	// Blocknil patch: the service restarts while a first payment waits for its JIT channel to
+	// open. The open is lost with the restart (nothing persists it), while LSPS2 still holds the
+	// payer's HTLC for a channel nothing will open. The start fails it back
+	// (`fail_stuck_jit_payments` reports it), and no channel comes of it later: LDK hands the
+	// HTLC to LSPS2 again at startup, which must not reopen the flow the sweep reset.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_config, lsps2_service_config, service_node, client_node, payer_node) =
+		setup_lsps2_nodes_inner(
+			&bitcoind,
+			&electrsd,
+			service_store.clone(),
+			10_000_000,
+			true,
+			1024,
+		)
+		.await;
+	service_node.set_hold_duration(Duration::from_secs(120));
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("restart")).unwrap());
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(100_000_000, &invoice_description.into(), 1024)
+		.unwrap();
+	client_node.stop().unwrap();
+	tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+		while service_node
+			.list_peers()
+			.iter()
+			.any(|p| p.node_id == client_node.node_id() && p.is_connected)
+		{
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("the service should notice the client disconnecting");
+
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+		while service_node.waiting_first_payments().is_empty() {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("the first payment should wait for the client");
+
+	service_node.stop().unwrap();
+	drop(service_node);
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	service_builder.enable_liquidity_provider(lsps2_service_config);
+	let service_node = service_builder
+		.build_with_store(service_config.node_entropy.into(), service_store)
+		.unwrap();
+	service_node.start().unwrap();
+	assert!(service_node.waiting_first_payments().is_empty(), "nothing waits after the restart");
+
+	assert_eq!(service_node.fail_stuck_jit_payments(), 1);
+	expect_event!(payer_node, PaymentFailed);
+
+	// The client is back: no channel opens for the failed payment.
+	client_node.start().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	client_node.connect(service_node.node_id(), service_addr, false).unwrap();
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	assert!(service_node
+		.list_channels()
+		.iter()
+		.all(|c| c.counterparty.node_id != client_node.node_id()));
+	assert!(service_node.waiting_first_payments().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

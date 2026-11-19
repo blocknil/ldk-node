@@ -56,6 +56,9 @@ where
 	pub(crate) logger: L,
 	/// First payments waiting for their offline client. Blocknil patch: see `jit_wait`.
 	pub(crate) jit_waits: JitWaits,
+	/// How many HTLCs the sweep at the first start failed back; `None` before it ran. Blocknil
+	/// patch.
+	pub(crate) stuck_channel_opens_failed: std::sync::Mutex<Option<usize>>,
 }
 
 /// Represents the configuration of the LSPS2 service.
@@ -393,6 +396,37 @@ where
 		for open_channel in retry {
 			self.handle_event(open_channel).await;
 		}
+	}
+
+	/// Blocknil patch: once per node, at its first start: fails back the payments of JIT flows
+	/// waiting on a channel open whose channel doesn't exist, which at startup means the open was
+	/// lost with the restart. See `LSPS2ServiceHandler::fail_stuck_channel_opens` (our
+	/// rust-lightning patch rl-01). Later starts of the same node keep their opens in memory, so
+	/// they don't sweep: a first payment waiting for its client (`jit_wait`) has no channel either.
+	///
+	/// Returns whether it ran (the first start).
+	pub(crate) async fn fail_stuck_channel_opens_at_first_start(&self) -> bool {
+		if self.stuck_channel_opens_failed.lock().expect("lock").is_some() {
+			return false;
+		}
+		let failed = match self.liquidity_manager.lsps2_service_handler() {
+			Some(handler) => handler.fail_stuck_channel_opens().await,
+			None => 0,
+		};
+		if failed > 0 {
+			log_info!(
+				self.logger,
+				"Failed back {} HTLC(s) held for JIT channel opens lost with the restart.",
+				failed
+			);
+		}
+		*self.stuck_channel_opens_failed.lock().expect("lock") = Some(failed);
+		true
+	}
+
+	/// Blocknil patch: how many HTLCs `fail_stuck_channel_opens_at_first_start` failed back.
+	pub(crate) fn stuck_channel_opens_failed(&self) -> usize {
+		self.stuck_channel_opens_failed.lock().expect("lock").unwrap_or(0)
 	}
 
 	/// Blocknil patch: LDK released the coins of a discarded channel funding; an open that waited
