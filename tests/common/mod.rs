@@ -355,7 +355,9 @@ pub(crate) fn setup_bitcoind_and_electrsd_for_splice_rbf() -> (BitcoinD, Electrs
 	setup_bitcoind_and_electrsd_with_args(&["-incrementalrelayfee=0.00000100"])
 }
 
-fn setup_bitcoind_and_electrsd_with_args(bitcoind_args: &[&'static str]) -> (BitcoinD, ElectrsD) {
+pub(crate) fn setup_bitcoind_and_electrsd_with_args(
+	bitcoind_args: &[&'static str],
+) -> (BitcoinD, ElectrsD) {
 	let bitcoind_exe = env::var("BITCOIND_EXE")
 		.expect("set BITCOIND_EXE or source ./scripts/download_bitcoind_electrs.sh before testing");
 	let mut bitcoind_conf = corepc_node::Conf::default();
