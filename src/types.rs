@@ -322,7 +322,7 @@ pub(crate) type DefaultMessageRouter = lightning::onion_message::messenger::Defa
 >;
 
 /// Blocknil patch: LDK's [`DefaultMessageRouter`], except on a node that routes its onion messages
-/// via its LSP ([`Config::route_messages_via_lsp`]).
+/// via its LSP ([`Config::route_messages_via_lsp`]), and on an async-payments server.
 ///
 /// LDK sends a message straight to the first node of its path: a connected peer, or a node whose
 /// addresses are in the network graph. A wallet's graph has none (a claim-only node has no graph,
@@ -330,18 +330,28 @@ pub(crate) type DefaultMessageRouter = lightning::onion_message::messenger::Defa
 /// payer's LSP that never opens. Such a node instead hands every message it cannot give a
 /// connected peer to its LSP, one hop, and the LSP forwards it. The phone dials no third party.
 ///
+/// An async-payments server (the provider every customer reaches directly) starts the blinded
+/// paths it creates at itself. LDK would start an unannounced node's paths at its peers: with one
+/// peer, that peer, often the very customer whose app is about to close, and with several peers
+/// that aren't in the graph, none at all.
+///
 /// [`Config::route_messages_via_lsp`]: crate::config::Config::route_messages_via_lsp
 pub(crate) struct MessageRouter {
 	inner: DefaultMessageRouter,
 	/// The LSP every message goes through that no connected peer can take.
 	via: Option<PublicKey>,
+	/// Whether blinded paths start at this node (an async-payments server).
+	direct_paths: bool,
+	entropy_source: Arc<KeysManager>,
 }
 
 impl MessageRouter {
 	pub(crate) fn new(
 		network_graph: Arc<Graph>, entropy_source: Arc<KeysManager>, via: Option<PublicKey>,
+		direct_paths: bool,
 	) -> Self {
-		Self { inner: DefaultMessageRouter::new(network_graph, entropy_source), via }
+		let inner = DefaultMessageRouter::new(network_graph, Arc::clone(&entropy_source));
+		Self { inner, via, direct_paths, entropy_source }
 	}
 }
 
@@ -382,6 +392,18 @@ impl lightning::onion_message::messenger::MessageRouter for MessageRouter {
 		peers: Vec<lightning::blinded_path::message::MessageForwardNode>,
 		secp_ctx: &bitcoin::secp256k1::Secp256k1<T>,
 	) -> Result<Vec<lightning::blinded_path::message::BlindedMessagePath>, ()> {
+		if self.direct_paths {
+			// Compact padding: these paths go into offers, static ones included, which must be
+			// small, and a path that starts at its recipient has little for padding to hide.
+			return Ok(vec![lightning::blinded_path::message::BlindedMessagePath::one_hop(
+				recipient,
+				local_node_receive_key,
+				context,
+				true,
+				&*self.entropy_source,
+				secp_ctx,
+			)]);
+		}
 		self.inner.create_blinded_paths(recipient, local_node_receive_key, context, peers, secp_ctx)
 	}
 }

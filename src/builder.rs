@@ -2212,6 +2212,8 @@ fn build_with_store_internal(
 		Arc::clone(&network_graph),
 		Arc::clone(&keys_manager),
 		route_messages_via,
+		// Blocknil patch: an async-payments server's blinded paths start at itself.
+		matches!(async_payments_role, Some(AsyncPaymentsRole::Server)),
 	));
 
 	// Initialize the ChannelManager

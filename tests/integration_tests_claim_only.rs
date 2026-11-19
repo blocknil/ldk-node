@@ -25,6 +25,7 @@ use common::{
 };
 use ldk_node::config::AsyncPaymentsRole;
 use ldk_node::{Builder, Event};
+use lightning::blinded_path::IntroductionNode;
 use lightning::routing::gossip::NodeId;
 use lightning::util::persist::{
 	KVStore, PageToken, PaginatedKVStore, PaginatedListResponse, NETWORK_GRAPH_PERSISTENCE_KEY,
@@ -518,4 +519,41 @@ async fn provider_connects_to_forward_a_wallets_onion_message() {
 	assert!(wallet.list_peers().iter().all(|peer| peer.node_id != recipient.node_id()));
 
 	wallet.stop().unwrap();
+}
+
+/// The provider, an async-payments server with only private channels, hands its customers blinded
+/// paths (for their static offers) that start at itself, not at a customer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn async_payments_server_paths_start_at_the_server() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let mut provider_config = random_config();
+	provider_config.async_payments_role = Some(AsyncPaymentsRole::Server);
+	let provider = setup_node(&chain_source, provider_config);
+	let mut customer_config = wallet_config_via(None);
+	customer_config.async_payments_role = Some(AsyncPaymentsRole::Client);
+	let customer = setup_node(&chain_source, customer_config);
+
+	let address = customer.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address],
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	customer.sync_wallets().unwrap();
+	open_channel(&customer, &provider, 1_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	customer.sync_wallets().unwrap();
+	provider.sync_wallets().unwrap();
+	expect_channel_ready_event!(customer, provider.node_id());
+	expect_channel_ready_event!(provider, customer.node_id());
+
+	let paths = provider.bolt12_payment().blinded_paths_for_async_recipient(vec![1, 2, 3]).unwrap();
+	assert!(!paths.is_empty());
+	for path in paths {
+		assert_eq!(*path.introduction_node(), IntroductionNode::NodeId(provider.node_id()));
+	}
 }
