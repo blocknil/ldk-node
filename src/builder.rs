@@ -2692,6 +2692,7 @@ fn build_with_store_internal(
 		om_mailbox,
 		async_payments_role,
 		pending_funding_fee_rates: Arc::new(Mutex::new(std::collections::HashMap::new())),
+		external_funding: Arc::new(Default::default()),
 		#[cfg(feature = "unified-payments")]
 		hrn_resolver,
 		prober,

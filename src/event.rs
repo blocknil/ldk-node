@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, Txid};
+use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use lightning::blinded_path::message::NextMessageHop;
 use lightning::chain::chaininterface::FundingCandidate;
 use lightning::chain::transaction::OutPoint as LdkOutPoint;
@@ -49,6 +49,7 @@ use crate::data_store::{DataStoreUpdateResult, UpdatableObject};
 use crate::fee_estimator::ConfirmationTarget;
 #[cfg(feature = "uniffi")]
 use crate::ffi::PaidBolt12Invoice;
+use crate::funding_signer::ExternalFunding;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -768,6 +769,8 @@ where
 	logger: L,
 	config: Arc<Config>,
 	pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+	/// Blocknil patch: funding from a wallet outside the node (see `FundingInputSigner`).
+	external_funding: Arc<ExternalFunding>,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -786,6 +789,7 @@ where
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 		pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+		external_funding: Arc<ExternalFunding>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -809,6 +813,7 @@ where
 			logger,
 			config,
 			pending_funding_fee_rates,
+			external_funding,
 		}
 	}
 
@@ -988,6 +993,81 @@ where
 				e,
 			);
 		}
+	}
+
+	/// Blocknil patch: signs, through the registered [`FundingInputSigner`], the inputs of this
+	/// node's contribution to the splice round `tx` that the node's own wallet did not sign: the
+	/// coins [`Node::splice_in_with_inputs`] handed in. Returns `tx` unchanged when there are none.
+	/// With no signer registered the round can't be signed, and fails as any signing does, which
+	/// cancels it: a round left waiting for signatures keeps the channel from carrying payments
+	/// until a start with a signer, and a node started without one (the app's claim-only start
+	/// to receive a payment) must be able to claim it. The signer is given the previous
+	/// output of every input the node knows: its contribution's coins and the channel's current
+	/// funding output, which a Taproot signature commits to and which may never have reached the
+	/// chain.
+	///
+	/// [`FundingInputSigner`]: crate::FundingInputSigner
+	/// [`Node::splice_in_with_inputs`]: crate::Node::splice_in_with_inputs
+	fn sign_external_funding_inputs(
+		&self, counterparty_node_id: PublicKey, channel_id: ChannelId, tx: Transaction,
+	) -> Result<Transaction, ()> {
+		let channel = match self
+			.channel_manager
+			.list_channels_with_counterparty(&counterparty_node_id)
+			.into_iter()
+			.find(|channel| channel.channel_id == channel_id)
+		{
+			Some(channel) => channel,
+			None => return Ok(tx),
+		};
+		let txid = tx.compute_txid();
+		let mut known_prevouts: Vec<(OutPoint, TxOut)> =
+			funding_candidates(channel.splice_details.as_ref(), counterparty_node_id, channel_id)
+				.into_iter()
+				.filter(|round| round.txid == txid)
+				.flat_map(|round| round.channels)
+				.filter_map(|funding| funding.contribution)
+				.flat_map(|contribution| {
+					contribution
+						.inputs()
+						.iter()
+						.map(|input| (input.outpoint(), input.output().clone()))
+						.collect::<Vec<_>>()
+				})
+				.collect();
+		let unsigned_contributed_input = tx.input.iter().any(|txin| {
+			txin.witness.is_empty()
+				&& known_prevouts.iter().any(|(outpoint, _)| *outpoint == txin.previous_output)
+		});
+		if !unsigned_contributed_input {
+			return Ok(tx);
+		}
+		let signer = match self.external_funding.signer.read().expect("lock").clone() {
+			Some(signer) => signer,
+			None => {
+				log_error!(
+					self.logger,
+					"No funding input signer is registered to sign the inputs from outside the \
+					node of the funding transaction for channel {}",
+					channel_id,
+				);
+				return Err(());
+			},
+		};
+		if let (Some(funding_txo), Some(redeem_script)) =
+			(channel.funding_txo, channel.funding_redeem_script)
+		{
+			known_prevouts.push((
+				funding_txo.into_bitcoin_outpoint(),
+				TxOut {
+					value: Amount::from_sat(channel.channel_value_satoshis),
+					script_pubkey: redeem_script.to_p2wsh(),
+				},
+			));
+		}
+		known_prevouts
+			.retain(|(outpoint, _)| tx.input.iter().any(|txin| txin.previous_output == *outpoint));
+		signer.sign_funding_inputs(tx, known_prevouts)
 	}
 
 	/// The channel's pending splice rounds that have a transaction, as LDK currently tracks them.
@@ -2936,7 +3016,11 @@ where
 				counterparty_node_id,
 				unsigned_transaction,
 				..
-			} => match self.wallet.sign_owned_inputs(unsigned_transaction) {
+			} => match self.wallet.sign_owned_inputs(unsigned_transaction).and_then(|tx| {
+				// Blocknil patch: the inputs of our contribution a wallet outside the node owns
+				// are signed by the signer it registered.
+				self.sign_external_funding_inputs(counterparty_node_id, channel_id, tx)
+			}) {
 				Ok(partially_signed_tx) => {
 					// Record the splice round before handing our signatures to LDK:
 					// `funding_transaction_signed` releases them to the counterparty, after which
@@ -3431,6 +3515,7 @@ mod tests {
 			Arc::clone(&node.logger),
 			Arc::clone(&node.config),
 			Arc::clone(&node.pending_funding_fee_rates),
+			Arc::clone(&node.external_funding),
 		);
 		(node, event_handler)
 	}
