@@ -731,6 +731,11 @@ where
 			.collect()
 	}
 
+	/// Blocknil patch: every LSP configured, discovered or not.
+	pub(crate) fn lsp_node_ids(&self) -> Vec<PublicKey> {
+		self.lsp_nodes.read().expect("lock").iter().map(|n| n.node_id).collect()
+	}
+
 	pub(crate) fn get_lsp_trust_0conf(&self, node_id: &PublicKey) -> Option<bool> {
 		self.lsp_nodes
 			.read()

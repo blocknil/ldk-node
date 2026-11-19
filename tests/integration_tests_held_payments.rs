@@ -708,3 +708,65 @@ async fn provider_fee_above_the_allowance_or_from_another_peer_is_refused() {
 	assert!(!splice_on_arrival_with_fee(&s, 700_000_000, Some(1_000_000), 1_000_000).await);
 	s.stop();
 }
+
+/// rust-lightning doesn't persist a channel's `accept_underpaying_htlcs`. A client sets it again
+/// at start on its channels with its LSP, and on a channel with its fee provider as soon as it is
+/// ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_underpaying_is_set_again_at_start_and_on_channel_ready() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let provider = setup_node(&chain_source, random_config());
+	let provider_address = provider.listening_addresses().unwrap()[0].clone();
+	let customer_config = random_config();
+	let customer_store =
+		common::TestSyncStore::new(customer_config.node_config.storage_dir_path.clone().into());
+	// The customer, with the provider as its LSP.
+	let customer_with_lsp = || {
+		let mut builder = ldk_node::Builder::from_config(customer_config.node_config.clone());
+		common::configure_chain_source(&chain_source, &mut builder, &customer_config);
+		builder.set_filesystem_logger(None, None);
+		builder.add_liquidity_source(provider.node_id(), provider_address.clone(), None, true);
+		let node =
+			builder.build_with_store(customer_config.node_entropy, customer_store.clone()).unwrap();
+		node.start().unwrap();
+		node
+	};
+	let customer = customer_with_lsp();
+	let addresses = (0..2).map(|_| provider.onchain_payment().new_address().unwrap()).collect();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addresses,
+		Amount::from_sat(1_000_000),
+	)
+	.await;
+	provider.sync_wallets().unwrap();
+	let underpaying = |node: &ldk_node::Node| -> Vec<bool> {
+		node.list_channels().iter().map(|c| c.config.accept_underpaying_htlcs).collect()
+	};
+
+	open_channel(&provider, &customer, 200_000, false, &electrsd).await;
+	wait_for(&customer, "the channel", is_ready_with(provider.node_id())).await;
+	wait_for(&provider, "the channel", is_ready_with(customer.node_id())).await;
+	assert_eq!(underpaying(&customer), vec![false]);
+	customer.set_fee_provider(Some(provider.node_id()));
+	assert_eq!(underpaying(&customer), vec![true]);
+
+	// A restart forgets it; the LSP's channels get it back at start.
+	customer.stop().unwrap();
+	drop(customer);
+	let customer = customer_with_lsp();
+	assert_eq!(underpaying(&customer), vec![true]);
+
+	// A new channel with the fee provider gets it once ready.
+	customer.set_fee_provider(Some(provider.node_id()));
+	let _ = customer.connect(provider.node_id(), provider_address.clone(), true);
+	open_channel(&provider, &customer, 200_000, false, &electrsd).await;
+	wait_for(&customer, "the new channel", is_ready_with(provider.node_id())).await;
+	wait_for(&provider, "the new channel", is_ready_with(customer.node_id())).await;
+	assert_eq!(underpaying(&customer), vec![true, true]);
+
+	provider.stop().unwrap();
+	customer.stop().unwrap();
+}
