@@ -2067,6 +2067,32 @@ where
 				}
 
 				let anchor_channel = crate::requires_anchor_channel_type(&channel_type);
+				// Blocknil patch: as an LSPS2 service that keeps no reserve on its clients' side,
+				// refuse channels without anchors. Zero reserve is only granted to anchor channels,
+				// so a legacy channel would leave the client holding 1% of its money for the
+				// channel's whole life. It mostly comes from LDK's own retry: when we turn down an
+				// anchor open below (no on-chain reserve to bump it with), the opener's node drops
+				// anchors and asks again. Refusing that too makes the open fail plainly, and the
+				// client tries again later.
+				let disables_client_reserve =
+					self.liquidity_source.lsps2_service().disables_client_reserve();
+				if !anchor_channel && disables_client_reserve {
+					log_error!(
+						self.logger,
+						"Rejecting inbound channel without anchors from peer {}: it couldn't be given zero reserve",
+						counterparty_node_id,
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							"Channel request rejected: anchor channels only".to_string(),
+						)
+						.unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to reject channel: {:?}", e);
+						});
+					return Ok(());
+				}
 				let required_reserve_sats = crate::new_channel_anchor_reserve_sats(
 					&self.config,
 					&counterparty_node_id,
@@ -2142,8 +2168,7 @@ where
 				// Blocknil patch: as an LSPS2 service with `disable_client_reserve`, a client that
 				// opens its own channel to us keeps no reserve either, as on the JIT channels we open
 				// to it. LDK allows zero reserve on anchor channels only.
-				let accept_0reserve = anchor_channel
-					&& self.liquidity_source.lsps2_service().disables_client_reserve();
+				let accept_0reserve = anchor_channel && disables_client_reserve;
 				let trusted_features = match (allow_0conf, accept_0reserve) {
 					(true, true) => Some(TrustedChannelFeatures::ZeroConfZeroReserve),
 					(true, false) => Some(TrustedChannelFeatures::ZeroConf),

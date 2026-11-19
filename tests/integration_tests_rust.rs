@@ -8560,6 +8560,44 @@ async fn do_lsps2_service_without_client_reserve_accepts_zero_reserve_from_clien
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_without_client_reserve_refuses_channels_without_anchors() {
+	// Blocknil patch: the service has no on-chain funds, so it turns down the client's anchor
+	// channel (no reserve to bump it with). The client's node then drops anchors and asks again;
+	// a legacy channel couldn't have zero reserve, so the service refuses that too.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let (service_node, client_node) =
+		setup_zero_client_reserve_service(&bitcoind, &electrsd, 0, false).await;
+
+	client_node
+		.open_channel(
+			service_node.node_id(),
+			service_node.listening_addresses().unwrap().first().unwrap().clone(),
+			100_000,
+			None,
+			None,
+			None,
+		)
+		.unwrap();
+	match tokio::time::timeout(Duration::from_secs(30), client_node.next_event_async())
+		.await
+		.unwrap()
+	{
+		Event::ChannelClosed {
+			reason: Some(lightning::events::ClosureReason::CounterpartyForceClosed { peer_msg }),
+			..
+		} => assert!(peer_msg.0.contains("anchor channels only"), "{peer_msg}"),
+		e => panic!("expected the channel to be refused, got {e:?}"),
+	}
+	client_node.event_handled().unwrap();
+	assert!(client_node.list_channels().is_empty());
+	assert!(service_node.list_channels().is_empty());
+	assert_eq!(service_node.next_event(), None);
+
+	service_node.stop().unwrap();
+	client_node.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_service_prunes_closed_channel_state() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
