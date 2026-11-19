@@ -8918,6 +8918,10 @@ async fn lsps2_service_fails_payment_if_client_is_disconnected() {
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
 	let (service_node, client_node, payer_node) =
 		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+	// Blocknil patch: a first payment waits for an offline client unless the wait is zero, which
+	// gives upstream's behaviour tested here (see
+	// `lsps2_first_payment_waits_for_its_offline_client`).
+	service_node.set_hold_duration(Duration::ZERO);
 
 	let invoice_description =
 		Bolt11InvoiceDescription::Direct(Description::new(String::from("asdf")).unwrap());
@@ -8983,6 +8987,89 @@ async fn lsps2_service_fails_payment_if_channel_closes_before_ready() {
 	expect_event!(client_node, ChannelClosed);
 	expect_event!(service_node, ChannelClosed);
 	expect_event!(payer_node, PaymentFailed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_first_payment_waits_for_its_offline_client() {
+	// Blocknil patch: the first payment for a client that isn't connected waits for it, wakes it,
+	// and its JIT channel opens once the client connects. A client that doesn't come in time has
+	// the payment failed back after the wait.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+	let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let woken_by_handler = Arc::clone(&woken);
+	service_node.set_payment_held_handler(Arc::new(move |client| {
+		woken_by_handler.lock().unwrap().push(client)
+	}));
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("first")).unwrap());
+	let jit_amount_msat = 100_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.unwrap();
+
+	client_node.stop().unwrap();
+	tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+		while service_node
+			.list_peers()
+			.iter()
+			.any(|p| p.node_id == client_node.node_id() && p.is_connected)
+		{
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("the service should notice the client disconnecting");
+	let wait_for_waiting = || async {
+		tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+			while service_node.waiting_first_payments().is_empty() {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		})
+		.await
+		.expect("the first payment should wait for the client");
+	};
+	let amt_to_forward_msat = jit_amount_msat * 99 / 100;
+
+	// The client doesn't come back in time: the payment is failed back once the wait is over.
+	service_node.set_hold_duration(Duration::from_secs(3));
+	payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	wait_for_waiting().await;
+	assert_eq!(
+		service_node.waiting_first_payments(),
+		vec![(client_node.node_id(), amt_to_forward_msat)]
+	);
+	assert_eq!(*woken.lock().unwrap(), vec![client_node.node_id()]);
+	expect_event!(payer_node, PaymentFailed);
+	assert!(service_node.waiting_first_payments().is_empty());
+
+	// It comes back while the payment waits: the channel opens and the payment goes through.
+	service_node.set_hold_duration(Duration::from_secs(60));
+	let payer_payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	wait_for_waiting().await;
+	assert_eq!(*woken.lock().unwrap(), vec![client_node.node_id(); 2]);
+	assert!(service_node
+		.list_channels()
+		.iter()
+		.all(|c| c.counterparty.node_id != client_node.node_id()));
+
+	client_node.start().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	client_node.connect(service_node.node_id(), service_addr, false).unwrap();
+
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, amt_to_forward_msat);
+	assert!(service_node.waiting_first_payments().is_empty());
+	assert_eq!(woken.lock().unwrap().len(), 2, "woken once per payment");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

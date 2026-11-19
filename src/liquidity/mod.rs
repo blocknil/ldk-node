@@ -26,6 +26,7 @@ use lightning_liquidity::lsps1::client::LSPS1ClientConfig as LdkLSPS1ClientConfi
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig as LdkLSPS2ClientConfig;
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceConfig;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
+pub use service::jit_wait::OnJitWaiting;
 pub use service::lsps2::LSPS2ServiceConfig;
 // Blocknil patch: the lifetimes of the opening fee parameters an LSPS2 service offers.
 pub use service::lsps2::{
@@ -47,6 +48,7 @@ use crate::liquidity::client::lsps2::state::{
 	LeaseCacheTargetStore, PaymentLeaseStore, PendingLeaseRequestState,
 };
 use crate::liquidity::client::lsps2::LSPS2Client;
+use crate::liquidity::service::jit_wait::JitWaits;
 use crate::liquidity::service::lsps2::{LSPS2Service, LSPS2ServiceLiquiditySource};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::runtime::Runtime;
@@ -446,6 +448,7 @@ where
 				liquidity_manager: Arc::clone(&liquidity_manager),
 				config: self.config.clone(),
 				logger: self.logger.clone(),
+				jit_waits: JitWaits::new(),
 			}),
 			pending_lsps0_discovery: Mutex::new(HashMap::new()),
 			discovery_done_tx,
