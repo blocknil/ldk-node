@@ -8,7 +8,8 @@
 //! Blocknil patch: the LSPS5 (webhook) client, which upstream ldk-node leaves off.
 //!
 //! A wallet registers the URL its push relay gives it with its LSP, so the LSP can wake the phone
-//! when a payment waits for it. The LSP's answers reach the wallet through
+//! when a payment waits for it, and removes it when the user turns that off. The LSP's answers
+//! reach the wallet through
 //! [`crate::Node::set_webhook_result_handler`].
 
 use std::ops::Deref;
@@ -21,14 +22,14 @@ use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 use crate::types::LiquidityManager;
 use crate::Error;
 
-/// The provider's answer to a webhook registration, as the LSPS5 client reports it.
+/// The provider's answer to a webhook registration or removal, as the LSPS5 client reports it.
 ///
 /// Blocknil patch (LSPS5): the wallet shows "Notifications: on/off" from this, so the answer has to
 /// be readable rather than only logged. Delivered to the handler set with
 /// [`crate::Node::set_webhook_result_handler`], on the node's event handling: it must not block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebhookResult {
-	/// The URL that was registered, as the provider echoes it back.
+	/// The URL that was registered, as the provider echoes it back. Empty for a removal.
 	pub url: String,
 	/// The app name it was registered under.
 	pub app_name: String,
@@ -36,6 +37,9 @@ pub struct WebhookResult {
 	pub accepted: bool,
 	/// True when the provider already had this exact URL and changed nothing.
 	pub no_change: bool,
+	/// True when this answer is about a webhook being removed, not registered: the provider no
+	/// longer has it, so nothing will wake the phone.
+	pub removed: bool,
 	/// Why it was refused, when it was. Empty otherwise.
 	pub error: String,
 }
@@ -81,6 +85,18 @@ where
 		})
 	}
 
+	/// Removes `app_name`'s webhook from `lsp`. The answer comes later, as an event.
+	pub(crate) fn remove_webhook(&self, lsp: PublicKey, app_name: String) -> Result<(), Error> {
+		let handler = self
+			.liquidity_manager
+			.lsps5_client_handler()
+			.ok_or(Error::WebhookRegistrationFailed)?;
+		handler.remove_webhook(lsp, app_name).map(|_| ()).map_err(|e| {
+			log_error!(self.logger, "Removing the webhook was refused: {:?}", e);
+			Error::WebhookRegistrationFailed
+		})
+	}
+
 	/// Logs the provider's answer and hands it to the wallet.
 	pub(crate) fn handle_event(&self, event: LSPS5ClientEvent) {
 		match event {
@@ -103,6 +119,7 @@ where
 					app_name: app_name.to_string(),
 					accepted: true,
 					no_change,
+					removed: false,
 					error: String::new(),
 				});
 			},
@@ -125,6 +142,45 @@ where
 					app_name: app_name.to_string(),
 					accepted: false,
 					no_change: false,
+					removed: false,
+					error: format!("{error:?}"),
+				});
+			},
+			LSPS5ClientEvent::WebhookRemoved { counterparty_node_id, app_name, .. } => {
+				log_info!(
+					self.logger,
+					"Webhook {:?} removed from {}",
+					app_name,
+					counterparty_node_id
+				);
+				self.report(WebhookResult {
+					url: String::new(),
+					app_name: app_name.to_string(),
+					accepted: false,
+					no_change: false,
+					removed: true,
+					error: String::new(),
+				});
+			},
+			LSPS5ClientEvent::WebhookRemovalFailed {
+				counterparty_node_id,
+				app_name,
+				error,
+				..
+			} => {
+				log_error!(
+					self.logger,
+					"Webhook {:?} could not be removed from {}: {:?}",
+					app_name,
+					counterparty_node_id,
+					error
+				);
+				self.report(WebhookResult {
+					url: String::new(),
+					app_name: app_name.to_string(),
+					accepted: false,
+					no_change: false,
+					removed: false,
 					error: format!("{error:?}"),
 				});
 			},

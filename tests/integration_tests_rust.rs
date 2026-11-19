@@ -9203,12 +9203,13 @@ async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
+async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for_until_removed() {
 	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook and is told
 	// the service's answer (`set_webhook_result_handler`); a first
 	// payment then waits for the client while it is offline, the service is told to wake it
 	// (`set_payment_held_handler`, as the provider does), and the signed notification reaches the
-	// service's webhook sender.
+	// service's webhook sender. The client then removes the webhook, is told so, and nothing is
+	// sent to it after that.
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
 	let (_, _, service_node, client_node, payer_node) =
@@ -9276,6 +9277,7 @@ async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
 			app_name: "blocknil".to_string(),
 			accepted: true,
 			no_change: false,
+			removed: false,
 			error: String::new(),
 		}]
 	);
@@ -9317,6 +9319,27 @@ async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for() {
 	expect_channel_ready_event!(client_node, service_id);
 	expect_payment_successful_event!(payer_node, payment_id, None);
 	expect_payment_received_event!(client_node, amount_msat * 99 / 100);
+
+	// Remove the webhook: the client is told, and the service sends nothing to it any more, even
+	// past the cooldown.
+	client_node.remove_webhook(service_id, "blocknil".to_string()).unwrap();
+	wait_until("the removal answer", || results.lock().unwrap().len() == 2).await;
+	assert_eq!(
+		results.lock().unwrap()[1],
+		ldk_node::liquidity::WebhookResult {
+			url: String::new(),
+			app_name: "blocknil".to_string(),
+			accepted: false,
+			no_change: false,
+			removed: true,
+			error: String::new(),
+		}
+	);
+	tokio::time::sleep(Duration::from_secs(11)).await;
+	let sent_before = posts.lock().unwrap().len();
+	service_node.notify_payment_incoming(client_id);
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(posts.lock().unwrap().len(), sent_before, "nothing is sent after the removal");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
