@@ -10,16 +10,21 @@
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
+	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId, MIN_FINAL_CLTV_EXPIRY_DELTA,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
-use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::routing::router::{
+	PaymentParameters, RouteHint, RouteHintHop, RouteParameters, RouteParametersConfig,
+};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
+	InvoiceBuilder, RoutingFees,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
@@ -35,7 +40,7 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -64,6 +69,8 @@ pub struct Bolt11Payment {
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
 	logger: Arc<Logger>,
+	/// Blocknil patch: signs invoices with a route hint of our own (`receive_via_hold_scid`).
+	keys_manager: Arc<KeysManager>,
 }
 
 impl Bolt11Payment {
@@ -72,7 +79,7 @@ impl Bolt11Payment {
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
 		peer_store: Arc<PeerStore<Arc<Logger>>>, config: Arc<Config>,
-		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>, keys_manager: Arc<KeysManager>,
 	) -> Self {
 		Self {
 			runtime,
@@ -84,7 +91,48 @@ impl Bolt11Payment {
 			config,
 			is_running,
 			logger,
+			keys_manager,
 		}
+	}
+
+	/// Blocknil patch: an invoice whose only route hint is `hop`, from our provider to us, with no
+	/// HTLC maximum, so a payer sends amounts larger than our channel can take today and the
+	/// provider gets the chance to add room. LDK's own hints cap an HTLC at what the channel can
+	/// take now. Claimed on arrival like any other.
+	fn receive_via_hint_inner(
+		&self, amount_msat: Option<u64>, description: &LdkBolt11InvoiceDescription,
+		expiry_secs: u32, hop: RouteHintHop,
+	) -> Result<LdkBolt11Invoice, Error> {
+		let (payment_hash, payment_secret, _) = self
+			.channel_manager
+			.create_inbound_payment(amount_msat, expiry_secs, None, None)
+			.map_err(|()| {
+				log_error!(self.logger, "Failed to register an inbound payment");
+				Error::InvoiceCreationFailed
+			})?;
+		let scid = hop.short_channel_id;
+		let mut builder = InvoiceBuilder::new(self.config.network.into())
+			.invoice_description(description.clone())
+			.payment_hash(payment_hash)
+			.payment_secret(payment_secret)
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(MIN_FINAL_CLTV_EXPIRY_DELTA.into())
+			.expiry_time(Duration::from_secs(expiry_secs.into()))
+			.private_route(RouteHint(vec![hop]));
+		if let Some(amount_msat) = amount_msat {
+			builder = builder.amount_milli_satoshis(amount_msat).basic_mpp();
+		}
+		let invoice = builder
+			.build_signed(|hash| {
+				Secp256k1::new()
+					.sign_ecdsa_recoverable(hash, &self.keys_manager.get_node_secret_key())
+			})
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to build and sign an invoice: {}", e);
+				Error::InvoiceCreationFailed
+			})?;
+		log_info!(self.logger, "Invoice created through SCID {}: {}", scid, invoice);
+		Ok(invoice)
 	}
 
 	pub(crate) fn receive_inner(
@@ -483,6 +531,27 @@ impl Bolt11Payment {
 
 		self.channel_manager.fail_htlc_backwards(&payment_hash);
 		Ok(())
+	}
+
+	/// Blocknil patch: an invoice routed through our provider's hold SCID for us (`scid`, with
+	/// the provider's `cltv_expiry_delta`), so a provider still on r8 holds a payment that arrives
+	/// while we're offline instead of failing it. `amount_msat: None` is an any-amount invoice.
+	/// Claimed on arrival like any other. r8's API, kept for a provider not yet upgraded.
+	pub fn receive_via_hold_scid(
+		&self, amount_msat: Option<u64>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+		provider: PublicKey, scid: u64, cltv_expiry_delta: u16,
+	) -> Result<Bolt11Invoice, Error> {
+		let description = maybe_try_convert_enum(description)?;
+		let hop = RouteHintHop {
+			src_node_id: provider,
+			short_channel_id: scid,
+			fees: RoutingFees { base_msat: 0, proportional_millionths: 0 },
+			cltv_expiry_delta,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		};
+		let invoice = self.receive_via_hint_inner(amount_msat, &description, expiry_secs, hop)?;
+		Ok(maybe_wrap(invoice))
 	}
 
 	/// Returns a payable invoice that can be used to request and receive a payment of the amount

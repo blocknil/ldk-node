@@ -52,7 +52,7 @@ use crate::fee_estimator::ConfirmationTarget;
 #[cfg(feature = "uniffi")]
 use crate::ffi::PaidBolt12Invoice;
 use crate::funding_signer::ExternalFunding;
-use crate::held_payments::HeldPayments;
+use crate::held_payments::{HeldPayments, NextHop};
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -2891,16 +2891,35 @@ where
 				payment_hash,
 				..
 			} => {
-				// Blocknil patch: an HTLC to one of our clients' channels (not an LSPS2 intercept
-				// SCID) is a held payment (see `held_payments`).
-				if let Some(customer) = self.held_payments.customer_for(requested_next_hop_scid) {
-					self.held_payments.intercepted(
-						intercept_id,
-						payment_hash,
-						customer,
-						expected_outbound_amount_msat,
-					);
-					return Ok(());
+				// Blocknil patch: an HTLC to one of our clients' channels or hold SCIDs (not an
+				// LSPS2 intercept SCID) is a held payment (see `held_payments`).
+				match self.held_payments.next_hop(requested_next_hop_scid) {
+					Some(NextHop::Customer(customer)) => {
+						self.held_payments.intercepted(
+							intercept_id,
+							payment_hash,
+							customer,
+							expected_outbound_amount_msat,
+						);
+						return Ok(());
+					},
+					Some(NextHop::LapsedHoldScid(customer)) => {
+						log_info!(
+							self.logger,
+							"Failing a payment for customer {} on their lapsed hold SCID {}",
+							customer,
+							requested_next_hop_scid
+						);
+						let _ = self.channel_manager.fail_intercepted_htlc(intercept_id);
+						return Ok(());
+					},
+					None if self.liquidity_source.lsps2_service().lsps2_service.is_none() => {
+						// Intercepted only for hold SCIDs (`Config::hold_private_forwards`), and
+						// this isn't one: nobody else will forward it.
+						let _ = self.channel_manager.fail_intercepted_htlc(intercept_id);
+						return Ok(());
+					},
+					None => {},
 				}
 				self.liquidity_source
 					.lsps2_service()

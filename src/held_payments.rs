@@ -24,20 +24,35 @@
 //!   adding room (a splice of its own coins), or [`crate::Node::refuse_held_payment`];
 //! - is failed back after `hold_for`.
 //!
-//! r8 (`held_forwards.rs`) did the same on hold SCIDs only; this replaces them.
+//! r8 (`held_forwards.rs`) did the same on hold SCIDs only: an intercept SCID per client, which
+//! its wallet put in its invoices' route hints. They are no longer needed, but invoices phones
+//! handed out before the upgrade carry them: the hold SCIDs r8 stored (`blocknil/hold_scids`) are
+//! honoured for [`HOLD_SCID_LIFETIME`] after this code first saw them, and an HTLC on one is held
+//! like any other for its client. After that it is failed back at once.
 //!
 //! [`Config::hold_private_forwards`]: crate::config::Config::hold_private_forwards
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::InterceptId;
 use lightning::types::payment::PaymentHash;
+use lightning::util::persist::KVStore;
 
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
-use crate::types::ChannelManager;
+use crate::types::{ChannelManager, DynStore};
+use crate::Error;
+
+/// Where r8 kept its hold SCIDs, and this code still does: one `scid customer first_seen` line per
+/// SCID (hex, hex, decimal seconds since the Unix epoch). r8 wrote `scid customer` only.
+const HOLD_SCIDS_NAMESPACE: &str = "blocknil";
+const HOLD_SCIDS_KEY: &str = "hold_scids";
+
+/// How long a hold SCID is honoured after this code first saw it: invoices handed out before the
+/// upgrade, and by phones still on r8, keep working that long.
+pub(crate) const HOLD_SCID_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// How long a payment for an offline client is held before it is failed back: inside a payer's
 /// patience, and time enough for a push to wake the phone.
@@ -120,8 +135,19 @@ struct Held {
 	fee_msat: u64,
 }
 
+/// Where an intercepted HTLC goes.
+pub(crate) enum NextHop {
+	/// To this client: one of our channels with them, or a hold SCID still honoured.
+	Customer(PublicKey),
+	/// A hold SCID of this client's, no longer honoured.
+	LapsedHoldScid(PublicKey),
+}
+
 pub(crate) struct HeldPayments {
 	held: Mutex<Vec<Held>>,
+	/// Hold SCIDs: client, and when this code first saw the SCID.
+	hold_scids: RwLock<HashMap<u64, (PublicKey, u64)>>,
+	kv_store: Arc<DynStore>,
 	recent: Mutex<VecDeque<HoldRecord>>,
 	hold_for: RwLock<Duration>,
 	on_held: RwLock<Option<OnHeld>>,
@@ -137,10 +163,40 @@ pub(crate) fn now_secs() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
 }
 
+fn encode_hold_scids(scids: &HashMap<u64, (PublicKey, u64)>) -> Vec<u8> {
+	let mut lines: Vec<_> = scids
+		.iter()
+		.map(|(scid, (customer, first_seen))| format!("{scid:016x} {customer} {first_seen}\n"))
+		.collect();
+	lines.sort();
+	lines.concat().into_bytes()
+}
+
+/// Reads both formats; `None` for a line r8 wrote (no first-seen time yet).
+fn decode_hold_scids(bytes: &[u8]) -> HashMap<u64, (PublicKey, Option<u64>)> {
+	String::from_utf8_lossy(bytes)
+		.lines()
+		.filter_map(|line| {
+			let mut fields = line.split(' ');
+			let scid = u64::from_str_radix(fields.next()?, 16).ok()?;
+			let customer = fields.next()?.parse().ok()?;
+			let first_seen = match fields.next() {
+				Some(secs) => Some(secs.parse().ok()?),
+				None => None,
+			};
+			fields.next().is_none().then_some((scid, (customer, first_seen)))
+		})
+		.collect()
+}
+
 impl HeldPayments {
-	pub(crate) fn new(channel_manager: Arc<ChannelManager>, logger: Arc<Logger>) -> Self {
+	pub(crate) fn new(
+		channel_manager: Arc<ChannelManager>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
+	) -> Self {
 		Self {
 			held: Mutex::new(Vec::new()),
+			hold_scids: RwLock::new(HashMap::new()),
+			kv_store,
 			recent: Mutex::new(VecDeque::new()),
 			hold_for: RwLock::new(DEFAULT_HOLD),
 			on_held: RwLock::new(None),
@@ -152,18 +208,92 @@ impl HeldPayments {
 		}
 	}
 
-	/// The client whose channel the payer asked for, when it is one of our channels. An intercept
-	/// SCID (an LSPS2 just-in-time channel) is not one.
-	pub(crate) fn customer_for(&self, requested_next_hop_scid: u64) -> Option<PublicKey> {
-		self.channel_manager
-			.list_channels()
+	/// Where an HTLC for `requested_next_hop_scid` goes: to the client of one of our channels, or
+	/// of a hold SCID. `None` for anything else (an LSPS2 intercept SCID).
+	pub(crate) fn next_hop(&self, requested_next_hop_scid: u64) -> Option<NextHop> {
+		let channel = self.channel_manager.list_channels().into_iter().find(|c| {
+			c.short_channel_id == Some(requested_next_hop_scid)
+				|| c.outbound_scid_alias == Some(requested_next_hop_scid)
+				|| c.inbound_scid_alias == Some(requested_next_hop_scid)
+		});
+		if let Some(channel) = channel {
+			return Some(NextHop::Customer(channel.counterparty.node_id));
+		}
+		let (customer, first_seen) =
+			*self.hold_scids.read().expect("lock").get(&requested_next_hop_scid)?;
+		if now_secs() < first_seen.saturating_add(HOLD_SCID_LIFETIME.as_secs()) {
+			Some(NextHop::Customer(customer))
+		} else {
+			Some(NextHop::LapsedHoldScid(customer))
+		}
+	}
+
+	/// Reads the hold SCIDs at build. One written by r8 gets its first-seen time now, saved.
+	pub(crate) async fn load_hold_scids(&self) -> Result<(), Error> {
+		let bytes =
+			match KVStore::read(&*self.kv_store, HOLD_SCIDS_NAMESPACE, "", HOLD_SCIDS_KEY).await {
+				Ok(bytes) => bytes,
+				Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => return Ok(()),
+				Err(e) => {
+					log_error!(self.logger, "Failed to read hold SCIDs: {}", e);
+					return Err(Error::PersistenceFailed);
+				},
+			};
+		let now = now_secs();
+		let decoded = decode_hold_scids(&bytes);
+		let first_seen_now = decoded.values().any(|(_, first_seen)| first_seen.is_none());
+		let scids: HashMap<_, _> = decoded
 			.into_iter()
-			.find(|c| {
-				c.short_channel_id == Some(requested_next_hop_scid)
-					|| c.outbound_scid_alias == Some(requested_next_hop_scid)
-					|| c.inbound_scid_alias == Some(requested_next_hop_scid)
-			})
-			.map(|c| c.counterparty.node_id)
+			.map(|(scid, (customer, first_seen))| (scid, (customer, first_seen.unwrap_or(now))))
+			.collect();
+		log_info!(self.logger, "Honouring {} hold SCID(s) of earlier invoices", scids.len());
+		if first_seen_now {
+			self.save_hold_scids(&scids).await?;
+		}
+		*self.hold_scids.write().expect("lock") = scids;
+		Ok(())
+	}
+
+	async fn save_hold_scids(&self, scids: &HashMap<u64, (PublicKey, u64)>) -> Result<(), Error> {
+		KVStore::write(
+			&*self.kv_store,
+			HOLD_SCIDS_NAMESPACE,
+			"",
+			HOLD_SCIDS_KEY,
+			encode_hold_scids(scids),
+		)
+		.await
+		.map_err(|e| {
+			log_error!(self.logger, "Failed to save hold SCIDs: {}", e);
+			Error::PersistenceFailed
+		})
+	}
+
+	/// The client's hold SCID, for a wallet still on r8 that asks for one: theirs while it is
+	/// honoured, a new one (honoured from now) when they have none, an error once theirs lapsed.
+	pub(crate) async fn hold_scid_for(
+		&self, customer: PublicKey, new_scid: impl FnOnce() -> u64,
+	) -> Result<u64, Error> {
+		let existing = {
+			let scids = self.hold_scids.read().expect("lock");
+			scids.iter().find(|(_, (c, _))| *c == customer).map(|(scid, (_, s))| (*scid, *s))
+		};
+		if let Some((scid, first_seen)) = existing {
+			if now_secs() < first_seen.saturating_add(HOLD_SCID_LIFETIME.as_secs()) {
+				return Ok(scid);
+			}
+			log_info!(self.logger, "The hold SCID of customer {} lapsed", customer);
+			return Err(Error::InvalidChannelId);
+		}
+		let scid = new_scid();
+		let scids = {
+			let mut scids = self.hold_scids.write().expect("lock");
+			scids.insert(scid, (customer, now_secs()));
+			scids.clone()
+		};
+		self.save_hold_scids(&scids).await?;
+		log_info!(self.logger, "Hold SCID {} for customer {}", scid, customer);
+		Ok(scid)
 	}
 
 	pub(crate) fn set_hold_for(&self, hold_for: Duration) {
@@ -425,5 +555,35 @@ impl HeldPayments {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn hold_scids_read_r8s_format_and_keep_their_first_seen_time() {
+		let customer: PublicKey =
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		// What r8 wrote (held_forwards.rs `encode`): `{scid:016x} {customer}` per line.
+		let r8 =
+			format!("{:016x} {}\n{:016x} {}\n", 0x0123_4567_89ab_cdef_u64, customer, 42, customer);
+		let decoded = decode_hold_scids(r8.as_bytes());
+		assert_eq!(decoded.len(), 2);
+		assert_eq!(decoded[&0x0123_4567_89ab_cdef], (customer, None));
+		assert_eq!(decoded[&42], (customer, None));
+
+		let mut scids = HashMap::new();
+		scids.insert(0x0123_4567_89ab_cdef_u64, (customer, 1_790_000_000));
+		scids.insert(42, (customer, 7));
+		let decoded = decode_hold_scids(&encode_hold_scids(&scids));
+		let roundtrip: HashMap<_, _> =
+			decoded.into_iter().map(|(scid, (c, s))| (scid, (c, s.unwrap()))).collect();
+		assert_eq!(roundtrip, scids);
+
+		assert!(decode_hold_scids(b"garbage\nzz 02 1\n").is_empty());
+		let extra = format!("{:016x} {} 1 2\n{:016x} {} x\n", 1, customer, 2, customer);
+		assert!(decode_hold_scids(extra.as_bytes()).is_empty());
 	}
 }

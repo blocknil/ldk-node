@@ -24,7 +24,9 @@ use common::{
 };
 use electrsd::corepc_node::Node as BitcoinD;
 use electrsd::ElectrsD;
+use ldk_node::io::sqlite_store::{SqliteStore, KV_TABLE_NAME, SQLITE_DB_FILE_NAME};
 use ldk_node::{Event, ShortOfRoom, UserChannelId};
+use lightning::util::persist::KVStore;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 
 /// Waits for the first event matching `want`, handling (and printing) the others.
@@ -489,21 +491,122 @@ async fn held_payment_survives_a_provider_restart() {
 	let chain_source = TestChainSource::Esplora(&s.electrsd);
 	let provider = setup_node(&chain_source, s.provider_config.clone());
 	let woken = wake_requests(&provider);
-	s.payer
-		.connect(provider.node_id(), provider.listening_addresses().unwrap()[0].clone(), true)
-		.unwrap();
+	// The provider may be dialling the payer at the same time: a failed connect is no matter.
+	let _ = s.payer.connect(
+		provider.node_id(),
+		provider.listening_addresses().unwrap()[0].clone(),
+		true,
+	);
 	let who = tokio::task::block_in_place(|| woken.recv_timeout(Duration::from_secs(30)))
 		.expect("held again after the restart");
 	assert_eq!(who, customer_id);
 	assert_eq!(provider.held_payments().len(), 1);
 
 	s.customer.start().unwrap();
-	s.customer
-		.connect(provider.node_id(), provider.listening_addresses().unwrap()[0].clone(), true)
-		.unwrap();
+	let _ = s.customer.connect(
+		provider.node_id(),
+		provider.listening_addresses().unwrap()[0].clone(),
+		true,
+	);
 	wait_for(&s.customer, "the held payment", is_received(50_000_000)).await;
 	wait_for(&s.payer, "its success", is_successful).await;
 	assert!(provider.held_payments().is_empty());
 	provider.stop().unwrap();
+	s.stop();
+}
+
+impl Setup {
+	/// Stops the provider, sets its stored hold SCIDs to `hold_scids` (as r8 or an earlier run
+	/// left them), and starts it again; payer and customer reconnect.
+	async fn restart_provider_with_hold_scids(&mut self, hold_scids: String) {
+		self.provider.stop().unwrap();
+		let store = SqliteStore::new(
+			self.provider_config.node_config.storage_dir_path.clone().into(),
+			Some(SQLITE_DB_FILE_NAME.to_string()),
+			Some(KV_TABLE_NAME.to_string()),
+		)
+		.unwrap();
+		KVStore::write(&store, "blocknil", "", "hold_scids", hold_scids.into_bytes())
+			.await
+			.unwrap();
+		drop(store);
+		let chain_source = TestChainSource::Esplora(&self.electrsd);
+		self.provider = setup_node(&chain_source, self.provider_config.clone());
+		let address = self.provider.listening_addresses().unwrap()[0].clone();
+		// The provider may be dialling them at the same time: a failed connect is no matter.
+		let _ = self.payer.connect(self.provider.node_id(), address.clone(), true);
+		let _ = self.customer.connect(self.provider.node_id(), address, true);
+		common::wait_for_channel_ready_to_send(&self.payer, &self.provider, 100_000_000).await;
+		common::wait_for_channel_ready_to_send(&self.provider, &self.customer, 100_000_000).await;
+	}
+
+	fn stored_hold_scids(&self) -> String {
+		let store = SqliteStore::new(
+			self.provider_config.node_config.storage_dir_path.clone().into(),
+			Some(SQLITE_DB_FILE_NAME.to_string()),
+			Some(KV_TABLE_NAME.to_string()),
+		)
+		.unwrap();
+		let bytes = tokio::task::block_in_place(|| {
+			tokio::runtime::Handle::current().block_on(KVStore::read(
+				&store,
+				"blocknil",
+				"",
+				"hold_scids",
+			))
+		});
+		String::from_utf8(bytes.unwrap()).unwrap()
+	}
+}
+
+/// Invoices phones handed out before the upgrade carry the provider's hold SCID for them. After
+/// the upgrade the provider reads r8's stored hold SCIDs, and a payment on one reaches its
+/// customer; 30 days after the new code first saw it, the SCID is no longer honoured: a payment
+/// on it fails at once, and the customer gets no new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_hold_scid_invoices_keep_working_for_30_days() {
+	let mut s = setup(&[1_000_000], 500_000).await;
+	let (provider_id, customer_id) = (s.provider.node_id(), s.customer.node_id());
+	let scid = s.provider.hold_scid_for(customer_id).unwrap();
+	assert_eq!(s.provider.hold_scid_for(customer_id).unwrap(), scid, "one per customer");
+	let cltv_expiry_delta = s.provider.list_channels()[0].config.cltv_expiry_delta;
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new("old".to_string()).unwrap());
+	let old_invoice = |amount_msat| {
+		s.customer
+			.bolt11_payment()
+			.receive_via_hold_scid(
+				Some(amount_msat),
+				&description,
+				3600,
+				provider_id,
+				scid,
+				cltv_expiry_delta,
+			)
+			.unwrap()
+	};
+	let (first, second) = (old_invoice(20_000_000), old_invoice(30_000_000));
+	assert_eq!(first.route_hints()[0].0[0].short_channel_id, scid);
+
+	// The upgrade: the provider starts on this code with the hold SCIDs as r8 stored them.
+	let r8_line = format!("{scid:016x} {customer_id}\n");
+	s.restart_provider_with_hold_scids(r8_line).await;
+	s.payer.bolt11_payment().send(&first, None).unwrap();
+	wait_for(&s.customer, "the old invoice's payment", is_received(20_000_000)).await;
+	wait_for(&s.payer, "its success", is_successful).await;
+	// The 30 days run from the upgrade: saved with the SCID.
+	let stored = s.stored_hold_scids();
+	let first_seen: u64 = stored.trim().rsplit(' ').next().unwrap().parse().unwrap();
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	assert!(now - first_seen < 600, "first seen at the upgrade: {stored}");
+
+	// 31 days later the SCID is no longer honoured.
+	let lapsed = now - 31 * 24 * 3600;
+	s.restart_provider_with_hold_scids(format!("{scid:016x} {customer_id} {lapsed}\n")).await;
+	let started = Instant::now();
+	s.payer.bolt11_payment().send(&second, None).unwrap();
+	wait_for(&s.payer, "the lapsed invoice's failure", is_failed).await;
+	assert!(started.elapsed() < Duration::from_secs(10), "failed at once");
+	assert!(s.provider.hold_scid_for(customer_id).is_err(), "no new hold SCID once it lapsed");
 	s.stop();
 }
