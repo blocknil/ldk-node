@@ -274,6 +274,7 @@ impl Default for ForwardedPaymentTrackingMode {
 )]
 /// | `manually_handle_unknown_bolt11_payments` | false                              |
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
+/// | `claim_only`                           | false                               |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -362,6 +363,14 @@ pub struct Config {
 	pub manually_handle_unknown_bolt11_payments: bool,
 	/// The mode used for tracking forwarded payments.
 	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	/// Blocknil patch: starts the node only to claim payments on channels it already has (a
+	/// wallet's notification extension, woken while its app is closed, with little memory and a
+	/// few seconds). See [`crate::NodeBuilder::set_claim_only`].
+	///
+	/// [`crate::Node::start`] then does not touch the chain: it does not start the chain source,
+	/// fetch fee estimates, sync the Lightning wallet before starting, or keep syncing afterwards.
+	/// The next start without it syncs as usual.
+	pub claim_only: bool,
 }
 
 impl Default for Config {
@@ -382,6 +391,7 @@ impl Default for Config {
 			hrn_config: HumanReadableNamesConfig::default(),
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			claim_only: false,
 		}
 	}
 }
