@@ -8514,6 +8514,41 @@ async fn lsps2_service_fails_payment_if_channel_closes_before_ready() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_service_opens_jit_channels_of_at_least_25k_sats() {
+	// Blocknil patch: a first payment of 5,000 sats would otherwise get a channel sized to it
+	// (4,950 sats after the 1% fee, plus 10% over-provisioning: 5,445 sats). The service opens
+	// 25,000 sats instead, and the payment goes through on it.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+
+	let invoice_description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("small")).unwrap());
+	let jit_amount_msat = 5_000_000;
+	let jit_invoice = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel(jit_amount_msat, &invoice_description.into(), 1024)
+		.unwrap();
+
+	let payer_payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
+	expect_payment_successful_event!(payer_node, payer_payment_id, None);
+	expect_payment_received_event!(client_node, jit_amount_msat * 99 / 100);
+
+	let jit_channel = service_node
+		.list_channels()
+		.into_iter()
+		.find(|c| c.counterparty.node_id == client_node.node_id())
+		.expect("the JIT channel");
+	assert_eq!(jit_channel.channel_value_sats, 25_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn payment_persistence_after_restart() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
