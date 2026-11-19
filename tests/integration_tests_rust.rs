@@ -3183,6 +3183,74 @@ async fn build_fails_when_wallet_rescan_height_is_above_tip() {
 
 #[cfg(feature = "chain-bitcoind")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn bitcoind_fee_estimates_that_can_wait_are_capped_by_the_mempool() {
+	// Blocknil patch: with a bitcoind chain source, an on-chain payment pays what the mempool
+	// asks when that is less than Core's estimate. Core here has learnt 20 sat/vB, but the mempool
+	// is empty, so the floor will do.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	premine_blocks(&bitcoind.client, &electrsd.client).await;
+	let core_address = bitcoind.client.new_address().unwrap();
+	for _ in 0..6 {
+		for _ in 0..5 {
+			// sendtoaddress address amount comment comment_to subtractfeefromamount replaceable
+			// conf_target estimate_mode avoid_reuse fee_rate (sat/vB)
+			let _: serde_json::Value = bitcoind
+				.client
+				.call(
+					"sendtoaddress",
+					&[
+						json!(core_address.to_string()),
+						json!(0.01),
+						json!(""),
+						json!(""),
+						json!(false),
+						json!(true),
+						json!(null),
+						json!("unset"),
+						json!(false),
+						json!(20),
+					],
+				)
+				.unwrap();
+		}
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	}
+	let core: serde_json::Value =
+		bitcoind.client.call("estimatesmartfee", &[json!(6), json!("economical")]).unwrap();
+	assert!(core["feerate"].as_f64().unwrap() >= 0.00019, "{core}");
+
+	for chain_source in
+		[TestChainSource::BitcoindRpcSync(&bitcoind), TestChainSource::BitcoindRestSync(&bitcoind)]
+	{
+		let node = setup_node(&chain_source, random_config());
+		let address = node.onchain_payment().new_address().unwrap();
+		distribute_funds_unconfirmed(
+			&bitcoind.client,
+			&electrsd.client,
+			vec![address],
+			Amount::from_sat(1_000_000),
+		)
+		.await;
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		// The second sync's estimates read the mempool the first one polled.
+		node.sync_wallets().unwrap();
+		node.sync_wallets().unwrap();
+
+		let txid = node.onchain_payment().send_to_address(&core_address, 100_000, None).unwrap();
+		wait_for_tx(&electrsd.client, txid).await;
+		let entry: serde_json::Value =
+			bitcoind.client.call("getmempoolentry", &[json!(txid.to_string())]).unwrap();
+		let fee_sat = entry["fees"]["base"].as_f64().unwrap() * 100_000_000.0;
+		let sat_per_vb = fee_sat / entry["vsize"].as_f64().unwrap();
+		assert!(sat_per_vb < 1.1, "paid {sat_per_vb} sat/vB");
+
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		node.stop().unwrap();
+	}
+}
+
+#[cfg(feature = "chain-bitcoind")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn build_aborts_on_first_startup_bitcoind_tip_fetch_failure() {
 	// A fresh node pointed at an unreachable bitcoind RPC endpoint must not silently
 	// fall back to genesis as the wallet birthday. The build must abort cleanly so the
