@@ -275,6 +275,7 @@ impl Default for ForwardedPaymentTrackingMode {
 /// | `manually_handle_unknown_bolt11_payments` | false                              |
 /// | `forwarded_payment_tracking_mode`      | Stats                               |
 /// | `claim_only`                           | false                               |
+/// | `route_messages_via_lsp`               | false                               |
 ///
 /// See [`AnchorChannelsConfig`], [`RouteParametersConfig`], and
 /// [`ForwardedPaymentTrackingMode`] for more information regarding their respective default values.
@@ -375,6 +376,15 @@ pub struct Config {
 	/// snapshots, so a claim-only node is built with the peer-to-peer gossip source, which then
 	/// learns nothing.
 	pub claim_only: bool,
+	/// Blocknil patch: sends every onion message this node cannot hand to a connected peer through
+	/// its LSP (the first one configured with [`crate::NodeBuilder::add_liquidity_source`]), as a
+	/// single intermediate hop.
+	///
+	/// A wallet whose graph has no node addresses (none at all on a claim-only start, none in a
+	/// rapid-gossip graph) otherwise leaves, say, a BOLT 12 invoice or invoice request waiting for
+	/// a connection to the other side's introduction node that never opens. It also keeps the
+	/// phone from dialling third parties.
+	pub route_messages_via_lsp: bool,
 }
 
 impl Default for Config {
@@ -396,6 +406,7 @@ impl Default for Config {
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
 			claim_only: false,
+			route_messages_via_lsp: false,
 		}
 	}
 }

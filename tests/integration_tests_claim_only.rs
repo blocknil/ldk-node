@@ -21,7 +21,7 @@ use common::{
 	expect_channel_ready_event, expect_payment_received_event, expect_payment_successful_event,
 	generate_blocks_and_wait, open_channel, open_channel_push_amt, premine_and_distribute_funds,
 	random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node, TestChainSource,
-	TestConfig, TestSyncStore,
+	TestConfig, TestNode, TestSyncStore,
 };
 use ldk_node::{Builder, Event};
 use lightning::util::persist::{
@@ -297,5 +297,130 @@ async fn claim_only_start_claims_without_the_chain() {
 		start_time, before, after
 	);
 	assert!(!wallet.network_graph().list_channels().is_empty());
+	wallet.stop().unwrap();
+}
+
+/// An unannounced wallet node that routes its onion messages via `lsp`, as the app sets it up.
+fn wallet_config_via(lsp: Option<&TestNode>) -> TestConfig {
+	let mut config = random_config();
+	config.node_config.listening_addresses = None;
+	config.node_config.node_alias = None;
+	config.node_config.route_messages_via_lsp = lsp.is_some();
+	config
+}
+
+/// Builds and starts `config`'s node claim-only, around the wallet core's store wrapper, with
+/// `lsp` as its liquidity source.
+fn start_claim_only(
+	chain_source: &TestChainSource, config: &TestConfig, store: ClaimOnlyStore,
+	lsp: Option<&TestNode>,
+) -> TestNode {
+	let mut config = config.clone();
+	config.node_config.claim_only = true;
+	setup_builder!(builder, config.node_config);
+	common::configure_chain_source(chain_source, &mut builder, &config);
+	if let Some(lsp) = lsp {
+		let address = lsp.listening_addresses().unwrap().first().unwrap().clone();
+		builder.add_liquidity_source(lsp.node_id(), address, None, false);
+	}
+	let node = builder.build_with_store(config.node_entropy, store).unwrap();
+	node.start().unwrap();
+	node
+}
+
+async fn wait_for_graph_channels(node: &TestNode, count: usize) {
+	while node.network_graph().list_channels().len() < count {
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+}
+
+/// A claim-only wallet is paid to its BOLT 12 offer by a payer behind its own LSP (Phoenix behind
+/// ACINQ): the payer's reply path starts at that LSP, which the wallet isn't connected to and has
+/// no address for. The wallet sends its invoice through its provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn claim_only_wallet_answers_a_bolt12_payer_through_its_provider() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+
+	let payer_lsp = setup_node(&chain_source, random_config());
+	let provider = setup_node(&chain_source, random_config());
+	// The payer reaches the network only through its LSP, too.
+	let mut payer_config = wallet_config_via(Some(&payer_lsp));
+	payer_config.node_config.route_messages_via_lsp = true;
+	let payer = {
+		setup_builder!(builder, payer_config.node_config);
+		common::configure_chain_source(&chain_source, &mut builder, &payer_config);
+		let address = payer_lsp.listening_addresses().unwrap().first().unwrap().clone();
+		builder.add_liquidity_source(payer_lsp.node_id(), address, None, false);
+		let node = builder
+			.build_with_store(
+				payer_config.node_entropy,
+				TestSyncStore::new(payer_config.node_config.storage_dir_path.clone().into()),
+			)
+			.unwrap();
+		node.start().unwrap();
+		node
+	};
+	let wallet_config = wallet_config_via(Some(&provider));
+	let wallet_store =
+		TestSyncStore::new(wallet_config.node_config.storage_dir_path.clone().into());
+	let wallet =
+		common::setup_node_with_store(&chain_source, wallet_config.clone(), wallet_store.clone());
+
+	let addresses = vec![
+		payer.onchain_payment().new_address().unwrap(),
+		payer_lsp.onchain_payment().new_address().unwrap(),
+		wallet.onchain_payment().new_address().unwrap(),
+	];
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		addresses,
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	for node in [&payer, &payer_lsp, &wallet] {
+		node.sync_wallets().unwrap();
+	}
+
+	// payer -- payer_lsp (unannounced), payer_lsp -- provider (announced), wallet -- provider
+	// (unannounced, half pushed so the wallet can receive).
+	open_channel(&payer, &payer_lsp, 1_000_000, false, &electrsd).await;
+	open_channel(&payer_lsp, &provider, 1_000_000, true, &electrsd).await;
+	open_channel_push_amt(&wallet, &provider, 1_000_000, Some(500_000_000), false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	for node in [&payer, &payer_lsp, &provider, &wallet] {
+		node.sync_wallets().unwrap();
+	}
+	expect_channel_ready_event!(payer, payer_lsp.node_id());
+	expect_channel_ready_event!(payer_lsp, payer.node_id());
+	expect_channel_ready_event!(payer_lsp, provider.node_id());
+	expect_channel_ready_event!(provider, payer_lsp.node_id());
+	expect_channel_ready_event!(wallet, provider.node_id());
+	expect_channel_ready_event!(provider, wallet.node_id());
+	// The payer routes over the announced channel.
+	wait_for_graph_channels(&payer, 1).await;
+
+	// The app shows an offer and closes; the extension starts claim-only, with no graph.
+	let amount_msat = 40_000_000;
+	let offer = wallet.bolt12_payment().receive(amount_msat, "claim-only", None, None).unwrap();
+	wallet.stop().unwrap();
+	drop(wallet);
+	let wallet = start_claim_only(
+		&chain_source,
+		&wallet_config,
+		ClaimOnlyStore::new(wallet_store.clone()),
+		Some(&provider),
+	);
+	assert!(wallet.network_graph().list_nodes().is_empty());
+	let provider_address = provider.listening_addresses().unwrap().first().unwrap().clone();
+	wallet.connect(provider.node_id(), provider_address, false).unwrap();
+
+	let payment_id = payer.bolt12_payment().send(&offer, None, None, None).unwrap();
+	expect_payment_received_event!(wallet, amount_msat);
+	expect_payment_successful_event!(payer, payment_id, None);
+	// The wallet never connected to the payer's LSP: everything went through its provider.
+	assert!(wallet.list_peers().iter().all(|peer| peer.node_id != payer_lsp.node_id()));
+
 	wallet.stop().unwrap();
 }
