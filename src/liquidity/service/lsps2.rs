@@ -30,6 +30,12 @@ use crate::{total_anchor_channels_reserve_sats, Config};
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 48);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
+/// Blocknil patch: the smallest just-in-time channel we open, whatever the payment. Sized to the
+/// payment alone, a first payment of a few hundred sats makes a channel under the client's
+/// 1,000 sat reserve floor, which the client refuses, and a few thousand sats makes one too small
+/// to receive anything after it. Every small first payment ties up this much of our liquidity.
+const MIN_JIT_CHANNEL_SATS: u64 = 25_000;
+
 pub(crate) struct LSPS2Service {
 	pub(crate) service_config: LSPS2ServiceConfig,
 	pub(crate) ldk_service_config: LdkLSPS2ServiceConfig,
@@ -505,8 +511,10 @@ where
 				let over_provisioning_msat = amt_to_forward_msat
 					.saturating_mul(service_config.channel_over_provisioning_ppm as u64)
 					/ 1_000_000;
+				// Blocknil patch: never smaller than `MIN_JIT_CHANNEL_SATS`.
 				let channel_amount_sats =
-					amt_to_forward_msat.saturating_add(over_provisioning_msat) / 1000;
+					(amt_to_forward_msat.saturating_add(over_provisioning_msat) / 1000)
+						.max(MIN_JIT_CHANNEL_SATS);
 				let cur_anchor_reserve_sats =
 					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 				let spendable_amount_sats =
