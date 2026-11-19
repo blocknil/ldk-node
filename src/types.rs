@@ -11,12 +11,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin::{OutPoint, ScriptBuf, Txid};
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::{
 	ChannelDetails as LdkChannelDetails, ChannelShutdownState, CounterpartyForwardingInfo,
-	InboundHTLCDetails, OutboundHTLCDetails,
+	InboundHTLCDetails, OutboundHTLCDetails, SpliceCandidateStatus,
 };
 use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::IgnoringMessageHandler;
@@ -734,6 +734,16 @@ pub struct ChannelDetails {
 	///
 	/// Will be `None` for objects serialized prior to LDK Node v0.8.
 	pub current_dust_exposure_msat: Option<u64>,
+	/// The transactions of the splices negotiated on this channel that have not locked yet, oldest
+	/// first: those signed and waiting to confirm, and one waiting for signatures. Empty when no
+	/// negotiated splice is waiting to lock, as once the splice has locked; a splice still being
+	/// negotiated has no transaction yet and is not listed. Unlike the in-memory state of a
+	/// negotiation, these survive a restart.
+	///
+	/// Blocknil patch: rust-lightning's `ChannelDetails::splice_details` reduced to what a caller
+	/// needs to tell whether a negotiated splice is waiting to lock, for instance to refuse a
+	/// cooperative close until it has.
+	pub pending_splice_txids: Vec<Txid>,
 }
 
 impl ChannelDetails {
@@ -803,6 +813,21 @@ impl ChannelDetails {
 			pending_inbound_htlcs: value.pending_inbound_htlcs,
 			pending_outbound_htlcs: value.pending_outbound_htlcs,
 			current_dust_exposure_msat: value.current_dust_exposure_msat,
+			// Blocknil patch: see the field.
+			pending_splice_txids: value
+				.splice_details
+				.map(|details| {
+					details
+						.candidates
+						.into_iter()
+						.filter_map(|candidate| match candidate.status {
+							SpliceCandidateStatus::AwaitingSignatures { txid, .. }
+							| SpliceCandidateStatus::Negotiated { txid, .. } => Some(txid),
+							_ => None,
+						})
+						.collect()
+				})
+				.unwrap_or_default(),
 		}
 	}
 }

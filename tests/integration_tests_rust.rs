@@ -6048,6 +6048,61 @@ async fn splice_failure_surfaced_after_disconnect_mid_negotiation() {
 	node_b.stop().unwrap();
 }
 
+/// A negotiated splice is listed on the channel, by its transaction, on both sides until it
+/// locks, including after a restart, when nothing else in memory recalls it.
+///
+/// Blocknil patch: `ChannelDetails::pending_splice_txids`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn pending_splice_is_listed_until_it_locks_also_after_a_restart() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let mut config_a = random_config();
+	config_a.store_type = TestStoreType::Sqlite;
+	let node_a = setup_node(&chain_source, config_a.clone());
+	let node_b = setup_node(&chain_source, random_config());
+
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(5_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	open_channel(&node_a, &node_b, 1_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	assert!(node_a.list_channels()[0].pending_splice_txids.is_empty());
+	assert!(node_b.list_channels()[0].pending_splice_txids.is_empty());
+
+	node_a.splice_in(&user_channel_id_a, node_b.node_id(), 500_000, None).unwrap();
+	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
+	wait_for_tx(&electrsd.client, txo.txid).await;
+	assert_eq!(node_a.list_channels()[0].pending_splice_txids, vec![txo.txid]);
+	assert_eq!(node_b.list_channels()[0].pending_splice_txids, vec![txo.txid]);
+
+	node_a.stop().unwrap();
+	drop(node_a);
+	let node_a = setup_node(&chain_source, config_a);
+	assert_eq!(node_a.list_channels()[0].pending_splice_txids, vec![txo.txid]);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	assert_eq!(node_a.list_channels()[0].funding_txo.unwrap().txid, txo.txid);
+	assert!(node_a.list_channels()[0].pending_splice_txids.is_empty());
+	assert!(node_b.list_channels()[0].pending_splice_txids.is_empty());
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
 /// A splice LDK dropped without ever persisting it — initiated while disconnected, then the node
 /// restarts — is reported once, through the failure LDK itself persisted at shutdown and replays
 /// at startup: `PeerDisconnected`, with the output the splice-out would have paid. A further
