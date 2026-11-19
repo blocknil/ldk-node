@@ -33,11 +33,15 @@
 //! [`Config::hold_private_forwards`]: crate::config::Config::hold_private_forwards
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::secp256k1::PublicKey;
+use lightning::events::{HTLCHandlingFailureReason, HTLCHandlingFailureType};
 use lightning::ln::channelmanager::InterceptId;
+use lightning::ln::onion_utils::LocalHTLCFailureReason;
+use lightning::ln::types::ChannelId;
 use lightning::types::payment::PaymentHash;
 use lightning::util::persist::KVStore;
 
@@ -70,6 +74,12 @@ pub(crate) const RELEASE_RETRIES: u32 = 20;
 
 /// How many finished holds are kept for the admin console.
 const RECENT: usize = 50;
+
+/// Blocknil patch (decision 4): how long a forward is remembered, to name the payment if it fails
+/// back because the client went offline before it reached their channel. rust-lightning adds a
+/// forwarded HTLC to the channel on its next forwarding pass, a few tens of milliseconds later (2 s
+/// after a start); this leaves ample room.
+const FORWARD_RACE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Called with the client whose payment is being held because they are offline, once per
 /// payment, to wake their device. It runs on the node's event handling: it must not block.
@@ -137,6 +147,16 @@ struct Held {
 	was_held: bool,
 }
 
+/// Blocknil patch (decision 4): an HTLC handed to rust-lightning with `forward_intercepted_htlc`,
+/// not yet known to have reached the client's channel.
+struct Forwarded {
+	customer: PublicKey,
+	channel_id: ChannelId,
+	payment_hash: PaymentHash,
+	amount_msat: u64,
+	at: Instant,
+}
+
 /// Where an intercepted HTLC goes.
 pub(crate) enum NextHop {
 	/// To this client: one of our channels with them, or a hold SCID still honoured.
@@ -157,6 +177,11 @@ pub(crate) struct HeldPayments {
 	/// Clients that reconnected with something held for them, for the release task.
 	reconnected: Mutex<HashSet<PublicKey>>,
 	reconnect_notify: tokio::sync::Notify,
+	/// Blocknil patch (decision 4): our recent forwards (see `forward_failed`).
+	forwarded: Mutex<VecDeque<Forwarded>>,
+	/// Blocknil patch (decision 4): forwards failed back because the client went offline between
+	/// the forward and the HTLC being added to their channel, since this node started.
+	forwards_failed_offline: AtomicU64,
 	channel_manager: Arc<ChannelManager>,
 	logger: Arc<Logger>,
 }
@@ -191,6 +216,29 @@ fn decode_hold_scids(bytes: &[u8]) -> HashMap<u64, (PublicKey, Option<u64>)> {
 		.collect()
 }
 
+/// Blocknil patch (decision 4): the forward of ours that a failed HTLC was, taken out of
+/// `forwarded`, when rust-lightning failed it back because the client was offline (`PeerOffline`)
+/// as it came to add it to their channel. The latest one to that client's channel: a forward
+/// fails on the forwarding pass right after it.
+fn take_lost_forward(
+	forwarded: &mut VecDeque<Forwarded>, failure_type: &HTLCHandlingFailureType,
+	failure_reason: Option<&HTLCHandlingFailureReason>,
+) -> Option<Forwarded> {
+	let (
+		HTLCHandlingFailureType::Forward { node_id: Some(customer), channel_id },
+		Some(HTLCHandlingFailureReason::Local { reason: LocalHTLCFailureReason::PeerOffline }),
+	) = (failure_type, failure_reason)
+	else {
+		return None;
+	};
+	let index = forwarded.iter().rposition(|f| {
+		f.customer == *customer
+			&& f.channel_id == *channel_id
+			&& f.at.elapsed() <= FORWARD_RACE_WINDOW
+	})?;
+	forwarded.remove(index)
+}
+
 impl HeldPayments {
 	pub(crate) fn new(
 		channel_manager: Arc<ChannelManager>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
@@ -205,6 +253,8 @@ impl HeldPayments {
 			on_short_of_room: RwLock::new(None),
 			reconnected: Mutex::new(HashSet::new()),
 			reconnect_notify: tokio::sync::Notify::new(),
+			forwarded: Mutex::new(VecDeque::new()),
+			forwards_failed_offline: AtomicU64::new(0),
 			channel_manager,
 			logger,
 		}
@@ -402,6 +452,52 @@ impl HeldPayments {
 		recent.truncate(RECENT);
 	}
 
+	/// Blocknil patch (decision 4): remembers a forward, for `forward_failed`.
+	fn note_forwarded(&self, h: &Held, channel_id: ChannelId, amount_msat: u64) {
+		let mut forwarded = self.forwarded.lock().expect("lock");
+		while matches!(forwarded.front(), Some(f) if f.at.elapsed() > FORWARD_RACE_WINDOW) {
+			forwarded.pop_front();
+		}
+		forwarded.push_back(Forwarded {
+			customer: h.customer,
+			channel_id,
+			payment_hash: h.payment_hash,
+			amount_msat,
+			at: Instant::now(),
+		});
+	}
+
+	/// Blocknil patch (decision 4): an HTLC failed (`Event::HTLCHandlingFailed`). If it is one of
+	/// our forwards that rust-lightning failed back because the client was offline when it came to
+	/// add it to their channel (they dropped between our forward and that), it is logged and
+	/// counted: rust-lightning 0.3 can't hand it back to us to hold again (rl-19 isn't ported), and
+	/// the count shows how often that happens.
+	pub(crate) fn forward_failed(
+		&self, failure_type: &HTLCHandlingFailureType,
+		failure_reason: Option<&HTLCHandlingFailureReason>,
+	) {
+		let mut forwarded = self.forwarded.lock().expect("lock");
+		let Some(lost) = take_lost_forward(&mut forwarded, failure_type, failure_reason) else {
+			return;
+		};
+		drop(forwarded);
+		let count = self.forwards_failed_offline.fetch_add(1, Ordering::Relaxed) + 1;
+		log_info!(
+			self.logger,
+			"A payment of {} msat for customer {} (payment hash {}) failed back: they went offline \
+			 after it was forwarded, before it reached their channel ({} since start)",
+			lost.amount_msat,
+			lost.customer,
+			lost.payment_hash,
+			count
+		);
+	}
+
+	/// Blocknil patch (decision 4): see `forward_failed`.
+	pub(crate) fn forwards_failed_offline(&self) -> u64 {
+		self.forwards_failed_offline.load(Ordering::Relaxed)
+	}
+
 	/// Whether anything is still held for this client.
 	pub(crate) fn has_held(&self, peer: &PublicKey) -> bool {
 		self.held.lock().expect("lock").iter().any(|h| &h.customer == peer)
@@ -467,6 +563,7 @@ impl HeldPayments {
 						forward_msat,
 					) {
 						Ok(()) => {
+							self.note_forwarded(&h, channel.channel_id, forward_msat);
 							log_info!(
 								self.logger,
 								"Forwarded a payment of {} msat to customer {}{}{}",
@@ -572,6 +669,64 @@ impl HeldPayments {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_forward_failed_back_as_its_client_went_offline_is_found() {
+		let customer: PublicKey =
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		let other: PublicKey =
+			"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".parse().unwrap();
+		let channel_id = ChannelId([1; 32]);
+		let forward = |customer, payment_hash: u8, at| Forwarded {
+			customer,
+			channel_id,
+			payment_hash: PaymentHash([payment_hash; 32]),
+			amount_msat: 1_000 * payment_hash as u64,
+			at,
+		};
+		let now = Instant::now();
+		let mut forwarded = VecDeque::from([
+			forward(customer, 1, now - FORWARD_RACE_WINDOW - Duration::from_secs(1)),
+			forward(customer, 2, now),
+			forward(customer, 3, now),
+			forward(other, 4, now),
+		]);
+		let to = |node_id, channel_id| HTLCHandlingFailureType::Forward { node_id, channel_id };
+		let local = |reason| Some(HTLCHandlingFailureReason::Local { reason });
+		let offline = local(LocalHTLCFailureReason::PeerOffline);
+
+		// Failed for another reason, by the client, or to another channel: not the race.
+		let not_the_race = [
+			(
+				to(Some(customer), channel_id),
+				local(LocalHTLCFailureReason::TemporaryChannelFailure),
+			),
+			(to(Some(customer), channel_id), Some(HTLCHandlingFailureReason::Downstream)),
+			(to(Some(customer), channel_id), None),
+			(to(Some(customer), ChannelId([2; 32])), offline.clone()),
+			(to(None, channel_id), offline.clone()),
+			(
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid: 42 },
+				offline.clone(),
+			),
+		];
+		for (failure_type, reason) in &not_the_race {
+			assert!(take_lost_forward(&mut forwarded, failure_type, reason.as_ref()).is_none());
+		}
+		assert_eq!(forwarded.len(), 4);
+
+		// The race: the client's latest forward to that channel, once; never one too old.
+		let race = to(Some(customer), channel_id);
+		let lost = take_lost_forward(&mut forwarded, &race, offline.as_ref()).unwrap();
+		assert_eq!(
+			(lost.customer, lost.payment_hash, lost.amount_msat),
+			(customer, PaymentHash([3; 32]), 3_000)
+		);
+		let lost = take_lost_forward(&mut forwarded, &race, offline.as_ref()).unwrap();
+		assert_eq!(lost.payment_hash, PaymentHash([2; 32]));
+		assert!(take_lost_forward(&mut forwarded, &race, offline.as_ref()).is_none());
+		assert_eq!(forwarded.len(), 2, "the old one and the other client's are left");
+	}
 
 	#[test]
 	fn hold_scids_read_r8s_format_and_keep_their_first_seen_time() {

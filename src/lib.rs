@@ -3701,6 +3701,14 @@ impl Node {
 	pub fn recent_held_payments(&self) -> Vec<HoldRecord> {
 		self.held_payments.recent()
 	}
+
+	/// Blocknil patch (decision 4): how many payments for our clients failed back since this node
+	/// started because the client went offline after we forwarded the payment and before it was
+	/// added to their channel. rust-lightning 0.3 fails such a payment rather than handing it back
+	/// to be held again. Each one is also logged, with the client, amount and payment hash.
+	pub fn forwards_failed_offline(&self) -> u64 {
+		self.held_payments.forwards_failed_offline()
+	}
 }
 
 /// Blocknil patch: splice on arrival, the client side (see `provider_fee`). r8's names.

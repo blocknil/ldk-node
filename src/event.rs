@@ -2128,7 +2128,10 @@ where
 					prober.handle_background_probe_failed(&path, payment_id);
 				}
 			},
-			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
+			LdkEvent::HTLCHandlingFailed { failure_type, failure_reason, .. } => {
+				// Blocknil patch (decision 4): log and count our forwards lost to a client who
+				// went offline before the HTLC reached their channel (see `held_payments`).
+				self.held_payments.forward_failed(&failure_type, failure_reason.as_ref());
 				self.liquidity_source
 					.lsps2_service()
 					.handle_htlc_handling_failed(failure_type)

@@ -851,3 +851,47 @@ async fn invoice_request_for_an_offline_customer_is_answered_when_it_is_back() {
 	wait_for(&s.customer, "the offer payment", is_received(50_000_000)).await;
 	s.stop();
 }
+
+/// Decision 4 (rl-19 isn't ported): a payment the provider forwards to a customer who drops
+/// before rust-lightning adds it to their channel (on its next forwarding pass, ~50 ms later) is
+/// failed back, not handed back to be held again. The provider logs and counts each one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_lost_to_a_customer_going_offline_is_counted() {
+	let s = setup(&[1_000_000], 300_000).await;
+	let reports = short_of_room_reports(&s.provider);
+	let customer_id = s.customer.node_id();
+	s.shrink_room_to(50_000_000).await;
+	assert_eq!(s.provider.forwards_failed_offline(), 0, "a forward that went through");
+
+	// The provider's `disconnect` removes the peer from its store before it disconnects, a write
+	// that takes a while. With the customer no longer in it (dialling back doesn't add it), the
+	// disconnect below happens at once.
+	s.provider.disconnect(customer_id).unwrap();
+	wait_until_disconnected(&s.provider, customer_id).await;
+	wait_until_disconnected(&s.customer, s.provider.node_id()).await;
+	s.customer
+		.connect(s.provider.node_id(), s.provider.listening_addresses().unwrap()[0].clone(), true)
+		.unwrap();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while s.room_msat() == 0 {
+		assert!(Instant::now() < deadline, "the customer's channel is usable again");
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+
+	// A payment larger than the room is held. The provider lets it go for less (a fee that leaves
+	// 40,000 sats, which fit): it is forwarded inside this call, and the customer is dropped at
+	// once, before the forwarding pass.
+	let large = invoice(&s.customer, 150_000_000);
+	s.payer.bolt11_payment().send(&large, None).unwrap();
+	let short = next_report(&reports, Duration::from_secs(30)).await.expect("reported");
+	s.provider.set_held_payment_fee(short.intercept_id, 110_000_000).unwrap();
+	s.provider.disconnect(customer_id).unwrap();
+
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while s.provider.forwards_failed_offline() == 0 {
+		assert!(Instant::now() < deadline, "the lost forward was never counted");
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+	assert_eq!(s.provider.forwards_failed_offline(), 1);
+	s.stop();
+}
