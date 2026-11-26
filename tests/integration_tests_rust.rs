@@ -831,6 +831,84 @@ async fn channel_full_cycle_force_close_trusted_no_reserve() {
 	.await;
 }
 
+/// A node that trusts its peer with no anchor reserve force-closes after that peer has gone (a
+/// wallet whose provider no longer runs). The peer can't broadcast anything, so our own
+/// commitment must reach the chain, and the node's balance must come back after the delay.
+///
+/// On an anchor channel our commitment is only ever broadcast by the
+/// `BumpTransactionEvent::ChannelClose` handler. Before the Blocknil patch, ldk-node ignored that
+/// event for a trusted peer, so this close broadcast nothing and the funding output stayed unspent.
+/// Node B's on-chain wallet is empty, as a Blocknil wallet's usually is: the commitment goes out at
+/// its own fee rate (rust-lightning 0.3 broadcasts it when coin selection for the anchor child fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn trusted_peer_gone_force_close_broadcasts_our_commitment() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	// Node B trusts node A (`trusted_peers_no_reserve`), as a Blocknil wallet trusts its provider.
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true);
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![node_a.onchain_payment().new_address().unwrap()],
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Node A opens and funds the channel, as the provider does for a just-in-time channel, and
+	// pushes node B a balance of its own.
+	let push_sat = 200_000;
+	let funding_txo =
+		open_channel_push_amt(&node_a, &node_b, 1_000_000, Some(push_sat * 1000), false, &electrsd)
+			.await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 0);
+
+	let user_channel_id_b = node_b
+		.list_channels()
+		.into_iter()
+		.find(|c| c.counterparty.node_id == node_a.node_id())
+		.unwrap()
+		.user_channel_id;
+
+	// The peer is gone.
+	node_a.stop().unwrap();
+
+	node_b.force_close_channel(&user_channel_id_b, node_a.node_id(), None).unwrap();
+	expect_event!(node_b, ChannelClosed);
+
+	// Without the patch nothing is broadcast, and this times out.
+	wait_for_outpoint_spend(&electrsd.client, funding_txo).await;
+
+	// The commitment confirms, our output waits out its delay, and the sweeper brings it home.
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_b.sync_wallets().unwrap();
+	let blocks_to_go = match node_b.list_balances().lightning_balances.as_slice() {
+		[ldk_node::LightningBalance::ClaimableAwaitingConfirmations {
+			confirmation_height, ..
+		}] => confirmation_height - node_b.status().current_best_block.height,
+		other => panic!("Unexpected balance state: {:?}", other),
+	};
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, blocks_to_go as usize).await;
+	node_b.sync_wallets().unwrap();
+	for _ in 0..10 {
+		if node_b.list_balances().total_onchain_balance_sats > 0 {
+			break;
+		}
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		node_b.sync_wallets().unwrap();
+	}
+	let back = node_b.list_balances().total_onchain_balance_sats;
+	// All of node B's balance, less the sweep's fee: node A, the opener, paid the commitment's.
+	assert!(back > push_sat - 5_000 && back < push_sat, "{back}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn peer_removed_when_counterparty_force_closes_last_channel() {
 	// When we open a channel outbound, we persist the counterparty so the background
