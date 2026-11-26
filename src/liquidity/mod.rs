@@ -33,6 +33,8 @@ use lightning_liquidity::lsps5::service::LSPS5ServiceConfig as LdkLSPS5ServiceCo
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 pub use service::jit_wait::OnJitWaiting;
 pub use service::lsps2::LSPS2ServiceConfig;
+// Blocknil patch: an LSPS2 offer priced from the fee rate.
+pub use service::lsps2::JitOpeningCost;
 // Blocknil patch: LSPS5.
 pub use client::lsps5::{OnWebhookResult, WebhookResult};
 pub use service::lsps5::{LSPS5ServiceConfig, OnWebhook, WebhookPost};

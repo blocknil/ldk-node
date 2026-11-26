@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::Transaction;
+use bitcoin::{FeeRate, Transaction};
 use chrono::Utc;
 use lightning::events::HTLCHandlingFailureType;
 use lightning::ln::channelmanager::InterceptId;
@@ -133,6 +133,63 @@ pub struct LSPS2ServiceConfig {
 	/// invoice is asked for. Upstream's value is [`DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS`]; see
 	/// [`SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS`] for the shortest that serves both invoice kinds.
 	pub opening_fee_params_lifetime_secs: u64,
+	/// What opening a channel costs us on chain, to set the offer's minimum fee and minimum
+	/// payment from the fee rate when the offer is made.
+	///
+	/// Blocknil patch: when set, [`Self::min_channel_opening_fee_msat`] and
+	/// [`Self::min_payment_size_msat`] are not used. A fixed minimum fee is either too low when
+	/// fees rise (a small first payment then costs us more in mining fees than it pays) or too
+	/// high when they fall. Upstream has no such option.
+	pub opening_cost: Option<JitOpeningCost>,
+}
+
+/// What a just-in-time channel costs its LSP on chain, from which its minimum opening fee and
+/// minimum payment follow the fee rate. Blocknil patch: see [`LSPS2ServiceConfig::opening_cost`].
+///
+/// At `ChannelFunding`'s fee rate `r` when an offer is made:
+/// `min fee = max(floor, ⌈(open + close vbytes) × r × headroom⌉ + close margin)`, and
+/// `min payment = min fee + min_payment_over_fee_sats`. The opening fee itself stays bLIP-52's:
+/// the larger of the minimum fee and the proportional share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct JitOpeningCost {
+	/// The funding transaction's size, in vbytes.
+	pub open_vbytes: u64,
+	/// The closing transaction's size, in vbytes: paid later, by us as the channel's funder.
+	pub close_vbytes: u64,
+	/// How much the fee rate is raised for this, in parts per million (1,000,000 is 1×): the rate
+	/// can rise while an offer is valid, and the close comes later at an unknown one.
+	pub feerate_headroom_ppm: u32,
+	/// What the close may cost over its size at the fee rate, as LDK's
+	/// `force_close_avoidance_max_fee_satoshis` lets it.
+	pub close_fee_margin_sats: u64,
+	/// The smallest minimum fee, whatever the fee rate.
+	pub min_fee_floor_sats: u64,
+	/// What the smallest first payment leaves the client after the minimum fee.
+	pub min_payment_over_fee_sats: u64,
+}
+
+impl JitOpeningCost {
+	/// The minimum opening fee at `fee_rate`, in msat, rounded up to the sat. Saturates at
+	/// `u64::MAX` rather than overflowing.
+	pub fn min_fee_msat(&self, fee_rate: FeeRate) -> u64 {
+		let weight = (self.open_vbytes as u128).saturating_add(self.close_vbytes as u128) * 4;
+		// sat/kWU × WU / 1,000 = sats, and the headroom is in ppm.
+		let onchain_sats = weight
+			.saturating_mul(fee_rate.to_sat_per_kwu() as u128)
+			.saturating_mul(self.feerate_headroom_ppm as u128)
+			.div_ceil(1_000 * 1_000_000);
+		let fee_sats = onchain_sats
+			.saturating_add(self.close_fee_margin_sats as u128)
+			.max(self.min_fee_floor_sats as u128);
+		u64::try_from(fee_sats.saturating_mul(1_000)).unwrap_or(u64::MAX)
+	}
+
+	/// The minimum payment at `fee_rate`, in msat: the minimum fee plus what it leaves the client.
+	pub fn min_payment_size_msat(&self, fee_rate: FeeRate) -> u64 {
+		self.min_fee_msat(fee_rate)
+			.saturating_add(self.min_payment_over_fee_sats.saturating_mul(1_000))
+	}
 }
 
 /// Upstream's lifetime of the opening fee parameters we offer: 48 hours. Long enough for an LDK
@@ -476,13 +533,26 @@ where
 					let lifetime =
 						Duration::from_secs(service_config.opening_fee_params_lifetime_secs);
 					let valid_until = LSPSDateTime(Utc::now() + lifetime);
+					// Blocknil patch: with an opening cost, the minimums follow today's fee rate.
+					let (min_fee_msat, min_payment_size_msat) = match service_config.opening_cost {
+						Some(cost) => {
+							let fee_rate = self
+								.fee_estimator
+								.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+							(cost.min_fee_msat(fee_rate), cost.min_payment_size_msat(fee_rate))
+						},
+						None => (
+							service_config.min_channel_opening_fee_msat,
+							service_config.min_payment_size_msat,
+						),
+					};
 					let opening_fee_params = LSPS2RawOpeningFeeParams {
-						min_fee_msat: service_config.min_channel_opening_fee_msat,
+						min_fee_msat,
 						proportional: service_config.channel_opening_fee_ppm,
 						valid_until,
 						min_lifetime: service_config.min_channel_lifetime,
 						max_client_to_self_delay: service_config.max_client_to_self_delay,
-						min_payment_size_msat: service_config.min_payment_size_msat,
+						min_payment_size_msat,
 						max_payment_size_msat: service_config.max_payment_size_msat,
 					};
 
@@ -507,7 +577,7 @@ where
 			LSPS2ServiceEvent::BuyRequest {
 				request_id,
 				counterparty_node_id,
-				opening_fee_params: _,
+				opening_fee_params,
 				payment_size_msat,
 			} => {
 				if let Some(lsps2_service_handler) =
@@ -539,8 +609,11 @@ where
 						//
 						// TODO: Eventually we also might want to make sure that we have sufficient
 						// liquidity for the channel opening here.
-						if payment_size_msat > service_config.max_payment_size_msat
-							|| payment_size_msat < service_config.min_payment_size_msat
+						//
+						// Blocknil patch: against the parameters the client bought, which with an
+						// `opening_cost` aren't the static ones.
+						if payment_size_msat > opening_fee_params.max_payment_size_msat
+							|| payment_size_msat < opening_fee_params.min_payment_size_msat
 						{
 							log_error!(
 								self.logger,
@@ -784,5 +857,76 @@ where
 				}
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod opening_cost_tests {
+	use bitcoin::FeeRate;
+
+	use super::JitOpeningCost;
+
+	/// Blocknil's provider (bitcoin-wallet docs/jit-pricing.md, #68): a 153 vB funding transaction
+	/// and a 169 vB cooperative close, 1.5× headroom on the fee rate, LDK's 200-sat closing-fee
+	/// margin, a 2,000-sat floor, and 1,000 sats left to the customer.
+	const COST: JitOpeningCost = JitOpeningCost {
+		open_vbytes: 153,
+		close_vbytes: 169,
+		feerate_headroom_ppm: 1_500_000,
+		close_fee_margin_sats: 200,
+		min_fee_floor_sats: 2_000,
+		min_payment_over_fee_sats: 1_000,
+	};
+
+	fn sat_per_vb(rate: u64) -> FeeRate {
+		FeeRate::from_sat_per_vb_u32(rate as u32)
+	}
+
+	#[test]
+	fn the_floor_is_the_minimum_at_low_fee_rates() {
+		// 322 vB × 3 × 1.5 + 200 = 1,649: under the floor.
+		for rate in [1, 2, 3] {
+			assert_eq!(COST.min_fee_msat(sat_per_vb(rate)), 2_000_000, "{rate} sat/vB");
+			assert_eq!(COST.min_payment_size_msat(sat_per_vb(rate)), 3_000_000, "{rate} sat/vB");
+		}
+		// The relay floor, 253 sat/kW, is under it too.
+		assert_eq!(COST.min_fee_msat(FeeRate::from_sat_per_kwu(253)), 2_000_000);
+	}
+
+	#[test]
+	fn above_the_floor_the_minimum_is_the_open_and_the_close_at_the_fee_rate() {
+		// 322 vB × r × 1.5 + 200: 4 → 2,132; 10 → 5,030; 50 → 24,350.
+		assert_eq!(COST.min_fee_msat(sat_per_vb(4)), 2_132_000);
+		assert_eq!(COST.min_fee_msat(sat_per_vb(10)), 5_030_000);
+		assert_eq!(COST.min_payment_size_msat(sat_per_vb(10)), 6_030_000);
+		assert_eq!(COST.min_fee_msat(sat_per_vb(50)), 24_350_000);
+		assert_eq!(COST.min_payment_size_msat(sat_per_vb(50)), 25_350_000);
+	}
+
+	#[test]
+	fn the_on_chain_part_is_rounded_up_to_the_sat() {
+		// 1,288 WU × 1,001 sat/kW × 1.5 = 1,933.932 sats: 1,934, plus the 200 margin.
+		assert_eq!(COST.min_fee_msat(FeeRate::from_sat_per_kwu(1_001)), 2_134_000);
+	}
+
+	#[test]
+	fn no_headroom_prices_the_rate_as_it_is() {
+		let plain = JitOpeningCost { feerate_headroom_ppm: 1_000_000, ..COST };
+		// 322 × 10 + 200.
+		assert_eq!(plain.min_fee_msat(sat_per_vb(10)), 3_420_000);
+	}
+
+	#[test]
+	fn absurd_numbers_saturate_rather_than_overflow() {
+		let huge = JitOpeningCost {
+			open_vbytes: u64::MAX,
+			close_vbytes: u64::MAX,
+			feerate_headroom_ppm: u32::MAX,
+			close_fee_margin_sats: u64::MAX,
+			min_fee_floor_sats: u64::MAX,
+			min_payment_over_fee_sats: u64::MAX,
+		};
+		assert_eq!(huge.min_fee_msat(FeeRate::from_sat_per_kwu(u64::MAX)), u64::MAX);
+		assert_eq!(huge.min_payment_size_msat(FeeRate::from_sat_per_kwu(u64::MAX)), u64::MAX);
 	}
 }

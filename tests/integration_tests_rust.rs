@@ -45,7 +45,10 @@ use ldk_node::config::{
 	ADDRESS_POOL_SIZE, DEFAULT_FULL_SCAN_STOP_GAP,
 };
 use ldk_node::entropy::NodeEntropy;
-use ldk_node::liquidity::{LSPS2ServiceConfig, DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS};
+use ldk_node::liquidity::{
+	LSPS2ServiceConfig, DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+	SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+};
 use ldk_node::payment::{
 	ConfirmationStatus, ForwardedPaymentId, PayerProofOptions, PaymentDetails, PaymentDirection,
 	PaymentKind, PaymentStatus, TransactionType, UnifiedPaymentResult,
@@ -7839,6 +7842,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		client_trusts_lsp,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8180,6 +8184,7 @@ async fn bolt12_lsps2_client_service_integration() {
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8654,6 +8659,7 @@ async fn lsps2_client_trusts_lsp() {
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8828,6 +8834,7 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8994,6 +9001,7 @@ async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -9080,6 +9088,7 @@ async fn setup_zero_client_reserve_service(
 		disable_client_reserve: true,
 		opening_fee_params_lifetime_secs:
 			ldk_node::liquidity::DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let client_node = setup_node(&TestChainSource::Esplora(electrsd), random_config());
 
@@ -9611,6 +9620,69 @@ async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_opening_cost_sets_the_offers_minimums_from_the_fee_rate() {
+	// Blocknil patch: with an `opening_cost`, the offer's minimum fee and minimum payment come from
+	// the service's channel-funding fee rate, not from the static minimums (set here to values the
+	// offer must not carry).
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+
+	let cost = ldk_node::liquidity::JitOpeningCost {
+		open_vbytes: 153,
+		close_vbytes: 169,
+		feerate_headroom_ppm: 1_500_000,
+		close_fee_margin_sats: 200,
+		min_fee_floor_sats: 2_000,
+		min_payment_over_fee_sats: 1_000,
+	};
+	let service_cfg = LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm: 5_000,
+		channel_over_provisioning_ppm: 1_000_000,
+		max_payment_size_msat: 100_000_000,
+		min_payment_size_msat: 7,
+		min_channel_lifetime: 144,
+		min_channel_opening_fee_msat: 11,
+		max_client_to_self_delay: 1024,
+		client_trusts_lsp: false,
+		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: Some(cost),
+	};
+	let service_config = random_config();
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.enable_liquidity_provider(service_cfg);
+	let service = service_builder.build(service_config.node_entropy.into()).unwrap();
+	service.start().unwrap();
+	let service_addr = service.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config();
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	client_builder.add_liquidity_source(service.node_id(), service_addr, None, true);
+	let client = client_builder.build(client_config.node_entropy.into()).unwrap();
+	client.start().unwrap();
+
+	let fee_rate = service.channel_funding_fee_rate();
+	let terms = client.lsps2_opening_fee_params().unwrap();
+	assert_eq!(terms.len(), 1);
+	let offer = &terms[0];
+	assert_eq!(offer.min_fee_msat, cost.min_fee_msat(fee_rate), "at {fee_rate:?}");
+	assert_eq!(offer.min_payment_size_msat, cost.min_payment_size_msat(fee_rate));
+	assert!(offer.min_fee_msat >= 2_000_000, "never under the floor: {}", offer.min_fee_msat);
+	assert_eq!(offer.min_payment_size_msat, offer.min_fee_msat + 1_000_000);
+	assert_eq!(offer.proportional_ppm, 5_000, "the share is unchanged");
+	assert_eq!(offer.max_payment_size_msat, 100_000_000);
+
+	client.stop().unwrap();
+	service.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for_until_removed() {
 	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook and is told
 	// the service's answer (`set_webhook_result_handler`); a first
@@ -9815,6 +9887,7 @@ async fn lsps2_short_offer_lifetime_serves_wallet_invoices_without_filling_slots
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs:
 			ldk_node::liquidity::SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -10808,6 +10881,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let cheap_node_config = random_config();
 	setup_builder!(cheap_builder, cheap_node_config.node_config);
@@ -10832,6 +10906,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let expensive_node_config = random_config();
 	setup_builder!(expensive_builder, expensive_node_config.node_config);
@@ -11117,6 +11192,7 @@ async fn lsps2_service_funding_fee_does_not_spend_anchor_reserve() {
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
