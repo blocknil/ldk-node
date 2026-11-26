@@ -6345,13 +6345,47 @@ mod tests {
 	}
 
 	/// Inserts `tx` into the BDK wallet as canonically unconfirmed (seen in the mempool).
+	///
+	/// bdk_wallet 3.2.1 drops an unconfirmed transaction whose wallet-owned inputs aren't validly
+	/// signed (see `signed_by_wallet`). A dropped fixture would leave a test asserting on a
+	/// wallet that never held it, so a drop fails here.
 	fn insert_unconfirmed_tx(wallet: &Wallet, tx: Transaction) {
 		let txid = tx.compute_txid();
 		let mut locked = wallet.inner.lock().unwrap();
 		let mut tx_update = bdk_chain::TxUpdate::default();
 		tx_update.txs = vec![Arc::new(tx)];
 		tx_update.seen_ats = [(txid, 100)].into();
-		locked.apply_update(Update { tx_update, ..Default::default() }).unwrap();
+		let events =
+			locked.apply_update_events(Update { tx_update, ..Default::default() }).unwrap();
+		assert_no_rejection(&events);
+	}
+
+	/// Applies `txs` to the BDK wallet as unconfirmed, each seen at its time, failing if bdk_wallet
+	/// drops any of them (see `insert_unconfirmed_tx`).
+	fn apply_unconfirmed(wallet: &Wallet, txs: impl IntoIterator<Item = (Transaction, u64)>) {
+		let events = wallet.inner.lock().unwrap().apply_unconfirmed_txs_events(txs);
+		assert_no_rejection(&events);
+	}
+
+	fn assert_no_rejection(events: &[WalletEvent]) {
+		for event in events {
+			if let WalletEvent::TxRejected { txid, reason, .. } = event {
+				panic!("bdk_wallet rejected the fixture {txid}: {reason}");
+			}
+		}
+	}
+
+	/// `tx` with the wallet's inputs signed, `prevouts` being the outputs its inputs spend, in
+	/// order: what the node broadcasts, and what bdk_wallet 3.2.1 requires of an unconfirmed
+	/// transaction spending the wallet's coins (it drops one it can't verify, as a chain source
+	/// could forge it). Signing leaves the txid as it was.
+	fn signed_by_wallet(wallet: &Wallet, tx: Transaction, prevouts: &[&TxOut]) -> Transaction {
+		assert_eq!(tx.input.len(), prevouts.len());
+		let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+		for (input, prevout) in psbt.inputs.iter_mut().zip(prevouts) {
+			input.witness_utxo = Some((*prevout).clone());
+		}
+		wallet.sign_psbt_inner(psbt).unwrap()
 	}
 
 	/// Marks `txid` as evicted from the mempool after it was seen, so the BDK wallet still has
@@ -12190,6 +12224,7 @@ mod tests {
 	) -> (Transaction, PaymentId) {
 		let coin = wallet_paying_tx(wallet, coin_byte);
 		let coin_txid = coin.compute_txid();
+		let coin_output = coin.output[0].clone();
 		insert_confirmed_tx(wallet, coin, 5);
 
 		let spending = |previous_output| bitcoin::TxIn {
@@ -12207,6 +12242,12 @@ mod tests {
 				value: Amount::from_sat(80_000),
 				script_pubkey: bitcoin::ScriptBuf::new_op_return(&[]),
 			}],
+		};
+		// Signed as the node signs a send: bdk_wallet drops an unconfirmed spend of its coin that
+		// it can't verify. A foreign input is left to its owner.
+		let spend = match foreign_input {
+			None => signed_by_wallet(wallet, spend, &[&coin_output]),
+			Some(_) => wallet.sign_owned_inputs(spend).unwrap(),
 		};
 		let txid = spend.compute_txid();
 		insert_unconfirmed_tx(wallet, spend.clone());
@@ -13341,7 +13382,9 @@ mod tests {
 		let coin = wallet_paying_tx(&wallet, 1);
 		let other_coin = wallet_paying_tx(&wallet, 2);
 		let send = tx_spending(&wallet, OutPoint::new(coin.compute_txid(), 0));
+		let send = signed_by_wallet(&wallet, send, &[&coin.output[0]]);
 		let unrelated = tx_spending(&wallet, OutPoint::new(other_coin.compute_txid(), 0));
+		let unrelated = signed_by_wallet(&wallet, unrelated, &[&other_coin.output[0]]);
 		insert_confirmed_tx(&wallet, coin, 1);
 		insert_confirmed_tx(&wallet, other_coin, 2);
 		insert_unconfirmed_tx(&wallet, send.clone());
@@ -13363,7 +13406,9 @@ mod tests {
 		let wallet = new_test_wallet(store, false).await;
 		let coin = wallet_paying_tx(&wallet, 1);
 		let parent = tx_spending(&wallet, OutPoint::new(coin.compute_txid(), 0));
+		let parent = signed_by_wallet(&wallet, parent, &[&coin.output[0]]);
 		let child = tx_spending(&wallet, OutPoint::new(parent.compute_txid(), 0));
+		let child = signed_by_wallet(&wallet, child, &[&parent.output[0]]);
 		let (parent_txid, child_txid) = (parent.compute_txid(), child.compute_txid());
 		insert_confirmed_tx(&wallet, coin, 1);
 		insert_unconfirmed_tx(&wallet, parent);
@@ -13392,12 +13437,14 @@ mod tests {
 		let mut parent_replacement = parent.clone();
 		parent_replacement.output[0].value = Amount::from_sat(89_000);
 		let child = tx_spending(&wallet, OutPoint::new(parent.compute_txid(), 0));
+		let child = signed_by_wallet(&wallet, child, &[&parent.output[0]]);
+		let parent = signed_by_wallet(&wallet, parent, &[&coin.output[0]]);
+		let parent_replacement = signed_by_wallet(&wallet, parent_replacement, &[&coin.output[0]]);
 		insert_confirmed_tx(&wallet, coin, 1);
-		wallet.inner.lock().unwrap().apply_unconfirmed_txs([
-			(parent.clone(), 100),
-			(child.clone(), 100),
-			(parent_replacement.clone(), 101),
-		]);
+		apply_unconfirmed(
+			&wallet,
+			[(parent.clone(), 100), (child.clone(), 100), (parent_replacement.clone(), 101)],
+		);
 		for tx in [&parent, &child] {
 			record_pending_send(&wallet, tx.compute_txid()).await;
 		}
@@ -13462,9 +13509,11 @@ mod tests {
 		let original = tx_spending(&wallet, OutPoint::new(coin.compute_txid(), 0));
 		let mut bump = original.clone();
 		bump.output[0].value = Amount::from_sat(89_000);
+		let original = signed_by_wallet(&wallet, original, &[&coin.output[0]]);
+		let bump = signed_by_wallet(&wallet, bump, &[&coin.output[0]]);
 		let (original_txid, bump_txid) = (original.compute_txid(), bump.compute_txid());
 		insert_confirmed_tx(&wallet, coin, 1);
-		wallet.inner.lock().unwrap().apply_unconfirmed_txs([(original, 100), (bump, 101)]);
+		apply_unconfirmed(&wallet, [(original, 100), (bump, 101)]);
 		let payment_id = PaymentId(original_txid.to_byte_array());
 		let payment = PaymentDetails::new(
 			payment_id,
@@ -13507,9 +13556,13 @@ mod tests {
 		let original = tx_spending(&wallet, OutPoint::new(coin.compute_txid(), 0));
 		let mut bump = original.clone();
 		bump.output[0].value = Amount::from_sat(89_000);
+		// Signed, or bdk_wallet would drop both and the bump would be out of view for want of
+		// ever being in it.
+		let original = signed_by_wallet(&wallet, original, &[&coin.output[0]]);
+		let bump = signed_by_wallet(&wallet, bump, &[&coin.output[0]]);
 		let (original_txid, bump_txid) = (original.compute_txid(), bump.compute_txid());
 		insert_confirmed_tx(&wallet, coin, 1);
-		wallet.inner.lock().unwrap().apply_unconfirmed_txs([(original.clone(), 100), (bump, 101)]);
+		apply_unconfirmed(&wallet, [(original.clone(), 100), (bump, 101)]);
 		let payment = PaymentDetails::new(
 			PaymentId(original_txid.to_byte_array()),
 			PaymentKind::Onchain {
@@ -13585,14 +13638,19 @@ mod tests {
 		// ...which the wallet spends in a replaceable payment sitting in the mempool. This
 		// transaction (B) has already replaced the original (A).
 		let tx_b = {
-			let mut locked_wallet = wallet.inner.lock().unwrap();
-			let recipient = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42u8; 20]));
-			let mut builder = locked_wallet.build_tx();
-			builder
-				.add_recipient(recipient, Amount::from_sat(100_000))
-				.fee_rate(FeeRate::from_sat_per_kwu(500));
-			let tx = builder.finish().unwrap().unsigned_tx;
-			locked_wallet.apply_unconfirmed_txs([(tx.clone(), 1)]);
+			let psbt = {
+				let mut locked_wallet = wallet.inner.lock().unwrap();
+				let recipient = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42u8; 20]));
+				let mut builder = locked_wallet.build_tx();
+				builder
+					.add_recipient(recipient, Amount::from_sat(100_000))
+					.fee_rate(FeeRate::from_sat_per_kwu(500));
+				builder.finish().unwrap()
+			};
+			// Signed, as it was broadcast: bdk_wallet neither takes in nor bumps an unconfirmed
+			// spend of its coins that it can't verify.
+			let tx = wallet.sign_psbt_inner(psbt).unwrap();
+			apply_unconfirmed(&wallet, [(tx.clone(), 1)]);
 			tx
 		};
 		let txid_b = tx_b.compute_txid();
