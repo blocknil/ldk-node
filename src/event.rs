@@ -2977,29 +2977,13 @@ where
 				self.runtime.spawn_cancellable_background_task(future);
 			},
 			LdkEvent::BumpTransaction(bte) => {
-				match bte {
-					BumpTransactionEvent::ChannelClose {
-						ref channel_id,
-						ref counterparty_node_id,
-						..
-					} => {
-						// Skip bumping channel closes if our counterparty is trusted.
-						if self
-							.config
-							.anchor_channels_config
-							.trusted_peers_no_reserve
-							.contains(counterparty_node_id)
-						{
-							log_debug!(self.logger,
-								"Ignoring BumpTransactionEvent::ChannelClose for channel {} due to trusted counterparty {}",
-								channel_id, counterparty_node_id
-							);
-							return Ok(());
-						}
-					},
-					BumpTransactionEvent::HTLCResolution { .. } => {},
-				}
-
+				// Blocknil patch: a channel close is handled for a trusted peer too. Upstream skips it
+				// for `trusted_peers_no_reserve`, trusting the peer to broadcast for us, but on an
+				// anchor channel this event is the only way *our* commitment reaches the chain: a close
+				// we start (or LDK starts when an HTLC nears expiry) against a peer that is gone would
+				// otherwise broadcast nothing. Being trusted still means no reserve is kept for the
+				// peer. With no coins to bump with, rust-lightning broadcasts the commitment at its own
+				// fee rate.
 				self.bump_tx_event_handler.handle_event(&bte).await;
 
 				// Record what the claim is spending only once it has been made: a claim must

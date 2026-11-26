@@ -3015,11 +3015,8 @@ impl Node {
 	/// Force-closing channels also more costly in terms of on-chain fees. So cooperative closure
 	/// should always be preferred (and tried first).
 	///
-	/// Broadcasting the closing transactions will be omitted for Anchor channels if we trust the
-	/// counterparty to broadcast for us (see [`AnchorChannelsConfig::trusted_peers_no_reserve`]
-	/// for more information).
-	///
-	/// [`AnchorChannelsConfig::trusted_peers_no_reserve`]: crate::config::AnchorChannelsConfig::trusted_peers_no_reserve
+	/// Our commitment is broadcast for every Anchor channel, a trusted peer's included (Blocknil
+	/// patch): with no on-chain funds to bump it, it goes out at its own fee rate.
 	pub fn force_close_channel(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		reason: Option<String>,
