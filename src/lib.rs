@@ -108,8 +108,8 @@ pub mod io;
 pub mod liquidity;
 mod lnurl_auth;
 pub mod logger;
-// Blocknil patch: mempool-capped fee estimates for the bitcoind chain source.
-#[cfg(feature = "chain-bitcoind")]
+// Blocknil patch: mempool-capped fee estimates for the bitcoind and Electrum chain sources.
+#[cfg(any(feature = "chain-bitcoind", feature = "chain-electrum"))]
 mod mempool_fee;
 mod message_handler;
 pub mod payment;

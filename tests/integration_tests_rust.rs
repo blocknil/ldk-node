@@ -1149,6 +1149,196 @@ async fn a_sweep_confirmed_while_down_is_classified_for_a_channel_whose_facts_we
 	node_b.stop().unwrap();
 }
 
+/// A TCP proxy in front of an Electrum server that answers `blockchain.estimatefee` for
+/// `spiked_blocks` with `spiked_btc_per_kvb` and passes everything else through: a server relaying
+/// Bitcoin Core's estimate while it has spiked. It counts the answers it changed and the fee
+/// histograms asked through it.
+#[cfg(feature = "chain-electrum")]
+struct SpikingElectrumProxy {
+	url: String,
+	spiked_answers: Arc<AtomicUsize>,
+	histogram_requests: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "chain-electrum")]
+impl SpikingElectrumProxy {
+	fn start(server: String, spiked_blocks: u64, spiked_btc_per_kvb: f64) -> Self {
+		use std::io::{BufRead, BufReader, Write};
+		use std::net::{Shutdown, TcpListener, TcpStream};
+
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("tcp://{}", listener.local_addr().unwrap());
+		let spiked_answers = Arc::new(AtomicUsize::new(0));
+		let histogram_requests = Arc::new(AtomicUsize::new(0));
+		let (answers, histograms) = (Arc::clone(&spiked_answers), Arc::clone(&histogram_requests));
+		std::thread::spawn(move || {
+			for client in listener.incoming() {
+				let Ok(client) = client else { return };
+				let upstream = TcpStream::connect(&server).unwrap();
+				// The ids of the estimate requests whose answers are changed. An id goes in before
+				// its request is passed on, so before its answer can come back.
+				let spiked_ids = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+				let (mut to_server, from_client) =
+					(upstream.try_clone().unwrap(), client.try_clone().unwrap());
+				let (ids, histograms) = (Arc::clone(&spiked_ids), Arc::clone(&histograms));
+				std::thread::spawn(move || {
+					let mut reader = BufReader::new(from_client);
+					let mut line = String::new();
+					while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+						if let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) {
+							match request["method"].as_str() {
+								Some("blockchain.estimatefee")
+									if request["params"][0].as_u64() == Some(spiked_blocks) =>
+								{
+									ids.lock().unwrap().insert(request["id"].to_string());
+								},
+								Some("mempool.get_fee_histogram") => {
+									histograms.fetch_add(1, Ordering::AcqRel);
+								},
+								_ => {},
+							}
+						}
+						if to_server.write_all(line.as_bytes()).is_err() {
+							break;
+						}
+						line.clear();
+					}
+					let _ = to_server.shutdown(Shutdown::Write);
+				});
+
+				let (mut to_client, answers) = (client, Arc::clone(&answers));
+				std::thread::spawn(move || {
+					let mut reader = BufReader::new(upstream);
+					let mut line = String::new();
+					while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+						if let Ok(mut answer) = serde_json::from_str::<serde_json::Value>(&line) {
+							if spiked_ids.lock().unwrap().remove(&answer["id"].to_string()) {
+								answer["result"] = serde_json::json!(spiked_btc_per_kvb);
+								line = format!("{answer}\n");
+								answers.fetch_add(1, Ordering::AcqRel);
+							}
+						}
+						if to_client.write_all(line.as_bytes()).is_err() {
+							break;
+						}
+						line.clear();
+					}
+					let _ = to_client.shutdown(Shutdown::Both);
+				});
+			}
+		});
+		Self { url, spiked_answers, histogram_requests }
+	}
+}
+
+/// Decision 17 (wallet #104), end to end. On Electrum the node's fee estimates are Bitcoin Core's,
+/// as the server relays them, and LDK's sweeper spends a force-closed channel's outputs at
+/// `OutputSpendingFee`. Core's estimate spikes and is slow to come down while the mempool is
+/// empty; the sweep must pay what the mempool asks (the relay floor here), not the spike.
+#[cfg(feature = "chain-electrum")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_sweep_on_electrum_pays_the_mempool_rate_when_cores_estimate_has_spiked() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// 50 sat/vB for 12 blocks, `OutputSpendingFee`'s target (and `ChannelFunding`'s; the anchor
+	// channel's own targets keep the server's answer, so the peers agree on its commitment fee).
+	let proxy = SpikingElectrumProxy::start(electrsd.electrum_url.clone(), 12, 0.0005);
+
+	let config_a = random_config();
+	setup_builder!(builder_a, config_a.node_config);
+	let mut sync_config = ldk_node::config::ElectrumSyncConfig::default();
+	sync_config.background_sync_config = None;
+	builder_a.set_chain_source_electrum(proxy.url.clone(), Some(sync_config));
+	builder_a.set_log_facade_logger();
+	let store_a = TestSyncStore::new(config_a.node_config.storage_dir_path.clone().into());
+	let node_a = builder_a.build_with_store(config_a.node_entropy.into(), store_a).unwrap();
+	node_a.start().unwrap();
+	let node_b = setup_node(&TestChainSource::Electrum(&electrsd), random_config());
+
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(5_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	let funding_txo = open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Node B force-closes, and node A's balance comes back to it through its sweeper.
+	let user_channel_id_b = node_b.list_channels().first().unwrap().user_channel_id;
+	node_b.force_close_channel(&user_channel_id_b, node_a.node_id(), None).unwrap();
+	expect_event!(node_a, ChannelClosed);
+	expect_event!(node_b, ChannelClosed);
+	wait_for_outpoint_spend(&electrsd.client, funding_txo).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	if let Some(ldk_node::LightningBalance::ClaimableAwaitingConfirmations {
+		confirmation_height,
+		..
+	}) = node_a.list_balances().lightning_balances.first()
+	{
+		let blocks_to_go = confirmation_height - node_a.status().current_best_block.height;
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, blocks_to_go as usize).await;
+		node_a.sync_wallets().unwrap();
+	}
+	for _ in 0..6 {
+		if node_a.list_balances().lightning_balances.is_empty() {
+			break;
+		}
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		node_a.sync_wallets().unwrap();
+	}
+	let mut sweep_txid = None;
+	for _ in 0..20 {
+		node_a.sync_wallets().unwrap();
+		match node_a.list_balances().pending_balances_from_channel_closures.first() {
+			Some(ldk_node::PendingSweepBalance::BroadcastAwaitingConfirmation {
+				latest_spending_txid,
+				..
+			}) => {
+				sweep_txid = Some(*latest_spending_txid);
+				break;
+			},
+			Some(ldk_node::PendingSweepBalance::PendingBroadcast { .. }) | None => {
+				tokio::time::sleep(Duration::from_millis(500)).await;
+			},
+			Some(balance) => panic!("Unexpected balance state: {:?}", balance),
+		}
+	}
+	let sweep_txid = sweep_txid.expect("the sweep was broadcast");
+	wait_for_tx(&electrsd.client, sweep_txid).await;
+
+	// The node read the spike through the proxy.
+	assert!(proxy.spiked_answers.load(Ordering::Acquire) > 0);
+
+	let sweep = electrsd.client.transaction_get(&sweep_txid).unwrap();
+	let spent_sat: u64 = sweep
+		.input
+		.iter()
+		.map(|txin| {
+			let parent = electrsd.client.transaction_get(&txin.previous_output.txid).unwrap();
+			parent.output[txin.previous_output.vout as usize].value.to_sat()
+		})
+		.sum();
+	let paid_sat: u64 = sweep.output.iter().map(|txout| txout.value.to_sat()).sum();
+	let sat_per_vb = (spent_sat - paid_sat) as f64 / sweep.vsize() as f64;
+	// The relay floor (253 sat/kWU, about 1 sat/vB) on regtest's empty mempool; 50 if spiked.
+	assert!(sat_per_vb < 2.0, "the sweep paid {sat_per_vb} sat/vB");
+	// The cap came from the server's mempool histogram.
+	assert!(proxy.histogram_requests.load(Ordering::Acquire) > 0);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn channel_full_cycle_0conf() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();

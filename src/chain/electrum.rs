@@ -37,6 +37,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_trace, log_warn, LdkLogger, Logger};
+use crate::mempool_fee::capped_by_mempool;
 use crate::payment::NodeOffersMessageHandler;
 use crate::runtime::Runtime;
 use crate::tx_broadcaster::SortedTransactions;
@@ -774,19 +775,19 @@ pub(crate) async fn get_electrum_fee_rate_cache_update(
 	runtime: Arc<Runtime>, electrum_client: Arc<ElectrumClient>, network: Network,
 	fee_rate_cache_update_timeout_secs: u64, logger: Arc<Logger>,
 ) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
-	let mut batch = Batch::default();
 	let confirmation_targets = get_all_conf_targets();
-	for target in confirmation_targets {
-		let num_blocks = get_num_block_defaults_for_target(target);
-		batch.estimate_fee(num_blocks, None);
-	}
+	let num_blocks: Vec<usize> = confirmation_targets
+		.iter()
+		.map(|&target| get_num_block_defaults_for_target(target))
+		.collect();
 
-	let spawn_fut = runtime.spawn_blocking(move || electrum_client.batch_call(&batch));
+	let spawn_fut =
+		runtime.spawn_blocking(move || electrum_fee_answers(&electrum_client, &num_blocks));
 
 	let timeout_fut =
 		tokio::time::timeout(Duration::from_secs(fee_rate_cache_update_timeout_secs), spawn_fut);
 
-	let raw_estimates_btc_kvb = timeout_fut
+	let (raw_estimates_btc_kvb, histogram) = timeout_fut
 		.await
 		.map_err(|e| {
 			log_error!(logger, "Updating fee rate estimates timed out: {}", e);
@@ -813,6 +814,18 @@ pub(crate) async fn get_electrum_fee_rate_cache_update(
 		return Err(Error::FeerateEstimationUpdateFailed);
 	}
 
+	match &histogram {
+		Some(histogram) => log_trace!(
+			logger,
+			"Mempool histogram for fee estimates: {} vB",
+			histogram.iter().map(|&(_, vsize)| vsize).sum::<u64>()
+		),
+		None => log_debug!(
+			logger,
+			"The Electrum server gave no mempool fee histogram: fee estimates are not capped"
+		),
+	}
+
 	let mut new_fee_rate_cache = HashMap::with_capacity(10);
 	for (target, raw_fee_rate_btc_per_kvb) in
 		confirmation_targets.into_iter().zip(raw_estimates_btc_kvb.into_iter())
@@ -831,6 +844,10 @@ pub(crate) async fn get_electrum_fee_rate_cache_update(
 			FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
 		};
 
+		// Blocknil patch: what can wait pays what the mempool asks, if that's less (as the
+		// bitcoind chain source does).
+		let fee_rate = capped_by_mempool(target, fee_rate, histogram.as_deref());
+
 		// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
 		// require some post-estimation adjustments to the fee rates, which we do here.
 		let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
@@ -846,6 +863,54 @@ pub(crate) async fn get_electrum_fee_rate_cache_update(
 	}
 
 	Ok(new_fee_rate_cache)
+}
+
+/// Blocknil patch: the server's `blockchain.estimatefee` answers for each of `num_blocks`, and
+/// its mempool fee histogram (`mempool.get_fee_histogram`: `[sat/vB, vsize]` pairs, highest rate
+/// first, as `mempool_fee` takes them), `None` if the server gives none.
+///
+/// One round trip: the histogram goes first in the estimates' batch. A server without the method
+/// fails the whole batch (the client fails a batch on any error), so then the histogram is asked
+/// alone, allowed to fail, and the estimates as before. A missing histogram never costs the
+/// estimates: it only means they aren't capped.
+fn electrum_fee_answers(
+	client: &ElectrumClient, num_blocks: &[usize],
+) -> Result<(Vec<serde_json::Value>, Option<Vec<(f64, u64)>>), electrum_client::Error> {
+	// A pair that doesn't read is skipped: less vsize above the cut only raises the cap.
+	let histogram_of = |value: &serde_json::Value| -> Option<Vec<(f64, u64)>> {
+		value.as_array().map(|pairs| {
+			pairs
+				.iter()
+				.filter_map(|pair| Some((pair.get(0)?.as_f64()?, pair.get(1)?.as_u64()?)))
+				.collect()
+		})
+	};
+	let estimates_batch = || {
+		let mut batch = Batch::default();
+		for &blocks in num_blocks {
+			batch.estimate_fee(blocks, None);
+		}
+		batch
+	};
+
+	let mut batch = Batch::default();
+	batch.raw("mempool.get_fee_histogram".into(), vec![]);
+	for &blocks in num_blocks {
+		batch.estimate_fee(blocks, None);
+	}
+	if let Ok(mut answers) = client.batch_call(&batch) {
+		if answers.len() == num_blocks.len() + 1 {
+			let histogram = answers.remove(0);
+			return Ok((answers, histogram_of(&histogram)));
+		}
+	}
+
+	let histogram = client
+		.raw_call("mempool.get_fee_histogram", Vec::<electrum_client::Param>::new())
+		.ok()
+		.and_then(|value| histogram_of(&value));
+	let estimates = client.batch_call(&estimates_batch())?;
+	Ok((estimates, histogram))
 }
 
 struct ConfirmGate {
@@ -949,8 +1014,12 @@ mod tests {
 	use std::thread;
 
 	use bitcoin::blockdata::constants::genesis_block;
+	use lightning::chain::chaininterface::{
+		ConfirmationTarget as LdkConfirmationTarget, FEERATE_FLOOR_SATS_PER_KW,
+	};
 
 	use super::*;
+	use crate::mempool_fee::may_use_mempool_rate;
 
 	#[test]
 	fn clean_eof_wakes_concurrent_electrum_requests() {
@@ -1174,5 +1243,116 @@ mod tests {
 		assert!(Some((1, 6)) >= Some(BROADCAST_PACKAGE_MIN_PROTOCOL_VERSION));
 		assert!(Some((2, 0)) >= Some(BROADCAST_PACKAGE_MIN_PROTOCOL_VERSION));
 		assert!(Some((1, 5)) < Some(BROADCAST_PACKAGE_MIN_PROTOCOL_VERSION));
+	}
+
+	/// Electrum's power-of-two buckets for a quiet mempool, as `mempool_fee`'s tests have them:
+	/// under a block pays 1 sat/vB or more, so the mempool asks next to nothing.
+	fn quiet_histogram() -> serde_json::Value {
+		serde_json::json!([
+			[511.0, 170],
+			[255.0, 0],
+			[127.0, 492],
+			[63.0, 1260],
+			[31.0, 3946],
+			[15.0, 25910],
+			[7.0, 40000],
+			[3.0, 135571],
+			[1.0, 147369],
+			[0.0, 22686053]
+		])
+	}
+
+	/// Core's estimate spiked to 50 sat/vB (0.0005 BTC/kvB) for every target: 12,500 sat/kWU.
+	const SPIKED_BTC_PER_KVB: f64 = 0.0005;
+
+	/// Asks a fake Electrum server for the fee rate cache. Every `blockchain.estimatefee` answers
+	/// `estimate_btc_per_kvb`; `mempool.get_fee_histogram` answers `histogram`, or with `None`
+	/// the error of a server that doesn't have the method. Also returns the methods asked.
+	async fn fee_rate_cache_from_fake_server(
+		estimate_btc_per_kvb: f64, histogram: Option<serde_json::Value>,
+	) -> (HashMap<ConfirmationTarget, FeeRate>, Vec<String>) {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let server_url = format!("tcp://{}", listener.local_addr().unwrap());
+		let server = thread::spawn(move || {
+			let (stream, _) = listener.accept().unwrap();
+			let mut reader = BufReader::new(stream);
+			let mut methods = Vec::new();
+			let mut line = String::new();
+			// Until the client hangs up.
+			while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+				let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+				line.clear();
+				let id = request["id"].clone();
+				let method = request["method"].as_str().unwrap().to_string();
+				let result = match method.as_str() {
+					"server.version" => Ok(serde_json::json!(["test-server", "1.4"])),
+					"blockchain.estimatefee" => Ok(serde_json::json!(estimate_btc_per_kvb)),
+					"mempool.get_fee_histogram" => histogram.clone().ok_or(()),
+					_ => Err(()),
+				};
+				let answer = match result {
+					Ok(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+					Err(()) => serde_json::json!({
+						"jsonrpc": "2.0",
+						"id": id,
+						"error": {"code": -32601, "message": format!("unknown method {method}")},
+					}),
+				};
+				methods.push(method);
+				writeln!(reader.get_mut(), "{answer}").unwrap();
+				reader.get_mut().flush().unwrap();
+			}
+			methods
+		});
+
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Arc::new(Runtime::new(Arc::clone(&logger)).unwrap());
+		let config = ElectrumConfigBuilder::new().retry(0).build();
+		let client = Arc::new(ElectrumClient::from_config(&server_url, config).unwrap());
+		let cache =
+			get_electrum_fee_rate_cache_update(runtime, client, Network::Bitcoin, 10, logger)
+				.await
+				.unwrap();
+		(cache, server.join().unwrap())
+	}
+
+	/// Decision 17: Core's estimate spikes and is slow to come down while the mempool is nearly
+	/// empty. The targets that can wait, LDK's sweeps after a force close among them, take the
+	/// mempool's rate (the relay floor here); every other target keeps Core's.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn electrum_estimates_that_can_wait_are_capped_by_the_mempool() {
+		let (cache, methods) =
+			fee_rate_cache_from_fake_server(SPIKED_BTC_PER_KVB, Some(quiet_histogram())).await;
+
+		let spiked = FeeRate::from_sat_per_kwu(12_500);
+		let floor = FeeRate::from_sat_per_kwu(FEERATE_FLOOR_SATS_PER_KW as u64);
+		for target in get_all_conf_targets() {
+			let estimate = if may_use_mempool_rate(target) { floor } else { spiked };
+			assert_eq!(
+				cache[&target],
+				apply_post_estimation_adjustments(target, estimate),
+				"{target:?}"
+			);
+		}
+		assert_eq!(cache[&LdkConfirmationTarget::OutputSpendingFee.into()], floor);
+		assert_eq!(cache[&LdkConfirmationTarget::UrgentOnChainSweep.into()], spiked);
+		assert!(methods.iter().any(|m| m == "mempool.get_fee_histogram"), "{methods:?}");
+	}
+
+	/// A server without the fee histogram leaves Core's estimates as they are, and the update
+	/// still succeeds, on mainnet too: the histogram may only lower an estimate, never cost one.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn electrum_estimates_stand_when_the_server_has_no_fee_histogram() {
+		let (cache, methods) = fee_rate_cache_from_fake_server(SPIKED_BTC_PER_KVB, None).await;
+		assert!(methods.iter().any(|m| m == "mempool.get_fee_histogram"), "{methods:?}");
+
+		let spiked = FeeRate::from_sat_per_kwu(12_500);
+		for target in get_all_conf_targets() {
+			assert_eq!(
+				cache[&target],
+				apply_post_estimation_adjustments(target, spiked),
+				"{target:?}"
+			);
+		}
 	}
 }

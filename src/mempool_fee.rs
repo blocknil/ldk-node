@@ -10,8 +10,9 @@
 //! Bitcoin Core's `estimatesmartfee` reads the recent past and stays high while the mempool is
 //! nearly empty (5.3 sat/vB for the next block on 2026-11-05, with under a block's worth paying
 //! 1 sat/vB or more), so funding transactions overpaid several times over. The bitcoind chain
-//! source builds a fee histogram from the mempool entries its poll caches, and the targets that can
-//! wait pay the cheaper of Core's estimate and the mempool's.
+//! source builds a fee histogram from the mempool entries its poll caches, the Electrum chain
+//! source asks its server for one (`mempool.get_fee_histogram`), and the targets that can wait pay
+//! the cheaper of Core's estimate and the mempool's.
 
 use bitcoin::FeeRate;
 use lightning::chain::chaininterface::{
