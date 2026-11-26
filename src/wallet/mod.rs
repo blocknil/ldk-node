@@ -1149,6 +1149,18 @@ impl Wallet {
 					stores.insert_or_update_payment(payment.clone()).await?;
 					self.upsert_pending_payment(&stores, payment, Vec::new()).await?;
 				},
+				// Blocknil patch: bdk_wallet 3.2.1 drops an unconfirmed transaction spending our coins
+				// whose signatures it can't verify. Our own sends are signed, so one dropped is the
+				// sign of a chain source that is misbehaving or lying.
+				WalletEvent::TxRejected { txid, reason, .. } => {
+					log_warn!(
+						self.logger,
+						"The wallet refused unconfirmed transaction {} from the chain source: {}",
+						txid,
+						reason,
+					);
+					continue;
+				},
 				_ => {
 					continue;
 				},
