@@ -24,7 +24,7 @@ use lightning_types::payment::PaymentHash;
 
 use super::jit_wait::JitWaits;
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
-use crate::logger::{log_error, log_info, log_trace, LdkLogger};
+use crate::logger::{log_error, log_info, log_trace, log_warn, LdkLogger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
 use crate::{total_anchor_channels_reserve_sats, Config};
 
@@ -190,6 +190,24 @@ impl JitOpeningCost {
 		self.min_fee_msat(fee_rate)
 			.saturating_add(self.min_payment_over_fee_sats.saturating_mul(1_000))
 	}
+}
+
+/// The minimum opening fee and minimum payment of the offer we make, in msat: from
+/// `opening_cost` at `fee_rate` when it is set, the static ones otherwise. Blocknil patch.
+///
+/// `None`, no offer, when the minimum payment is over `max_payment_msat`: bLIP-52 wants the
+/// minimum at or under the maximum, and no payment the offer allows would pay for the open (with
+/// `opening_cost`, at high fee rates). Lowering the minimum to the maximum instead would open
+/// channels for less than they cost on chain.
+fn offered_minimums(
+	opening_cost: Option<JitOpeningCost>, static_min_fee_msat: u64, static_min_payment_msat: u64,
+	max_payment_msat: u64, fee_rate: FeeRate,
+) -> Option<(u64, u64)> {
+	let (min_fee_msat, min_payment_msat) = match opening_cost {
+		Some(cost) => (cost.min_fee_msat(fee_rate), cost.min_payment_size_msat(fee_rate)),
+		None => (static_min_fee_msat, static_min_payment_msat),
+	};
+	(min_payment_msat <= max_payment_msat).then_some((min_fee_msat, min_payment_msat))
 }
 
 /// Upstream's lifetime of the opening fee parameters we offer: 48 hours. Long enough for an LDK
@@ -534,29 +552,39 @@ where
 						Duration::from_secs(service_config.opening_fee_params_lifetime_secs);
 					let valid_until = LSPSDateTime(Utc::now() + lifetime);
 					// Blocknil patch: with an opening cost, the minimums follow today's fee rate.
-					let (min_fee_msat, min_payment_size_msat) = match service_config.opening_cost {
-						Some(cost) => {
-							let fee_rate = self
-								.fee_estimator
-								.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
-							(cost.min_fee_msat(fee_rate), cost.min_payment_size_msat(fee_rate))
+					let fee_rate = service_config.opening_cost.map(|_| {
+						self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding)
+					});
+					// An empty menu when no payment could pay for the open (see `offered_minimums`).
+					let opening_fee_params_menu = match offered_minimums(
+						service_config.opening_cost,
+						service_config.min_channel_opening_fee_msat,
+						service_config.min_payment_size_msat,
+						service_config.max_payment_size_msat,
+						fee_rate.unwrap_or(FeeRate::ZERO),
+					) {
+						Some((min_fee_msat, min_payment_size_msat)) => {
+							vec![LSPS2RawOpeningFeeParams {
+								min_fee_msat,
+								proportional: service_config.channel_opening_fee_ppm,
+								valid_until,
+								min_lifetime: service_config.min_channel_lifetime,
+								max_client_to_self_delay: service_config.max_client_to_self_delay,
+								min_payment_size_msat,
+								max_payment_size_msat: service_config.max_payment_size_msat,
+							}]
 						},
-						None => (
-							service_config.min_channel_opening_fee_msat,
-							service_config.min_payment_size_msat,
-						),
+						None => {
+							log_warn!(
+								self.logger,
+								"Offering no JIT channel to {}: at {} sat/kWU the minimum payment would be over the maximum of {} msat",
+								counterparty_node_id,
+								fee_rate.map_or(0, |rate| rate.to_sat_per_kwu()),
+								service_config.max_payment_size_msat,
+							);
+							Vec::new()
+						},
 					};
-					let opening_fee_params = LSPS2RawOpeningFeeParams {
-						min_fee_msat,
-						proportional: service_config.channel_opening_fee_ppm,
-						valid_until,
-						min_lifetime: service_config.min_channel_lifetime,
-						max_client_to_self_delay: service_config.max_client_to_self_delay,
-						min_payment_size_msat,
-						max_payment_size_msat: service_config.max_payment_size_msat,
-					};
-
-					let opening_fee_params_menu = vec![opening_fee_params];
 
 					if let Err(e) = lsps2_service_handler.opening_fee_params_generated(
 						&counterparty_node_id,
@@ -914,6 +942,23 @@ mod opening_cost_tests {
 		let plain = JitOpeningCost { feerate_headroom_ppm: 1_000_000, ..COST };
 		// 322 × 10 + 200.
 		assert_eq!(plain.min_fee_msat(sat_per_vb(10)), 3_420_000);
+	}
+
+	/// bLIP-52 wants `min_payment_size_msat <= max_payment_size_msat`. With the provider's
+	/// 100,000-sat maximum, the minimum payment passes it just over 204 sat/vB (322 vB × r × 1.5 +
+	/// 200 + 1,000). Over it no payment can pay for the open, so no offer is made: lowering the
+	/// minimum to the maximum would open channels for less than they cost on chain.
+	#[test]
+	fn no_offer_when_the_minimum_payment_is_over_the_maximum() {
+		let max = 100_000_000;
+		assert_eq!(
+			super::offered_minimums(Some(COST), 0, 0, max, sat_per_vb(204)),
+			Some((98_732_000, 99_732_000))
+		);
+		assert_eq!(super::offered_minimums(Some(COST), 0, 0, max, sat_per_vb(205)), None);
+		// The static minimums are held to the same rule.
+		assert_eq!(super::offered_minimums(None, 1, max, max, sat_per_vb(1)), Some((1, max)));
+		assert_eq!(super::offered_minimums(None, 1, max + 1, max, sat_per_vb(1)), None);
 	}
 
 	#[test]
