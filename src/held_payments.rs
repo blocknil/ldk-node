@@ -280,12 +280,13 @@ impl ForwardLedger {
 	/// Forwards `h` with `forward` (rust-lightning's `forward_intercepted_htlc`), and if that
 	/// worked, records the hold's end and remembers the forward.
 	///
-	/// All of it under the `forwarded` lock, which `forward_failed` takes first: rust-lightning
-	/// can fail the HTLC back on another thread as soon as `forward` has handed it over, and that
-	/// failure must find the forward and its record. The record is written before the forward is
-	/// remembered, so a forward that can be found always has its record to correct. (Without the
+	/// All of it under the `forwarded` lock, which `forward_failed` takes first. That lock is what
+	/// makes it correct: rust-lightning can fail the HTLC back on another thread as soon as
+	/// `forward` has handed it over, and `forward_failed` then waits until the forward and its
+	/// record are both booked, so it finds the forward and has its record to correct. Without the
 	/// lock, a failure handled in between went uncounted, or found no record and left one saying
-	/// `forwarded`, with a fee, for a payment the client never got.)
+	/// `forwarded`, with a fee, for a payment the client never got. The order inside the lock (the
+	/// record, then the forward) doesn't matter for that.
 	fn forward<E>(
 		&self, h: &Held, channel_id: ChannelId, amount_msat: u64,
 		forward: impl FnOnce() -> Result<(), E>,
@@ -805,6 +806,10 @@ mod tests {
 	/// hold's record. The failure must still be counted, and the record must say it was failed
 	/// back with no fee: a record left saying `forwarded` shows the admin console a payment
 	/// delivered, with a fee kept, that the client never got.
+	///
+	/// It fails if `ForwardLedger::forward` takes the `forwarded` lock after `forward()` rather
+	/// than before (checked by mutation; that was the code before ldk3-held-record-order): the
+	/// failure then runs before the forward is remembered, finds nothing, and goes uncounted.
 	#[test]
 	fn a_forward_failed_back_before_it_is_booked_is_counted_and_recorded_as_failed() {
 		let customer: PublicKey =
