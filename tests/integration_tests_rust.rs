@@ -45,7 +45,10 @@ use ldk_node::config::{
 	ADDRESS_POOL_SIZE, DEFAULT_FULL_SCAN_STOP_GAP,
 };
 use ldk_node::entropy::NodeEntropy;
-use ldk_node::liquidity::{LSPS2ServiceConfig, DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS};
+use ldk_node::liquidity::{
+	LSPS2ServiceConfig, DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+	SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+};
 use ldk_node::payment::{
 	ConfirmationStatus, ForwardedPaymentId, PayerProofOptions, PaymentDetails, PaymentDirection,
 	PaymentKind, PaymentStatus, TransactionType, UnifiedPaymentResult,
@@ -1144,6 +1147,196 @@ async fn a_sweep_confirmed_while_down_is_classified_for_a_channel_whose_facts_we
 		)
 	});
 	assert_eq!(sweeps.len(), 1, "node_a classified the sweep that confirmed while it was down");
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+/// A TCP proxy in front of an Electrum server that answers `blockchain.estimatefee` for
+/// `spiked_blocks` with `spiked_btc_per_kvb` and passes everything else through: a server relaying
+/// Bitcoin Core's estimate while it has spiked. It counts the answers it changed and the fee
+/// histograms asked through it.
+#[cfg(feature = "chain-electrum")]
+struct SpikingElectrumProxy {
+	url: String,
+	spiked_answers: Arc<AtomicUsize>,
+	histogram_requests: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "chain-electrum")]
+impl SpikingElectrumProxy {
+	fn start(server: String, spiked_blocks: u64, spiked_btc_per_kvb: f64) -> Self {
+		use std::io::{BufRead, BufReader, Write};
+		use std::net::{Shutdown, TcpListener, TcpStream};
+
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("tcp://{}", listener.local_addr().unwrap());
+		let spiked_answers = Arc::new(AtomicUsize::new(0));
+		let histogram_requests = Arc::new(AtomicUsize::new(0));
+		let (answers, histograms) = (Arc::clone(&spiked_answers), Arc::clone(&histogram_requests));
+		std::thread::spawn(move || {
+			for client in listener.incoming() {
+				let Ok(client) = client else { return };
+				let upstream = TcpStream::connect(&server).unwrap();
+				// The ids of the estimate requests whose answers are changed. An id goes in before
+				// its request is passed on, so before its answer can come back.
+				let spiked_ids = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+				let (mut to_server, from_client) =
+					(upstream.try_clone().unwrap(), client.try_clone().unwrap());
+				let (ids, histograms) = (Arc::clone(&spiked_ids), Arc::clone(&histograms));
+				std::thread::spawn(move || {
+					let mut reader = BufReader::new(from_client);
+					let mut line = String::new();
+					while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+						if let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) {
+							match request["method"].as_str() {
+								Some("blockchain.estimatefee")
+									if request["params"][0].as_u64() == Some(spiked_blocks) =>
+								{
+									ids.lock().unwrap().insert(request["id"].to_string());
+								},
+								Some("mempool.get_fee_histogram") => {
+									histograms.fetch_add(1, Ordering::AcqRel);
+								},
+								_ => {},
+							}
+						}
+						if to_server.write_all(line.as_bytes()).is_err() {
+							break;
+						}
+						line.clear();
+					}
+					let _ = to_server.shutdown(Shutdown::Write);
+				});
+
+				let (mut to_client, answers) = (client, Arc::clone(&answers));
+				std::thread::spawn(move || {
+					let mut reader = BufReader::new(upstream);
+					let mut line = String::new();
+					while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+						if let Ok(mut answer) = serde_json::from_str::<serde_json::Value>(&line) {
+							if spiked_ids.lock().unwrap().remove(&answer["id"].to_string()) {
+								answer["result"] = serde_json::json!(spiked_btc_per_kvb);
+								line = format!("{answer}\n");
+								answers.fetch_add(1, Ordering::AcqRel);
+							}
+						}
+						if to_client.write_all(line.as_bytes()).is_err() {
+							break;
+						}
+						line.clear();
+					}
+					let _ = to_client.shutdown(Shutdown::Both);
+				});
+			}
+		});
+		Self { url, spiked_answers, histogram_requests }
+	}
+}
+
+/// Decision 17 (wallet #104), end to end. On Electrum the node's fee estimates are Bitcoin Core's,
+/// as the server relays them, and LDK's sweeper spends a force-closed channel's outputs at
+/// `OutputSpendingFee`. Core's estimate spikes and is slow to come down while the mempool is
+/// empty; the sweep must pay what the mempool asks (the relay floor here), not the spike.
+#[cfg(feature = "chain-electrum")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_sweep_on_electrum_pays_the_mempool_rate_when_cores_estimate_has_spiked() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	// 50 sat/vB for 12 blocks, `OutputSpendingFee`'s target (and `ChannelFunding`'s; the anchor
+	// channel's own targets keep the server's answer, so the peers agree on its commitment fee).
+	let proxy = SpikingElectrumProxy::start(electrsd.electrum_url.clone(), 12, 0.0005);
+
+	let config_a = random_config();
+	setup_builder!(builder_a, config_a.node_config);
+	let mut sync_config = ldk_node::config::ElectrumSyncConfig::default();
+	sync_config.background_sync_config = None;
+	builder_a.set_chain_source_electrum(proxy.url.clone(), Some(sync_config));
+	builder_a.set_log_facade_logger();
+	let store_a = TestSyncStore::new(config_a.node_config.storage_dir_path.clone().into());
+	let node_a = builder_a.build_with_store(config_a.node_entropy.into(), store_a).unwrap();
+	node_a.start().unwrap();
+	let node_b = setup_node(&TestChainSource::Electrum(&electrsd), random_config());
+
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(5_000_000),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	let funding_txo = open_channel(&node_a, &node_b, 4_000_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// Node B force-closes, and node A's balance comes back to it through its sweeper.
+	let user_channel_id_b = node_b.list_channels().first().unwrap().user_channel_id;
+	node_b.force_close_channel(&user_channel_id_b, node_a.node_id(), None).unwrap();
+	expect_event!(node_a, ChannelClosed);
+	expect_event!(node_b, ChannelClosed);
+	wait_for_outpoint_spend(&electrsd.client, funding_txo).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	if let Some(ldk_node::LightningBalance::ClaimableAwaitingConfirmations {
+		confirmation_height,
+		..
+	}) = node_a.list_balances().lightning_balances.first()
+	{
+		let blocks_to_go = confirmation_height - node_a.status().current_best_block.height;
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, blocks_to_go as usize).await;
+		node_a.sync_wallets().unwrap();
+	}
+	for _ in 0..6 {
+		if node_a.list_balances().lightning_balances.is_empty() {
+			break;
+		}
+		generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+		node_a.sync_wallets().unwrap();
+	}
+	let mut sweep_txid = None;
+	for _ in 0..20 {
+		node_a.sync_wallets().unwrap();
+		match node_a.list_balances().pending_balances_from_channel_closures.first() {
+			Some(ldk_node::PendingSweepBalance::BroadcastAwaitingConfirmation {
+				latest_spending_txid,
+				..
+			}) => {
+				sweep_txid = Some(*latest_spending_txid);
+				break;
+			},
+			Some(ldk_node::PendingSweepBalance::PendingBroadcast { .. }) | None => {
+				tokio::time::sleep(Duration::from_millis(500)).await;
+			},
+			Some(balance) => panic!("Unexpected balance state: {:?}", balance),
+		}
+	}
+	let sweep_txid = sweep_txid.expect("the sweep was broadcast");
+	wait_for_tx(&electrsd.client, sweep_txid).await;
+
+	// The node read the spike through the proxy.
+	assert!(proxy.spiked_answers.load(Ordering::Acquire) > 0);
+
+	let sweep = electrsd.client.transaction_get(&sweep_txid).unwrap();
+	let spent_sat: u64 = sweep
+		.input
+		.iter()
+		.map(|txin| {
+			let parent = electrsd.client.transaction_get(&txin.previous_output.txid).unwrap();
+			parent.output[txin.previous_output.vout as usize].value.to_sat()
+		})
+		.sum();
+	let paid_sat: u64 = sweep.output.iter().map(|txout| txout.value.to_sat()).sum();
+	let sat_per_vb = (spent_sat - paid_sat) as f64 / sweep.vsize() as f64;
+	// The relay floor (253 sat/kWU, about 1 sat/vB) on regtest's empty mempool; 50 if spiked.
+	assert!(sat_per_vb < 2.0, "the sweep paid {sat_per_vb} sat/vB");
+	// The cap came from the server's mempool histogram.
+	assert!(proxy.histogram_requests.load(Ordering::Acquire) > 0);
 
 	node_a.stop().unwrap();
 	node_b.stop().unwrap();
@@ -7649,6 +7842,7 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 		client_trusts_lsp,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -7990,6 +8184,7 @@ async fn bolt12_lsps2_client_service_integration() {
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8464,6 +8659,7 @@ async fn lsps2_client_trusts_lsp() {
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8638,6 +8834,7 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8804,6 +9001,7 @@ async fn setup_lsps2_nodes_inner<S: PaginatedKVStore + Send + Sync + 'static>(
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -8890,6 +9088,7 @@ async fn setup_zero_client_reserve_service(
 		disable_client_reserve: true,
 		opening_fee_params_lifetime_secs:
 			ldk_node::liquidity::DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let client_node = setup_node(&TestChainSource::Esplora(electrsd), random_config());
 
@@ -9421,6 +9620,69 @@ async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_opening_cost_sets_the_offers_minimums_from_the_fee_rate() {
+	// Blocknil patch: with an `opening_cost`, the offer's minimum fee and minimum payment come from
+	// the service's channel-funding fee rate, not from the static minimums (set here to values the
+	// offer must not carry).
+	let (_bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+
+	let cost = ldk_node::liquidity::JitOpeningCost {
+		open_vbytes: 153,
+		close_vbytes: 169,
+		feerate_headroom_ppm: 1_500_000,
+		close_fee_margin_sats: 200,
+		min_fee_floor_sats: 2_000,
+		min_payment_over_fee_sats: 1_000,
+	};
+	let service_cfg = LSPS2ServiceConfig {
+		require_token: None,
+		advertise_service: false,
+		channel_opening_fee_ppm: 5_000,
+		channel_over_provisioning_ppm: 1_000_000,
+		max_payment_size_msat: 100_000_000,
+		min_payment_size_msat: 7,
+		min_channel_lifetime: 144,
+		min_channel_opening_fee_msat: 11,
+		max_client_to_self_delay: 1024,
+		client_trusts_lsp: false,
+		disable_client_reserve: false,
+		opening_fee_params_lifetime_secs: SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: Some(cost),
+	};
+	let service_config = random_config();
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
+	service_builder.enable_liquidity_provider(service_cfg);
+	let service = service_builder.build(service_config.node_entropy.into()).unwrap();
+	service.start().unwrap();
+	let service_addr = service.listening_addresses().unwrap().first().unwrap().clone();
+
+	let client_config = random_config();
+	setup_builder!(client_builder, client_config.node_config);
+	client_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	client_builder.add_liquidity_source(service.node_id(), service_addr, None, true);
+	let client = client_builder.build(client_config.node_entropy.into()).unwrap();
+	client.start().unwrap();
+
+	let fee_rate = service.channel_funding_fee_rate();
+	let terms = client.lsps2_opening_fee_params().unwrap();
+	assert_eq!(terms.len(), 1);
+	let offer = &terms[0];
+	assert_eq!(offer.min_fee_msat, cost.min_fee_msat(fee_rate), "at {fee_rate:?}");
+	assert_eq!(offer.min_payment_size_msat, cost.min_payment_size_msat(fee_rate));
+	assert!(offer.min_fee_msat >= 2_000_000, "never under the floor: {}", offer.min_fee_msat);
+	assert_eq!(offer.min_payment_size_msat, offer.min_fee_msat + 1_000_000);
+	assert_eq!(offer.proportional_ppm, 5_000, "the share is unchanged");
+	assert_eq!(offer.max_payment_size_msat, 100_000_000);
+
+	client.stop().unwrap();
+	service.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps5_webhook_wakes_a_client_a_first_payment_waits_for_until_removed() {
 	// Blocknil patch: LSPS5 between two LDK Node nodes. The client registers a webhook and is told
 	// the service's answer (`set_webhook_result_handler`); a first
@@ -9625,6 +9887,7 @@ async fn lsps2_short_offer_lifetime_serves_wallet_invoices_without_filling_slots
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs:
 			ldk_node::liquidity::SHORT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
@@ -10618,6 +10881,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let cheap_node_config = random_config();
 	setup_builder!(cheap_builder, cheap_node_config.node_config);
@@ -10642,6 +10906,7 @@ async fn do_lsps2_multi_lsp_picks_cheapest(
 		client_trusts_lsp: true,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 	let expensive_node_config = random_config();
 	setup_builder!(expensive_builder, expensive_node_config.node_config);
@@ -10927,6 +11192,7 @@ async fn lsps2_service_funding_fee_does_not_spend_anchor_reserve() {
 		client_trusts_lsp: false,
 		disable_client_reserve: false,
 		opening_fee_params_lifetime_secs: DEFAULT_OPENING_FEE_PARAMS_LIFETIME_SECS,
+		opening_cost: None,
 	};
 
 	let service_config = random_config();
