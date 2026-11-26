@@ -876,14 +876,21 @@ pub(crate) async fn get_electrum_fee_rate_cache_update(
 fn electrum_fee_answers(
 	client: &ElectrumClient, num_blocks: &[usize],
 ) -> Result<(Vec<serde_json::Value>, Option<Vec<(f64, u64)>>), electrum_client::Error> {
-	// A pair that doesn't read is skipped: less vsize above the cut only raises the cap.
+	// All or nothing: one pair that doesn't read makes the whole answer no histogram, so the
+	// estimates aren't capped. Skipping it would leave less vsize above the cut (none, if no pair
+	// reads), which reads as a quieter mempool than the real one and lowers the cap, to the relay
+	// floor at worst. An empty array is an empty mempool: electrs answers `[]` for one.
 	let histogram_of = |value: &serde_json::Value| -> Option<Vec<(f64, u64)>> {
-		value.as_array().map(|pairs| {
-			pairs
-				.iter()
-				.filter_map(|pair| Some((pair.get(0)?.as_f64()?, pair.get(1)?.as_u64()?)))
-				.collect()
-		})
+		value
+			.as_array()?
+			.iter()
+			.map(|pair| match pair.as_array()?.as_slice() {
+				[rate, vsize] => {
+					Some((rate.as_f64().filter(|r| r.is_finite() && *r >= 0.0)?, vsize.as_u64()?))
+				},
+				_ => None,
+			})
+			.collect()
 	};
 	let estimates_batch = || {
 		let mut batch = Batch::default();
@@ -1337,6 +1344,47 @@ mod tests {
 		assert_eq!(cache[&LdkConfirmationTarget::OutputSpendingFee.into()], floor);
 		assert_eq!(cache[&LdkConfirmationTarget::UrgentOnChainSweep.into()], spiked);
 		assert!(methods.iter().any(|m| m == "mempool.get_fee_histogram"), "{methods:?}");
+	}
+
+	/// A histogram that doesn't read is no histogram: Core's estimates stand. Skipping the pairs
+	/// that don't read would leave less vsize above the cut, or none, and read as an empty
+	/// mempool: the capped targets would drop to the relay floor in a full one. Here a server
+	/// sends vsize as a float, and a 40 sat/vB band over 12 MvB (several blocks) next to it.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn electrum_estimates_stand_when_the_fee_histogram_does_not_read() {
+		let spiked = FeeRate::from_sat_per_kwu(12_500);
+		for histogram in [
+			serde_json::json!([[40.0, 12_000_000.0]]),
+			serde_json::json!([[40.0, 12_000_000.0], [1.0, 1000]]),
+			serde_json::json!([[40.0, 12_000_000], [1.0]]),
+			serde_json::json!([[40.0, 12_000_000], "garbage"]),
+			serde_json::json!({"40": 12_000_000}),
+		] {
+			let (cache, methods) =
+				fee_rate_cache_from_fake_server(SPIKED_BTC_PER_KVB, Some(histogram.clone())).await;
+			for target in get_all_conf_targets() {
+				assert_eq!(
+					cache[&target],
+					apply_post_estimation_adjustments(target, spiked),
+					"{target:?} with {histogram}"
+				);
+			}
+			assert!(methods.iter().any(|m| m == "mempool.get_fee_histogram"), "{methods:?}");
+		}
+	}
+
+	/// An empty histogram is an empty mempool (electrs answers `[]` for one): the targets that can
+	/// wait go to the relay floor, as on bitcoind.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_empty_fee_histogram_is_an_empty_mempool() {
+		let (cache, _) =
+			fee_rate_cache_from_fake_server(SPIKED_BTC_PER_KVB, Some(serde_json::json!([]))).await;
+		let floor = FeeRate::from_sat_per_kwu(FEERATE_FLOOR_SATS_PER_KW as u64);
+		assert_eq!(cache[&LdkConfirmationTarget::OutputSpendingFee.into()], floor);
+		assert_eq!(
+			cache[&LdkConfirmationTarget::UrgentOnChainSweep.into()],
+			FeeRate::from_sat_per_kwu(12_500)
+		);
 	}
 
 	/// A server without the fee histogram leaves Core's estimates as they are, and the update
