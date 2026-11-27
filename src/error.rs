@@ -152,6 +152,8 @@ pub enum Error {
 	ChainSourceNotSupported,
 	/// The provided payer proof is invalid.
 	InvalidPayerProof,
+	/// Blocknil patch: an app message over 65533 bytes or with a zero byte.
+	InvalidAppMessage,
 }
 
 impl fmt::Display for Error {
@@ -251,6 +253,9 @@ impl fmt::Display for Error {
 				write!(f, "The configured chain source is not supported.")
 			},
 			Self::InvalidPayerProof => write!(f, "The provided payer proof is invalid."),
+			Self::InvalidAppMessage => {
+				write!(f, "The app message is over 65533 bytes or has a zero byte.")
+			},
 		}
 	}
 }

@@ -218,6 +218,7 @@ enum NodeError {
 	"InvalidLnurl",
 	"ChainSourceNotSupported",
 	"InvalidPayerProof",
+	"InvalidAppMessage",
 };
 
 typedef dictionary NodeStatus;

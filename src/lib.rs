@@ -174,6 +174,9 @@ use lightning::ln::funding::{
 use lightning::ln::msgs::{BaseMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::routing::gossip::NodeAlias;
+pub use message_handler::{
+	AppMessageHandler, APP_MESSAGES_FEATURE_BIT, APP_MESSAGE_TYPE, MAX_APP_MESSAGE_LEN,
+};
 pub use provider_fee::ProviderFeeAllowance;
 
 use lightning::sign::EntropySource;
@@ -307,6 +310,8 @@ pub struct Node {
 	held_payments: Arc<held_payments::HeldPayments>,
 	/// Blocknil patch: what our provider may keep out of payments (see `provider_fee`).
 	provider_fees: Arc<provider_fee::ProviderFees>,
+	/// Blocknil patch: app messages beside LSPS (see `message_handler`).
+	app_messages: Arc<message_handler::AppMessages>,
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
@@ -3670,6 +3675,34 @@ pub(crate) fn new_channel_anchor_reserve_sats(
 		0
 	} else {
 		config.anchor_channels_config.per_channel_reserve_sats
+	}
+}
+
+/// Blocknil patch: app messages, our own peer messages beside LSPS (see [`AppMessageHandler`]).
+impl Node {
+	/// Sends `payload` to the connected `peer` as an app message ([`APP_MESSAGE_TYPE`]).
+	///
+	/// Fails with [`Error::ConnectionFailed`] when `peer` isn't connected, and with
+	/// [`Error::InvalidAppMessage`] when `payload` is over [`MAX_APP_MESSAGE_LEN`] bytes or has a
+	/// zero byte. A peer without app messages ignores it: check [`Self::peer_has_app_messages`].
+	/// Safe to call from an [`AppMessageHandler`]'s callbacks.
+	///
+	/// `Ok` means queued, not delivered: if `peer` disconnects first, the message is dropped, never
+	/// sent on its next connection. The queue is unbounded; the caller bounds what it sends.
+	pub fn send_app_message(&self, peer: PublicKey, payload: String) -> Result<(), Error> {
+		self.app_messages.send(peer, payload)?;
+		// Send it now rather than at the background processor's next round. On another thread:
+		// a handler's callback may run while LDK holds the peer's lock, which `process_events`
+		// takes.
+		let peer_manager = Arc::clone(&self.peer_manager);
+		let _ = self.runtime.spawn_blocking(move || peer_manager.process_events());
+		Ok(())
+	}
+
+	/// Whether `peer` is connected and said in its `Init` that it takes app messages
+	/// ([`APP_MESSAGES_FEATURE_BIT`]).
+	pub fn peer_has_app_messages(&self, peer: &PublicKey) -> bool {
+		self.app_messages.peer_supports(peer)
 	}
 }
 

@@ -97,7 +97,7 @@ use crate::liquidity::client::lsps2::router::LSPS2Router;
 use crate::liquidity::{LSPS2ServiceConfig, LSPS5ServiceConfig, LiquiditySourceBuilder, LspConfig};
 use crate::lnurl_auth::LnurlAuth;
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
-use crate::message_handler::NodeCustomMessageHandler;
+use crate::message_handler::{AppMessageHandler, AppMessages, NodeCustomMessageHandler};
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::forwarding_store::ForwardingStore;
 #[cfg(feature = "unified-payments")]
@@ -350,6 +350,8 @@ pub struct NodeBuilder {
 	runtime_handle: Option<tokio::runtime::Handle>,
 	pathfinding_scores_sync_config: Option<PathfindingScoresSyncConfig>,
 	probing_config: Option<ProbingConfig>,
+	/// Blocknil patch: see [`Self::set_app_message_handler`].
+	app_message_handler: Option<Arc<dyn AppMessageHandler>>,
 }
 
 #[cfg(not(feature = "uniffi"))]
@@ -381,6 +383,7 @@ impl NodeBuilder {
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 			probing_config,
+			app_message_handler: None,
 		}
 	}
 
@@ -769,6 +772,16 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Blocknil patch: takes app messages from peers with `handler`, and tells peers so in `Init`
+	/// (see [`AppMessageHandler`]). Without one, app messages are ignored, though
+	/// [`Node::send_app_message`] still sends.
+	///
+	/// [`Node::send_app_message`]: crate::Node::send_app_message
+	pub fn set_app_message_handler(&mut self, handler: Arc<dyn AppMessageHandler>) -> &mut Self {
+		self.app_message_handler = Some(handler);
+		self
+	}
+
 	/// Sets background probing config.
 	///
 	/// Use [`ProbingConfigBuilder`] to build the configuration:
@@ -1064,6 +1077,7 @@ impl NodeBuilder {
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.probing_config.as_ref(),
 			self.async_payments_role,
+			self.app_message_handler.clone(),
 			seed_bytes,
 			runtime,
 			logger,
@@ -1688,7 +1702,8 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
-	seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	app_message_handler: Option<Arc<dyn AppMessageHandler>>, seed_bytes: [u8; 64],
+	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -2591,6 +2606,9 @@ fn build_with_store_internal(
 			.map_err(|_| BuildError::ReadFailed)?,
 	);
 
+	// Blocknil patch: app messages beside LSPS (see `message_handler`).
+	let app_messages = Arc::new(AppMessages::new(app_message_handler, Arc::clone(&logger)));
+
 	let (liquidity_source, custom_message_handler) = {
 		let mut liquidity_source_builder = LiquiditySourceBuilder::new(
 			Arc::clone(&wallet),
@@ -2634,6 +2652,7 @@ fn build_with_store_internal(
 		let custom_message_handler = Arc::new(NodeCustomMessageHandler::new(
 			Arc::clone(&liquidity_source),
 			Arc::clone(&held_payments),
+			Arc::clone(&app_messages),
 		));
 
 		(liquidity_source, custom_message_handler)
@@ -2883,6 +2902,7 @@ fn build_with_store_internal(
 		external_funding: Arc::new(Default::default()),
 		held_payments,
 		provider_fees,
+		app_messages,
 		#[cfg(feature = "unified-payments")]
 		hrn_resolver,
 		prober,
