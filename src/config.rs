@@ -573,8 +573,9 @@ pub struct AnchorChannelsConfig {
 	/// A list of peers that we trust to get the required channel closing transactions confirmed
 	/// on-chain.
 	///
-	/// Channels with these peers won't count towards the retained on-chain reserve and we won't
-	/// take any action to get the required channel closing transactions confirmed ourselves.
+	/// Channels with these peers won't count towards the retained on-chain reserve. A channel
+	/// close we start is still broadcast, and bumped with whatever on-chain funds we have (Blocknil
+	/// patch: upstream leaves it to the peer, which can't help when the peer is gone).
 	///
 	/// **Note:** Trusting the channel counterparty to take the necessary actions to get the
 	/// required Anchor spending transactions confirmed on-chain is potentially insecure
