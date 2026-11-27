@@ -36,7 +36,8 @@ use crate::ffi::{maybe_deref, maybe_try_convert_enum, maybe_wrap};
 use crate::liquidity::LiquiditySource;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{
-	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
+	LSPS2Parameters, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
+	PaymentStatus,
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
@@ -164,7 +165,7 @@ impl Bolt11Payment {
 	fn receive_via_jit_channel_inner(
 		&self, amount_msat: Option<u64>, description: &LdkBolt11InvoiceDescription,
 		expiry_secs: u32, payment_hash: Option<PaymentHash>,
-	) -> Result<LdkBolt11Invoice, Error> {
+	) -> Result<(LdkBolt11Invoice, LSPS2Parameters), Error> {
 		let connection_manager = Arc::clone(&self.connection_manager);
 		let res = self.runtime.block_on(async move {
 			if let Some(amount_msat) = amount_msat {
@@ -190,13 +191,59 @@ impl Bolt11Payment {
 					.await
 			}
 		});
-		let (invoice, chosen_lsp) = res?;
+		let (invoice, chosen_lsp, lsps2_parameters) = res?;
 
 		// Persist the chosen LSP peer to make sure we reconnect on restart.
 		let peer_info = PeerInfo { node_id: chosen_lsp.node_id, address: chosen_lsp.address };
 		self.runtime.block_on(self.peer_store.add_peer(peer_info))?;
 
-		Ok(invoice)
+		Ok((invoice, lsps2_parameters))
+	}
+}
+
+/// Blocknil patch (ldk3-jit-fee-limits): a just-in-time invoice together with the fee limits it was
+/// made with.
+///
+/// The JIT receive methods pick an LSP offer themselves (the cheapest of a fresh round of offers,
+/// or a lease cached earlier, e.g. for a BOLT 12 offer), and the limits of the offer they pick are
+/// encrypted into the invoice's payment metadata. A wallet that shows the fee from offers it fetched
+/// on its own ([`crate::Node::lsps2_opening_fee_params`]) can show another offer's fee: the LSP's
+/// prices may have changed in between, or the cached lease was bought at an older price. These
+/// return the limits the payment will be held to (the fee checked against
+/// [`counterparty_skimmed_fee_msat`] before the payment is claimable), so what a wallet shows is
+/// what the LSP may take.
+///
+/// Not exported over UniFFI: a tuple isn't a UniFFI type, and only our Rust wallet uses them.
+///
+/// [`counterparty_skimmed_fee_msat`]: crate::payment::PaymentKind::Bolt11::counterparty_skimmed_fee_msat
+impl Bolt11Payment {
+	/// As [`Self::receive_via_jit_channel`], also returning the limits of the offer the invoice is
+	/// built on. For a fixed amount, `max_total_opening_fee_msat` is exactly the fee the LSP takes.
+	pub fn receive_via_jit_channel_with_fee_limits(
+		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+	) -> Result<(Bolt11Invoice, LSPS2Parameters), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		let description = maybe_try_convert_enum(description)?;
+		let (invoice, limits) =
+			self.receive_via_jit_channel_inner(Some(amount_msat), &description, expiry_secs, None)?;
+		Ok((maybe_wrap(invoice), limits))
+	}
+
+	/// As [`Self::receive_variable_amount_via_jit_channel`], also returning the limits of the offer
+	/// the invoice is built on: the LSP takes the larger of `min_opening_fee_msat` and
+	/// `max_proportional_opening_fee_ppm_msat` of the amount that arrives.
+	pub fn receive_variable_amount_via_jit_channel_with_fee_limits(
+		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+	) -> Result<(Bolt11Invoice, LSPS2Parameters), Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+		let description = maybe_try_convert_enum(description)?;
+		let (invoice, limits) =
+			self.receive_via_jit_channel_inner(None, &description, expiry_secs, None)?;
+		Ok((maybe_wrap(invoice), limits))
 	}
 }
 
@@ -734,7 +781,7 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 		let description = maybe_try_convert_enum(description)?;
-		let invoice =
+		let (invoice, _) =
 			self.receive_via_jit_channel_inner(Some(amount_msat), &description, expiry_secs, None)?;
 		Ok(maybe_wrap(invoice))
 	}
@@ -780,7 +827,7 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_via_jit_channel_inner(
+		let (invoice, _) = self.receive_via_jit_channel_inner(
 			Some(amount_msat),
 			&description,
 			expiry_secs,
@@ -810,7 +857,8 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_via_jit_channel_inner(None, &description, expiry_secs, None)?;
+		let (invoice, _) =
+			self.receive_via_jit_channel_inner(None, &description, expiry_secs, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -854,7 +902,7 @@ impl Bolt11Payment {
 			return Err(Error::NotRunning);
 		}
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_via_jit_channel_inner(
+		let (invoice, _) = self.receive_via_jit_channel_inner(
 			None,
 			&description,
 			expiry_secs,
