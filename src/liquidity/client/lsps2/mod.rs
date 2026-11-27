@@ -405,7 +405,7 @@ where
 		self: Arc<Self>, amount_msat: u64, description: &Bolt11InvoiceDescription,
 		expiry_secs: u32, payment_hash: Option<PaymentHash>,
 		connection_manager: Arc<ConnectionManager<L>>,
-	) -> Result<(Bolt11Invoice, LspConfig), Error> {
+	) -> Result<(Bolt11Invoice, LspConfig, LSPS2Parameters), Error> {
 		let (lease, total_fee_msat, lsp, was_negotiated) =
 			self.acquire_fixed_lease(amount_msat, expiry_secs.into(), &connection_manager).await?;
 		let lsps2_parameters = LSPS2Parameters {
@@ -425,13 +425,15 @@ where
 		if was_negotiated {
 			log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
 		}
-		Ok((invoice, lsp))
+		// Blocknil patch (ldk3-jit-fee-limits): the limits the invoice was made with, which are
+		// what the payment is held to, go back to the caller so it can show them.
+		Ok((invoice, lsp, lsps2_parameters))
 	}
 
 	pub(crate) async fn lsps2_receive_variable_amount_to_jit_channel(
 		self: Arc<Self>, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 		payment_hash: Option<PaymentHash>, connection_manager: Arc<ConnectionManager<L>>,
-	) -> Result<(Bolt11Invoice, LspConfig), Error> {
+	) -> Result<(Bolt11Invoice, LspConfig, LSPS2Parameters), Error> {
 		let (lease, proportional_fee, lsp, was_negotiated) =
 			self.acquire_variable_lease(None, expiry_secs.into(), &connection_manager).await?;
 		let lsps2_parameters = LSPS2Parameters {
@@ -450,7 +452,9 @@ where
 		if was_negotiated {
 			log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
 		}
-		Ok((invoice, lsp))
+		// Blocknil patch (ldk3-jit-fee-limits): the limits the invoice was made with, which are
+		// what the payment is held to, go back to the caller so it can show them.
+		Ok((invoice, lsp, lsps2_parameters))
 	}
 
 	async fn acquire_fixed_lease(

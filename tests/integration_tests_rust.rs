@@ -9672,6 +9672,133 @@ async fn lsps2_payment_stuck_by_a_restart_mid_open_is_failed_back() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_jit_invoice_returns_the_fee_limits_of_the_offer_it_was_bought_with() {
+	// Blocknil patch (ldk3-jit-fee-limits, bitcoin-wallet#162): the offer a JIT invoice is bought
+	// with need not be the one a wallet read from `lsps2_opening_fee_params` just before. Here the
+	// client's BOLT 12 offer has a lease cached at the service's first price (1%), and the service
+	// then restarts at 2%. The terms now say 2%, while the BOLT 11 invoice for the offer's amount
+	// takes the cached lease at 1%. `receive_via_jit_channel_with_fee_limits` returns the 1% fee,
+	// and that is exactly what the service takes when the payment arrives.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_config, mut lsps2_service_config, service_node, client_node, payer_node) =
+		setup_lsps2_nodes_inner(
+			&bitcoind,
+			&electrsd,
+			service_store.clone(),
+			10_000_000,
+			true,
+			1024,
+			false,
+		)
+		.await;
+	let service_id = service_node.node_id();
+	let amount_msat = 50_000_000;
+	let cached_fee_msat = amount_msat / 100;
+	assert_eq!(lsps2_service_config.channel_opening_fee_ppm, 10_000);
+
+	// The client can't receive the amount yet, so the offer caches a lease for it (the service's
+	// default 48-hour parameters are long enough to cache).
+	client_node.bolt12_payment().receive(amount_msat, "cached", None, None).unwrap();
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// The service's price changes: it restarts at 2%.
+	service_node.stop().unwrap();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+	drop(service_node);
+	lsps2_service_config.channel_opening_fee_ppm = 20_000;
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	service_builder.enable_liquidity_provider(lsps2_service_config);
+	let service_node = service_builder
+		.build_with_store(service_config.node_entropy.into(), service_store)
+		.unwrap();
+	service_node.start().unwrap();
+	client_node.connect(service_id, service_addr.clone(), false).unwrap();
+	payer_node.connect(service_id, service_addr, true).unwrap();
+	tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+		while !payer_node.list_channels().iter().any(|c| c.is_usable) {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("the payer's channel should be usable again after the service's restart");
+
+	let terms = client_node.lsps2_opening_fee_params().unwrap();
+	assert_eq!(terms.len(), 1);
+	assert_eq!(terms[0].proportional_ppm, 20_000, "the terms carry the new price");
+
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("cached")).unwrap());
+	let (invoice, limits) = client_node
+		.bolt11_payment()
+		.receive_via_jit_channel_with_fee_limits(amount_msat, &description.into(), 3600)
+		.unwrap();
+	assert_eq!(
+		limits.max_total_opening_fee_msat,
+		Some(cached_fee_msat),
+		"the invoice is built on the lease cached at 1%, not on the terms' 2%"
+	);
+	assert_eq!(limits.max_proportional_opening_fee_ppm_msat, None);
+
+	let payment_id = payer_node.bolt11_payment().send(&invoice, None).unwrap();
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_id);
+	expect_channel_ready_event!(client_node, service_id);
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	let received = expect_payment_received_event!(client_node, amount_msat - cached_fee_msat);
+	match client_node.payment(&received).unwrap().unwrap().kind {
+		PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
+			assert_eq!(counterparty_skimmed_fee_msat, limits.max_total_opening_fee_msat);
+		},
+		kind => panic!("unexpected payment kind {kind:?}"),
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn lsps2_variable_amount_jit_invoice_returns_the_fee_limits_it_is_held_to() {
+	// Blocknil patch (ldk3-jit-fee-limits): an any-amount JIT invoice returns the rate and the
+	// minimum of the offer it was bought with, and the service takes that rate of what arrives.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
+	let (service_node, client_node, payer_node) =
+		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+	let service_id = service_node.node_id();
+
+	let description =
+		Bolt11InvoiceDescription::Direct(Description::new(String::from("any")).unwrap());
+	let (invoice, limits) = client_node
+		.bolt11_payment()
+		.receive_variable_amount_via_jit_channel_with_fee_limits(&description.into(), 3600)
+		.unwrap();
+	assert_eq!(limits.max_proportional_opening_fee_ppm_msat, Some(10_000));
+	assert_eq!(limits.min_opening_fee_msat, 0);
+
+	let amount_msat = 40_000_000;
+	let fee_msat = amount_msat * limits.max_proportional_opening_fee_ppm_msat.unwrap() / 1_000_000;
+	let payment_id =
+		payer_node.bolt11_payment().send_using_amount(&invoice, amount_msat, None).unwrap();
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_event!(service_node, PaymentForwarded);
+	expect_channel_pending_event!(client_node, service_id);
+	expect_channel_ready_event!(client_node, service_id);
+	expect_payment_successful_event!(payer_node, payment_id, None);
+	let received = expect_payment_received_event!(client_node, amount_msat - fee_msat);
+	match client_node.payment(&received).unwrap().unwrap().kind {
+		PaymentKind::Bolt11 { counterparty_skimmed_fee_msat, .. } => {
+			assert_eq!(counterparty_skimmed_fee_msat, Some(fee_msat));
+		},
+		kind => panic!("unexpected payment kind {kind:?}"),
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_opening_fee_params_shows_the_lsps_terms() {
 	// Blocknil patch: the client reads its LSP's current offer, as `setup_lsps2_nodes` configures
 	// it, without negotiating anything.
