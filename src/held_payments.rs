@@ -174,18 +174,13 @@ pub(crate) struct HeldPayments {
 	/// Hold SCIDs: client, and when this code first saw the SCID.
 	hold_scids: RwLock<HashMap<u64, (PublicKey, u64)>>,
 	kv_store: Arc<DynStore>,
-	recent: Mutex<VecDeque<HoldRecord>>,
+	ledger: ForwardLedger,
 	hold_for: RwLock<Duration>,
 	on_held: RwLock<Option<OnHeld>>,
 	on_short_of_room: RwLock<Option<OnShortOfRoom>>,
 	/// Clients that reconnected with something held for them, for the release task.
 	reconnected: Mutex<HashSet<PublicKey>>,
 	reconnect_notify: tokio::sync::Notify,
-	/// Blocknil patch (decision 4): our recent forwards (see `forward_failed`).
-	forwarded: Mutex<VecDeque<Forwarded>>,
-	/// Blocknil patch (decision 4): forwards failed back because the client went offline between
-	/// the forward and the HTLC being added to their channel, since this node started.
-	forwards_failed_offline: AtomicU64,
 	channel_manager: Arc<ChannelManager>,
 	logger: Arc<Logger>,
 }
@@ -243,6 +238,111 @@ fn take_lost_forward(
 	forwarded.remove(index)
 }
 
+/// Blocknil patch (decision 4): the records of holds that ended, and of our recent forwards with
+/// the count of those lost to a client going offline (see [`HeldPayments::forward_failed`]).
+struct ForwardLedger {
+	recent: Mutex<VecDeque<HoldRecord>>,
+	/// Our recent forwards, for `forward_failed`.
+	forwarded: Mutex<VecDeque<Forwarded>>,
+	/// Forwards failed back because the client went offline between the forward and the HTLC
+	/// being added to their channel, since this node started.
+	forwards_failed_offline: AtomicU64,
+}
+
+impl ForwardLedger {
+	fn new() -> Self {
+		Self {
+			recent: Mutex::new(VecDeque::new()),
+			forwarded: Mutex::new(VecDeque::new()),
+			forwards_failed_offline: AtomicU64::new(0),
+		}
+	}
+
+	fn recent(&self) -> Vec<HoldRecord> {
+		self.recent.lock().expect("lock").iter().cloned().collect()
+	}
+
+	fn record_ended(&self, h: &Held, forwarded: bool, refused: Option<String>) {
+		let mut recent = self.recent.lock().expect("lock");
+		recent.push_front(HoldRecord {
+			customer: h.customer,
+			amount_msat: h.amount_msat,
+			held_secs: h.since.elapsed().as_secs(),
+			ended_at: now_secs(),
+			forwarded,
+			fee_msat: if forwarded { h.fee_msat } else { 0 },
+			refused,
+			payment_hash: h.payment_hash,
+		});
+		recent.truncate(RECENT);
+	}
+
+	/// Forwards `h` with `forward` (rust-lightning's `forward_intercepted_htlc`), and if that
+	/// worked, records the hold's end and remembers the forward.
+	///
+	/// All of it under the `forwarded` lock, which `forward_failed` takes first. That lock is what
+	/// makes it correct: rust-lightning can fail the HTLC back on another thread as soon as
+	/// `forward` has handed it over, and `forward_failed` then waits until the forward and its
+	/// record are both booked, so it finds the forward and has its record to correct. Without the
+	/// lock, a failure handled in between went uncounted, or found no record and left one saying
+	/// `forwarded`, with a fee, for a payment the client never got. The order inside the lock (the
+	/// record, then the forward) doesn't matter for that.
+	fn forward<E>(
+		&self, h: &Held, channel_id: ChannelId, amount_msat: u64,
+		forward: impl FnOnce() -> Result<(), E>,
+	) -> Result<(), E> {
+		let mut forwarded = self.forwarded.lock().expect("lock");
+		forward()?;
+		if h.was_held {
+			self.record_ended(h, true, None);
+		}
+		while matches!(forwarded.front(), Some(f) if f.at.elapsed() > FORWARD_RACE_WINDOW) {
+			forwarded.pop_front();
+		}
+		forwarded.push_back(Forwarded {
+			customer: h.customer,
+			channel_id,
+			payment_hash: h.payment_hash,
+			amount_msat,
+			at: Instant::now(),
+		});
+		Ok(())
+	}
+
+	/// The forward of ours that a failed HTLC was, if rust-lightning failed it back because the
+	/// client went offline, with the count of those since start. Its record, if it has one, now
+	/// says it was failed back and kept no fee.
+	fn forward_failed(
+		&self, failure_type: &HTLCHandlingFailureType,
+		failure_reason: Option<&HTLCHandlingFailureReason>,
+	) -> Option<(Forwarded, u64)> {
+		let mut forwarded = self.forwarded.lock().expect("lock");
+		let lost = take_lost_forward(&mut forwarded, failure_type, failure_reason)?;
+		drop(forwarded);
+		// The admin console reads these records: a forward lost this way was failed back, not
+		// delivered, and we kept no fee. Corrected before it is counted, so whoever sees the count
+		// sees the record corrected (`Release` here, `Acquire` in `forwards_failed_offline`).
+		{
+			let mut recent = self.recent.lock().expect("lock");
+			if let Some(record) = recent.iter_mut().find(|r| {
+				r.forwarded && r.customer == lost.customer && r.payment_hash == lost.payment_hash
+			}) {
+				record.forwarded = false;
+				record.fee_msat = 0;
+				record.refused = Some(
+					"failed back: the client went offline right after it was forwarded".to_string(),
+				);
+			}
+		}
+		let count = self.forwards_failed_offline.fetch_add(1, Ordering::Release) + 1;
+		Some((lost, count))
+	}
+
+	fn forwards_failed_offline(&self) -> u64 {
+		self.forwards_failed_offline.load(Ordering::Acquire)
+	}
+}
+
 impl HeldPayments {
 	pub(crate) fn new(
 		channel_manager: Arc<ChannelManager>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
@@ -251,14 +351,12 @@ impl HeldPayments {
 			held: Mutex::new(Vec::new()),
 			hold_scids: RwLock::new(HashMap::new()),
 			kv_store,
-			recent: Mutex::new(VecDeque::new()),
+			ledger: ForwardLedger::new(),
 			hold_for: RwLock::new(DEFAULT_HOLD),
 			on_held: RwLock::new(None),
 			on_short_of_room: RwLock::new(None),
 			reconnected: Mutex::new(HashSet::new()),
 			reconnect_notify: tokio::sync::Notify::new(),
-			forwarded: Mutex::new(VecDeque::new()),
-			forwards_failed_offline: AtomicU64::new(0),
 			channel_manager,
 			logger,
 		}
@@ -439,37 +537,11 @@ impl HeldPayments {
 
 	/// Holds that ended, newest first.
 	pub(crate) fn recent(&self) -> Vec<HoldRecord> {
-		self.recent.lock().expect("lock").iter().cloned().collect()
+		self.ledger.recent()
 	}
 
 	fn record_ended(&self, h: &Held, forwarded: bool, refused: Option<String>) {
-		let mut recent = self.recent.lock().expect("lock");
-		recent.push_front(HoldRecord {
-			customer: h.customer,
-			amount_msat: h.amount_msat,
-			held_secs: h.since.elapsed().as_secs(),
-			ended_at: now_secs(),
-			forwarded,
-			fee_msat: if forwarded { h.fee_msat } else { 0 },
-			refused,
-			payment_hash: h.payment_hash,
-		});
-		recent.truncate(RECENT);
-	}
-
-	/// Blocknil patch (decision 4): remembers a forward, for `forward_failed`.
-	fn note_forwarded(&self, h: &Held, channel_id: ChannelId, amount_msat: u64) {
-		let mut forwarded = self.forwarded.lock().expect("lock");
-		while matches!(forwarded.front(), Some(f) if f.at.elapsed() > FORWARD_RACE_WINDOW) {
-			forwarded.pop_front();
-		}
-		forwarded.push_back(Forwarded {
-			customer: h.customer,
-			channel_id,
-			payment_hash: h.payment_hash,
-			amount_msat,
-			at: Instant::now(),
-		});
+		self.ledger.record_ended(h, forwarded, refused);
 	}
 
 	/// Blocknil patch (decision 4): an HTLC failed (`Event::HTLCHandlingFailed`). If it is one of
@@ -481,12 +553,9 @@ impl HeldPayments {
 		&self, failure_type: &HTLCHandlingFailureType,
 		failure_reason: Option<&HTLCHandlingFailureReason>,
 	) {
-		let mut forwarded = self.forwarded.lock().expect("lock");
-		let Some(lost) = take_lost_forward(&mut forwarded, failure_type, failure_reason) else {
+		let Some((lost, count)) = self.ledger.forward_failed(failure_type, failure_reason) else {
 			return;
 		};
-		drop(forwarded);
-		let count = self.forwards_failed_offline.fetch_add(1, Ordering::Relaxed) + 1;
 		log_info!(
 			self.logger,
 			"A payment of {} msat for customer {} (payment hash {}) failed back: they went offline \
@@ -496,23 +565,11 @@ impl HeldPayments {
 			lost.payment_hash,
 			count
 		);
-		// The admin console reads these records: a forward lost this way was failed back, not
-		// delivered, and we kept no fee.
-		let mut recent = self.recent.lock().expect("lock");
-		if let Some(record) = recent.iter_mut().find(|r| {
-			r.forwarded && r.customer == lost.customer && r.payment_hash == lost.payment_hash
-		}) {
-			record.forwarded = false;
-			record.fee_msat = 0;
-			record.refused = Some(
-				"failed back: the client went offline right after it was forwarded".to_string(),
-			);
-		}
 	}
 
 	/// Blocknil patch (decision 4): see `forward_failed`.
 	pub(crate) fn forwards_failed_offline(&self) -> u64 {
-		self.forwards_failed_offline.load(Ordering::Relaxed)
+		self.ledger.forwards_failed_offline()
 	}
 
 	/// Whether anything is still held for this client.
@@ -573,14 +630,15 @@ impl HeldPayments {
 					.filter(|c| c.is_usable && c.next_outbound_htlc_limit_msat >= forward_msat)
 					.max_by_key(|c| c.next_outbound_htlc_limit_msat);
 				if let Some(channel) = channel {
-					match self.channel_manager.forward_intercepted_htlc(
-						h.intercept_id,
-						&channel.channel_id,
-						h.customer,
-						forward_msat,
-					) {
+					match self.ledger.forward(&h, channel.channel_id, forward_msat, || {
+						self.channel_manager.forward_intercepted_htlc(
+							h.intercept_id,
+							&channel.channel_id,
+							h.customer,
+							forward_msat,
+						)
+					}) {
 						Ok(()) => {
-							self.note_forwarded(&h, channel.channel_id, forward_msat);
 							log_info!(
 								self.logger,
 								"Forwarded a payment of {} msat to customer {}{}{}",
@@ -593,9 +651,6 @@ impl HeldPayments {
 									String::new()
 								}
 							);
-							if h.was_held {
-								self.record_ended(&h, true, None);
-							}
 							continue;
 						},
 						Err(e) => {
@@ -743,6 +798,73 @@ mod tests {
 		assert_eq!(lost.payment_hash, PaymentHash([2; 32]));
 		assert!(take_lost_forward(&mut forwarded, &race, offline.as_ref()).is_none());
 		assert_eq!(forwarded.len(), 2, "the old one and the other client's are left");
+	}
+
+	/// The race of decision 4, with the failure handled while our forward is still being booked:
+	/// rust-lightning fails the HTLC back on its forwarding pass, on another thread, as soon as the
+	/// client is gone, and that can come before we have remembered the forward or written the
+	/// hold's record. The failure must still be counted, and the record must say it was failed
+	/// back with no fee: a record left saying `forwarded` shows the admin console a payment
+	/// delivered, with a fee kept, that the client never got.
+	///
+	/// It fails if `ForwardLedger::forward` takes the `forwarded` lock after `forward()` rather
+	/// than before (checked by mutation; that was the code before ldk3-held-record-order): the
+	/// failure then runs before the forward is remembered, finds nothing, and goes uncounted.
+	#[test]
+	fn a_forward_failed_back_before_it_is_booked_is_counted_and_recorded_as_failed() {
+		let customer: PublicKey =
+			"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		let channel_id = ChannelId([1; 32]);
+		let now = Instant::now();
+		let held = Held {
+			intercept_id: InterceptId([7; 32]),
+			payment_hash: PaymentHash([9; 32]),
+			customer,
+			amount_msat: 150_000_000,
+			since: now,
+			deadline: now + Duration::from_secs(60),
+			announced: true,
+			room_asked: true,
+			fee_msat: 110_000_000,
+			was_held: true,
+		};
+		let ledger = Arc::new(ForwardLedger::new());
+		let failure_type = HTLCHandlingFailureType::Forward { node_id: Some(customer), channel_id };
+		let failure_reason =
+			HTLCHandlingFailureReason::Local { reason: LocalHTLCFailureReason::PeerOffline };
+
+		let failure = Mutex::new(None);
+		ledger
+			.forward(&held, channel_id, held.amount_msat - held.fee_msat, || {
+				// The forward is with rust-lightning: the failure comes now, on its own thread.
+				let (ledger, failure_type, failure_reason) =
+					(Arc::clone(&ledger), failure_type.clone(), failure_reason.clone());
+				let (done_tx, done_rx) = std::sync::mpsc::channel();
+				*failure.lock().unwrap() = Some(std::thread::spawn(move || {
+					let lost = ledger.forward_failed(&failure_type, Some(&failure_reason));
+					let _ = done_tx.send(());
+					lost
+				}));
+				// Give it the time to run before the forward returns, as a forwarding pass can.
+				let _ = done_rx.recv_timeout(Duration::from_millis(300));
+				Ok::<(), ()>(())
+			})
+			.unwrap();
+		let lost = failure.lock().unwrap().take().unwrap().join().unwrap();
+
+		let (lost, count) =
+			lost.expect("the failure is our forward, lost to the client going away");
+		assert_eq!((lost.payment_hash, count), (held.payment_hash, 1));
+		assert_eq!(ledger.forwards_failed_offline(), 1);
+		let records = ledger.recent();
+		assert_eq!(records.len(), 1);
+		let record = &records[0];
+		assert!(!record.forwarded, "{record:?}");
+		assert_eq!(record.fee_msat, 0, "{record:?}");
+		assert!(
+			record.refused.as_deref().is_some_and(|why| why.contains("went offline")),
+			"{record:?}"
+		);
 	}
 
 	#[test]
