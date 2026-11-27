@@ -9760,15 +9760,91 @@ async fn lsps2_jit_invoice_returns_the_fee_limits_of_the_offer_it_was_bought_wit
 	}
 }
 
+/// Blocknil patch (ldk3-jit-fee-limits): stops `service_node` and builds it again over its store with
+/// `lsps2_service_config`, at the same address, so its LSPS2 state (bought leases) carries over.
+async fn restart_lsps2_service(
+	service_node: TestNode, service_config: &TestConfig, lsps2_service_config: LSPS2ServiceConfig,
+	service_store: TestSyncStore, electrsd: &ElectrsD,
+) -> TestNode {
+	service_node.stop().unwrap();
+	drop(service_node);
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	setup_builder!(service_builder, service_config.node_config);
+	service_builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	service_builder.enable_liquidity_provider(lsps2_service_config);
+	let service_node = service_builder
+		.build_with_store(service_config.node_entropy.clone().into(), service_store)
+		.unwrap();
+	service_node.start().unwrap();
+	service_node
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn lsps2_variable_amount_jit_invoice_returns_the_fee_limits_it_is_held_to() {
 	// Blocknil patch (ldk3-jit-fee-limits): an any-amount JIT invoice returns the rate and the
-	// minimum of the offer it was bought with, and the service takes that rate of what arrives.
+	// minimum fee of the offer it was bought with, and the service takes the larger of the two.
+	// As in the fixed-amount test, the offer is a lease cached for the client's any-amount BOLT 12
+	// offer at the service's first price (1%, at least 1,000 sats), and the service then restarts
+	// at 2%, at least 3,000 sats. The invoice is built on the cached lease, and the payment, 40,000
+	// sats, is under the amount at which 1% passes the minimum, so the minimum fee is what is taken.
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let service_store = TestSyncStore::new(random_config().node_config.storage_dir_path.into());
-	let (service_node, client_node, payer_node) =
-		setup_lsps2_nodes(&bitcoind, &electrsd, service_store, 10_000_000, true).await;
+	let (service_config, mut lsps2_service_config, service_node, client_node, payer_node) =
+		setup_lsps2_nodes_inner(
+			&bitcoind,
+			&electrsd,
+			service_store.clone(),
+			10_000_000,
+			true,
+			1024,
+			false,
+		)
+		.await;
 	let service_id = service_node.node_id();
+	let service_addr = service_node.listening_addresses().unwrap().first().unwrap().clone();
+
+	// The first price: 1%, at least 1,000 sats.
+	lsps2_service_config.channel_opening_fee_ppm = 10_000;
+	lsps2_service_config.min_channel_opening_fee_msat = 1_000_000;
+	let service_node = restart_lsps2_service(
+		service_node,
+		&service_config,
+		lsps2_service_config.clone(),
+		service_store.clone(),
+		&electrsd,
+	)
+	.await;
+	client_node.connect(service_id, service_addr.clone(), false).unwrap();
+	assert_eq!(client_node.lsps2_opening_fee_params().unwrap()[0].min_fee_msat, 1_000_000);
+
+	// The client can't receive yet, so its any-amount offer caches a lease at the first price.
+	client_node.bolt12_payment().receive_variable_amount("cached any", None).unwrap();
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// The price changes: 2%, at least 3,000 sats.
+	lsps2_service_config.channel_opening_fee_ppm = 20_000;
+	lsps2_service_config.min_channel_opening_fee_msat = 3_000_000;
+	let service_node = restart_lsps2_service(
+		service_node,
+		&service_config,
+		lsps2_service_config,
+		service_store,
+		&electrsd,
+	)
+	.await;
+	client_node.connect(service_id, service_addr.clone(), false).unwrap();
+	payer_node.connect(service_id, service_addr, true).unwrap();
+	tokio::time::timeout(Duration::from_secs(common::INTEROP_TIMEOUT_SECS), async {
+		while !payer_node.list_channels().iter().any(|c| c.is_usable) {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("the payer's channel should be usable again after the service's restart");
+	let terms = client_node.lsps2_opening_fee_params().unwrap();
+	assert_eq!((terms[0].proportional_ppm, terms[0].min_fee_msat), (20_000, 3_000_000));
 
 	let description =
 		Bolt11InvoiceDescription::Direct(Description::new(String::from("any")).unwrap());
@@ -9776,11 +9852,18 @@ async fn lsps2_variable_amount_jit_invoice_returns_the_fee_limits_it_is_held_to(
 		.bolt11_payment()
 		.receive_variable_amount_via_jit_channel_with_fee_limits(&description.into(), 3600)
 		.unwrap();
-	assert_eq!(limits.max_proportional_opening_fee_ppm_msat, Some(10_000));
-	assert_eq!(limits.min_opening_fee_msat, 0);
+	assert_eq!(
+		(limits.max_proportional_opening_fee_ppm_msat, limits.min_opening_fee_msat),
+		(Some(10_000), 1_000_000),
+		"the invoice is built on the lease cached at the first price, not on the terms"
+	);
 
+	// 1% of 40,000 sats is 400 sats, under the 1,000-sat minimum: the minimum is taken.
 	let amount_msat = 40_000_000;
-	let fee_msat = amount_msat * limits.max_proportional_opening_fee_ppm_msat.unwrap() / 1_000_000;
+	let rate_fee_msat =
+		amount_msat * limits.max_proportional_opening_fee_ppm_msat.unwrap() / 1_000_000;
+	assert!(rate_fee_msat < limits.min_opening_fee_msat);
+	let fee_msat = limits.min_opening_fee_msat;
 	let payment_id =
 		payer_node.bolt11_payment().send_using_amount(&invoice, amount_msat, None).unwrap();
 	expect_channel_pending_event!(service_node, client_node.node_id());
