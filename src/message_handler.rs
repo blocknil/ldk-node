@@ -395,6 +395,9 @@ where
 	}
 
 	fn peer_disconnected(&self, their_node_id: PublicKey) {
+		// Blocknil patch (ldk3-lost-forward-match): ends the connection `held_payments` matches
+		// a lost forward against.
+		self.held_payments.peer_disconnected(&their_node_id);
 		let lsps = self.liquidity_source.liquidity_manager();
 		self.app_messages.disconnected_beside(&*lsps, their_node_id)
 	}
