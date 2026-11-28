@@ -6508,14 +6508,16 @@ async fn splice_in_with_change_keeps_a_change_output_or_is_refused() {
 /// `confirmed_spendable_onchain_balance_sats` is what a splice's coin selection can spend:
 /// confirmed coins only. Node A holds a single coin; opening a channel spends it, and until the
 /// open's change confirms and the wallet syncs, `spendable_onchain_balance_sats` counts that change
-/// while the confirmed figure doesn't. Once it confirms and the wallet syncs the two agree, and a
-/// splice spends what the confirmed figure counted.
+/// while the confirmed figure doesn't, also once it is in a block the wallet hasn't synced. After
+/// the sync the two agree, and a splice spends what the confirmed figure counted.
 ///
 /// Blocknil patch (bitcoin-wallet #211).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn confirmed_spendable_balance_leaves_out_unconfirmed_change() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
-	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	// Esplora, whose test nodes have no background sync (`setup_node`): what the wallet has seen
+	// moves only with `sync_wallets`. A bitcoind source polls every 2 s.
+	let chain_source = TestChainSource::Esplora(&electrsd);
 	let node_b = setup_node(&chain_source, random_config());
 	let mut config_a = random_config();
 	// No anchor reserve, so that the figures are the coins themselves.
@@ -6549,6 +6551,8 @@ async fn confirmed_spendable_balance_leaves_out_unconfirmed_change() {
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	// Confirmed on chain but not yet synced: still none for coin selection.
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	let user_channel_id = expect_channel_ready_event!(node_a, node_b.node_id());
