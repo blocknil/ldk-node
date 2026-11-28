@@ -2354,6 +2354,21 @@ impl Wallet {
 			.sum()
 	}
 
+	/// The value of each coin [`Self::get_confirmed_unlocked_amount_sats`] sums: the same filter.
+	///
+	/// Blocknil patch, for [`crate::Node::confirmed_spendable_utxo_values`].
+	pub(crate) fn get_confirmed_unlocked_utxo_values(&self) -> Vec<u64> {
+		let locked_wallet = self.inner.lock().expect("lock");
+		locked_wallet
+			.list_unspent()
+			.filter(|utxo| {
+				utxo.chain_position.is_confirmed()
+					&& !locked_wallet.is_outpoint_locked(utxo.outpoint)
+			})
+			.map(|utxo| utxo.txout.value.to_sat())
+			.collect()
+	}
+
 	fn build_drain_psbt(
 		&self, locked_wallet: &mut PersistedWallet<KVStoreWalletPersister>,
 		drain_script: ScriptBuf, cur_anchor_reserve_sats: u64, fee_rate: FeeRate,

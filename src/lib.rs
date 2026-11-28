@@ -2358,7 +2358,18 @@ impl Node {
 						contribution,
 						None,
 						confirmed_unlocked_sats,
-					)?
+					)
+					.map_err(|e| {
+						// Blocknil patch: `splice_in_with_change` reports a lack of funds as
+						// `InsufficientFunds`, as it does when no coins leave change, so a caller can
+						// tell it from a splice that can't start (`ChannelSplicingFailed`). This
+						// check only fails for funds; upstream's `splice_in` keeps its error.
+						if keep_change {
+							Error::InsufficientFunds
+						} else {
+							e
+						}
+					})?
 				},
 				FundingAmount::Max => self.splice_in_with_all_contribution(
 					funding_template,
@@ -3322,6 +3333,17 @@ impl Node {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
 		self.wallet.get_confirmed_unlocked_amount_sats().saturating_sub(cur_anchor_reserve_sats)
+	}
+
+	/// The value of each coin [`Node::confirmed_spendable_onchain_balance_sats`] counts: confirmed
+	/// as of the wallet's last sync and not locked for a pending funding, in no particular order.
+	/// Their sum is that balance before the anchor reserve comes off.
+	///
+	/// Blocknil patch: the provider's splice on arrival sizes a splice's fee from the coins its coin
+	/// selection could spend, largest first, so a wallet of many small coins isn't quoted a fee
+	/// for one input and then refused after the customer's yes (bitcoin-wallet #211, review of r11).
+	pub fn confirmed_spendable_utxo_values(&self) -> Vec<u64> {
+		self.wallet.get_confirmed_unlocked_utxo_values()
 	}
 
 	/// Retrieves an overview of all known balances.

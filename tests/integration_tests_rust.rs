@@ -4677,6 +4677,79 @@ async fn run_rbf_splice_channel_test(confirm_original: bool) {
 	node_b.stop().unwrap();
 }
 
+/// Blocknil patch (ldk3-confirmed-coins): `splice_in_with_change` reports a splice whose fee would
+/// come out of the anchor reserve (upstream #1223's check after coin selection) as
+/// `InsufficientFunds`, as it does when no coins leave change, while upstream's `splice_in` keeps
+/// `ChannelSplicingFailed`. And `confirmed_spendable_utxo_values` lists the coins the confirmed
+/// balance counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_in_with_change_reports_a_fee_into_the_anchor_reserve_as_insufficient_funds() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
+
+	let premine_amount_sat = 1_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			node_a.onchain_payment().new_address().unwrap(),
+			node_b.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	open_channel(&node_a, &node_b, 500_000, false, &electrsd).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	let user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	// node_b's one coin, which the confirmed balance counts less the anchor reserve.
+	let balances = node_b.list_balances();
+	let anchor_reserve_sat = balances.total_anchor_channels_reserve_sats;
+	assert_eq!(anchor_reserve_sat, 25_000);
+	assert_eq!(node_b.confirmed_spendable_utxo_values(), vec![premine_amount_sat]);
+	assert_eq!(
+		node_b.confirmed_spendable_onchain_balance_sats(),
+		premine_amount_sat - anchor_reserve_sat
+	);
+
+	// As in `splice_in_fee_does_not_spend_anchor_reserve`: the amount fits next to the reserve, but
+	// at 50 sat/vB the fee would come out of it. The coin leaves change worth keeping, so the
+	// change-keeping selection succeeds and the check after it refuses.
+	let splice_amount_sat = balances.spendable_onchain_balance_sats - 5_000;
+	let fee_rate = FeeRate::from_sat_per_vb(50).unwrap();
+	assert_eq!(
+		Err(NodeError::InsufficientFunds),
+		node_b.splice_in_with_change(
+			&user_channel_id_b,
+			node_a.node_id(),
+			splice_amount_sat,
+			Some(fee_rate.into())
+		)
+	);
+	// Its inputs were released: the coin is listed again.
+	assert_eq!(node_b.confirmed_spendable_utxo_values(), vec![premine_amount_sat]);
+	assert_eq!(
+		Err(NodeError::ChannelSplicingFailed),
+		node_b.splice_in(
+			&user_channel_id_b,
+			node_a.node_id(),
+			splice_amount_sat,
+			Some(fee_rate.into())
+		)
+	);
+	assert_eq!(node_b.confirmed_spendable_utxo_values(), vec![premine_amount_sat]);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn splice_in_fee_does_not_spend_anchor_reserve() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
@@ -6892,11 +6965,13 @@ async fn confirmed_spendable_balance_leaves_out_unconfirmed_change() {
 	node_a.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+	assert!(node_a.confirmed_spendable_utxo_values().is_empty());
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 2_000_000);
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 2_000_000);
+	assert_eq!(node_a.confirmed_spendable_utxo_values(), vec![2_000_000]);
 
 	// The open spends the only coin: its change is spendable by the trusted figure only.
 	open_channel(&node_a, &node_b, 500_000, false, &electrsd).await;
@@ -6904,15 +6979,23 @@ async fn confirmed_spendable_balance_leaves_out_unconfirmed_change() {
 	let spendable = node_a.list_balances().spendable_onchain_balance_sats;
 	assert!(spendable > 1_400_000 && spendable < 1_500_000, "the change: {spendable}");
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+	assert!(node_a.confirmed_spendable_utxo_values().is_empty(), "the change is not listed");
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	// Confirmed on chain but not yet synced: still none for coin selection.
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+	assert!(node_a.confirmed_spendable_utxo_values().is_empty());
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
 	let user_channel_id = expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), spendable);
+	let reserve = node_a.list_balances().total_anchor_channels_reserve_sats;
+	assert_eq!(
+		node_a.confirmed_spendable_utxo_values(),
+		vec![spendable + reserve],
+		"the change, now confirmed"
+	);
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, spendable);
 
 	// What the confirmed figure says is there, a splice can use.
