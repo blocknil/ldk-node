@@ -3182,6 +3182,22 @@ impl Node {
 		self.runtime.block_on(self.wallet.remove_payment(payment_id))
 	}
 
+	/// The on-chain balance that a channel open's or splice's coin selection can spend now: the
+	/// coins confirmed as of the wallet's last sync, unlocked and mature, less the anchor reserve.
+	///
+	/// [`BalanceDetails::spendable_onchain_balance_sats`] also counts unconfirmed change of our
+	/// own, which [`Node::splice_in`] and [`Node::splice_in_with_change`] don't select. After an
+	/// open or splice spends the wallet's coins, the two differ until its change confirms and the
+	/// wallet has synced ([`Node::sync_wallets`]).
+	///
+	/// Blocknil patch: the provider's splice on arrival checks the funds it quotes against this,
+	/// rather than quote on change it can't splice with (bitcoin-wallet #211).
+	pub fn confirmed_spendable_onchain_balance_sats(&self) -> u64 {
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		self.wallet.get_confirmed_spendable_amount_sats(cur_anchor_reserve_sats)
+	}
+
 	/// Retrieves an overview of all known balances.
 	pub fn list_balances(&self) -> BalanceDetails {
 		let cur_anchor_reserve_sats =

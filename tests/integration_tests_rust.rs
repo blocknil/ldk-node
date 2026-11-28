@@ -6505,6 +6505,67 @@ async fn splice_in_with_change_keeps_a_change_output_or_is_refused() {
 	node_b.stop().unwrap();
 }
 
+/// `confirmed_spendable_onchain_balance_sats` is what a splice's coin selection can spend:
+/// confirmed coins only. Node A holds a single coin; opening a channel spends it, and until the
+/// open's change confirms and the wallet syncs, `spendable_onchain_balance_sats` counts that change
+/// while the confirmed figure doesn't, also once it is in a block the wallet hasn't synced. After
+/// the sync the two agree, and a splice spends what the confirmed figure counted.
+///
+/// Blocknil patch (bitcoin-wallet #211).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn confirmed_spendable_balance_leaves_out_unconfirmed_change() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let node_b = setup_node(&chain_source, random_config());
+	let mut config_a = random_config();
+	// No anchor reserve, so that the figures are the coins themselves.
+	config_a.node_config.anchor_channels_config.trusted_peers_no_reserve.push(node_b.node_id());
+	let node_a = setup_node(&chain_source, config_a);
+
+	premine_blocks(&bitcoind.client, &electrsd.client).await;
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+	distribute_funds_unconfirmed(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(2_000_000),
+	)
+	.await;
+	// Unconfirmed and not our own change: in neither figure.
+	node_a.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 2_000_000);
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 2_000_000);
+
+	// The open spends the only coin: its change is spendable by the trusted figure only.
+	open_channel(&node_a, &node_b, 500_000, false, &electrsd).await;
+	node_a.sync_wallets().unwrap();
+	let spendable = node_a.list_balances().spendable_onchain_balance_sats;
+	assert!(spendable > 1_400_000 && spendable < 1_500_000, "the change: {spendable}");
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	// Confirmed on chain but not yet synced: still none for coin selection.
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), 0);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+	let user_channel_id = expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+	assert_eq!(node_a.confirmed_spendable_onchain_balance_sats(), spendable);
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, spendable);
+
+	// What the confirmed figure says is there, a splice can use.
+	node_a.splice_in_with_change(&user_channel_id, node_b.node_id(), 100_000, None).unwrap();
+	expect_splice_negotiated_event!(node_a, node_b.node_id());
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
 /// The fee `tx` paid, from its inputs' previous outputs.
 fn splice_fee_sats<E: ElectrumApi>(electrsd: &E, tx: &bitcoin::Transaction) -> u64 {
 	let input_sats: u64 = tx

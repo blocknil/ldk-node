@@ -2334,6 +2334,44 @@ impl Wallet {
 		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
 	}
 
+	/// The sum of the coins a funding's coin selection can spend now, less
+	/// `total_anchor_channels_reserve_sats`: confirmed as of the wallet's last synced checkpoint,
+	/// unlocked, mature, and small enough to announce in `tx_add_input`. These are the coins
+	/// [`Self::select_confirmed_utxos_keeping_change`] chooses from (`exclude_unconfirmed`), which
+	/// the trusted spendable balance of [`Self::get_balances`] overstates by any unconfirmed change.
+	///
+	/// Blocknil patch: the provider's splice on arrival quoted on that change and then found no
+	/// coin to splice with (bitcoin-wallet #211).
+	pub(crate) fn get_confirmed_spendable_amount_sats(
+		&self, total_anchor_channels_reserve_sats: u64,
+	) -> u64 {
+		let locked_wallet = self.inner.lock().expect("lock");
+		let tip_height = locked_wallet.latest_checkpoint().height();
+		let mut sats: u64 = 0;
+		for utxo in locked_wallet.list_unspent() {
+			if locked_wallet.is_outpoint_locked(utxo.outpoint) {
+				continue;
+			}
+			let Some(confirmation_height) = utxo.chain_position.confirmation_height_upper_bound()
+			else {
+				continue;
+			};
+			let Some(prevtx) = locked_wallet.tx_graph().get_tx(utxo.outpoint.txid) else {
+				continue;
+			};
+			if prevtx.is_coinbase()
+				&& tip_height.saturating_sub(confirmation_height) + 1 < COINBASE_MATURITY
+			{
+				continue;
+			}
+			if !fits_tx_add_input(&prevtx) {
+				continue;
+			}
+			sats = sats.saturating_add(utxo.txout.value.to_sat());
+		}
+		sats.saturating_sub(total_anchor_channels_reserve_sats)
+	}
+
 	fn build_drain_psbt(
 		&self, locked_wallet: &mut PersistedWallet<KVStoreWalletPersister>,
 		drain_script: ScriptBuf, cur_anchor_reserve_sats: u64, fee_rate: FeeRate,
