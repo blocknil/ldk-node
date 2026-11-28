@@ -2354,9 +2354,14 @@ impl Wallet {
 			.sum()
 	}
 
-	/// The value of each coin [`Self::get_confirmed_unlocked_amount_sats`] sums: the same filter.
+	/// The value of each coin a splice's coin selection can pick: what
+	/// [`Self::get_confirmed_unlocked_amount_sats`] sums (confirmed, not locked for a pending
+	/// funding), less the coins whose previous transaction is too large to announce in a
+	/// `tx_add_input`, which [`Self::select_confirmed_utxos_keeping_change`] marks unspendable.
 	///
-	/// Blocknil patch, for [`crate::Node::confirmed_spendable_utxo_values`].
+	/// Blocknil patch, for [`crate::Node::confirmed_spendable_utxo_values`]. Upstream's amount
+	/// helper counts those coins too; a provider funded by a large batch payment would quote a
+	/// splice on them and then have it refused after the customer's yes.
 	pub(crate) fn get_confirmed_unlocked_utxo_values(&self) -> Vec<u64> {
 		let locked_wallet = self.inner.lock().expect("lock");
 		locked_wallet
@@ -2364,6 +2369,10 @@ impl Wallet {
 			.filter(|utxo| {
 				utxo.chain_position.is_confirmed()
 					&& !locked_wallet.is_outpoint_locked(utxo.outpoint)
+					&& !locked_wallet
+						.tx_graph()
+						.get_tx(utxo.outpoint.txid)
+						.is_some_and(|prevtx| !fits_tx_add_input(&prevtx))
 			})
 			.map(|utxo| utxo.txout.value.to_sat())
 			.collect()
@@ -14001,6 +14010,26 @@ mod tests {
 			spendable_sats + change_output.value.to_sat()
 		);
 		assert_eq!(wallet.get_confirmed_unlocked_amount_sats(), confirmed_unlocked_sats);
+	}
+
+	/// Blocknil patch (ldk3-confirmed-coins): a coin coin selection won't pick, because its
+	/// previous transaction is too large to announce, isn't listed among the coins a splice can
+	/// spend, though upstream's amount still counts it.
+	#[tokio::test]
+	async fn confirmed_unlocked_utxo_values_leave_out_coins_too_large_to_announce() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let mut oversized = wallet_paying_tx(&wallet, 1);
+		oversized.output.push(TxOut {
+			value: Amount::ZERO,
+			script_pubkey: ScriptBuf::from_bytes(vec![0x6a; 70_000]),
+		});
+		assert!(!fits_tx_add_input(&oversized));
+		insert_confirmed_tx(&wallet, oversized, 1);
+		insert_confirmed_tx(&wallet, wallet_paying_tx(&wallet, 2), 2);
+
+		assert_eq!(wallet.get_confirmed_unlocked_amount_sats(), 180_000);
+		assert_eq!(wallet.get_confirmed_unlocked_utxo_values(), vec![90_000]);
 	}
 
 	#[tokio::test]

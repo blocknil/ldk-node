@@ -3327,21 +3327,28 @@ impl Node {
 	/// wallet has synced ([`Node::sync_wallets`]).
 	///
 	/// Blocknil patch: the provider's splice on arrival checks the funds it quotes against this,
-	/// rather than quote on change it can't splice with (bitcoin-wallet #211). A public wrapper
-	/// of upstream's `Wallet::get_confirmed_unlocked_amount_sats` (ldk-node #1223).
+	/// rather than quote on change it can't splice with (bitcoin-wallet #211). The sum of
+	/// [`Node::confirmed_spendable_utxo_values`], so it leaves out, as coin selection does, coins
+	/// whose previous transaction is too large to announce; upstream's
+	/// `Wallet::get_confirmed_unlocked_amount_sats` (ldk-node #1223), which its own splice checks
+	/// use, counts them.
 	pub fn confirmed_spendable_onchain_balance_sats(&self) -> u64 {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-		self.wallet.get_confirmed_unlocked_amount_sats().saturating_sub(cur_anchor_reserve_sats)
+		let confirmed_unlocked_sats: u64 =
+			self.wallet.get_confirmed_unlocked_utxo_values().iter().sum();
+		confirmed_unlocked_sats.saturating_sub(cur_anchor_reserve_sats)
 	}
 
 	/// The value of each coin [`Node::confirmed_spendable_onchain_balance_sats`] counts: confirmed
-	/// as of the wallet's last sync and not locked for a pending funding, in no particular order.
-	/// Their sum is that balance before the anchor reserve comes off.
+	/// as of the wallet's last sync, not locked for a pending funding and small enough to announce
+	/// in a `tx_add_input`, in no particular order. Their sum is that balance before the anchor
+	/// reserve comes off.
 	///
-	/// Blocknil patch: the provider's splice on arrival sizes a splice's fee from the coins its coin
-	/// selection could spend, largest first, so a wallet of many small coins isn't quoted a fee
-	/// for one input and then refused after the customer's yes (bitcoin-wallet #211, review of r11).
+	/// Blocknil patch: the provider's splice on arrival sizes a splice's fee for the most of these
+	/// coins its coin selection could spend, the smallest first, so a wallet of many small coins
+	/// isn't quoted a fee for one input and then refused after the customer's yes
+	/// (bitcoin-wallet #211, review of r11).
 	pub fn confirmed_spendable_utxo_values(&self) -> Vec<u64> {
 		self.wallet.get_confirmed_unlocked_utxo_values()
 	}
